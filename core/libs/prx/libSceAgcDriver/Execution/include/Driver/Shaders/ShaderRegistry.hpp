@@ -28,11 +28,13 @@ struct PreparedShaderState {
         std::uint64_t vertexId;
         std::uint64_t fragmentId;
         std::shared_ptr<const ShaderRecompiler::RectListShaders> shaders;
+        std::vector<std::uint64_t> targetKey;
     };
     struct RectangleProgress {
         std::weak_ptr<const ShaderSnapshot> fragment;
         std::size_t vertexCount;
         std::size_t fragmentCount;
+        std::vector<std::uint64_t> targetKey;
     };
     struct GraphicsAbi {
         std::vector<std::uint64_t> key;
@@ -77,7 +79,7 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
 
 void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint32_t primitiveType, const ShaderRecompiler::SpirvTarget& target);
 
-ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, std::uint64_t vertexId, std::uint64_t fragmentId);
+ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapshot, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ShaderRecompiler::SpirvTarget& target);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
