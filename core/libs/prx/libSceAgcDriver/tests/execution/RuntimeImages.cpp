@@ -19,12 +19,18 @@ alignas(256) std::array<std::array<std::uint32_t, 64>, 2> textures{};
 alignas(256) std::array<std::uint32_t, 64> output{};
 constexpr std::array<std::uint32_t, 10> code{0x7e3c02ffu, 0x3fa00000u, 0x7e3e02ffu, 0x3f000000u, 0xf09c0108u, 0x00610a1eu, 0x34060082u, 0xe0701000u, 0x80000a03u, 0xbf810000u};
 
-void RunLoop(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+void RunLoop(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, bool conditionalContinue) {
     alignas(256) static std::array<std::uint32_t, 256> texels{};
     constexpr std::array<std::uint32_t, 12> loopCode{
         0xbe8c0381u, 0x7e040280u, 0x7e020280u, 0xbf0a840cu, 0xbf840006u,
         0x4a04040cu, 0xf0201108u, 0x00010200u, 0x4a020281u, 0x800c810cu, 0xbf82fff8u, 0xbf810000u,
     };
+    constexpr std::array<std::uint32_t, 14> conditionalCode{
+        0xbe8c0381u, 0x7e040280u, 0x7e020280u, 0xbf0a840cu, 0xbf840008u,
+        0xbf06820cu, 0xbf850001u, 0x4a04040cu, 0xf0201108u, 0x00010200u,
+        0x4a020281u, 0x800c810cu, 0xbf82fff6u, 0xbf810000u,
+    };
+    const auto selectedCode = conditionalContinue ? std::span<const std::uint32_t>(conditionalCode) : std::span<const std::uint32_t>(loopCode);
     GuestAllocations::Mutation().Add(texels.data(), sizeof(texels), true, true);
     const auto deregister = [](std::uint32_t* pointer) { GuestAllocations::Mutation().Remove(pointer); };
     const std::unique_ptr<std::uint32_t, decltype(deregister)> registration(texels.data(), deregister);
@@ -38,7 +44,7 @@ void RunLoop(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     std::copy(image.begin(), image.end(), userData.begin() + 4u);
     const ShaderRecompiler::ShaderComputeStageInfo compute{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     ShaderRecompiler::RecompileRequest request{
-        {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(loopCode.data()), loopCode, 0u, {}},
+        {ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(selectedCode.data()), selectedCode, 0u, {}},
         {waveSize, 0u, userData, compute, std::nullopt, std::nullopt, {}}, device.Target(), {0u, 0u, 0u, 128u},
     };
     request.useCache = false;
@@ -64,7 +70,7 @@ void RunLoop(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     device.WaitIdle();
     AgcDriver::Graphics::StorageTexture::FlushPending(imageAddress, sizeof(texels), nullptr, "test");
     device.WaitIdle();
-    constexpr std::array expected{1u, 3u, 6u, 0xdeadbeefu};
+    const auto expected = conditionalContinue ? std::array{1u, 1u, 4u, 0xdeadbeefu} : std::array{1u, 3u, 6u, 0xdeadbeefu};
     for (std::uint32_t row = 0u; row < expected.size(); ++row) {
         for (std::uint32_t lane = 0u; lane < 64u; ++lane) {
             Require(texels[row * 64u + lane] == expected[row], "runtime image loop did not preserve all three stores and exit: wave=" +
@@ -110,8 +116,10 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        RunLoop(*device, 32u);
-        RunLoop(*device, 64u);
+        RunLoop(*device, 32u, false);
+        RunLoop(*device, 64u, false);
+        RunLoop(*device, 32u, true);
+        RunLoop(*device, 64u, true);
         Run(*device);
         std::cout << "runtime image and sampler tests passed\n";
         return 0;
