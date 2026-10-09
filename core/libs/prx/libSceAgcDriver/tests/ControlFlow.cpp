@@ -571,6 +571,27 @@ early_exit:
          {0x7e020280u, 0xbe880380u, 0xbe890380u, 0x4a020281u, 0xbf060209u, 0xbf850009u, 0x80098109u, 0xbf0a8409u, 0xbf85fffau, 0x80088108u,
           0xbf0a8408u, 0xbf85fff6u, 0xe0700000u, 0x80000100u, 0xbf810000u, 0x4a020282u, 0xe0700000u, 0x80000100u, 0xbf810000u},
          Split::Route, 0},
+        {"nested loop exit sharing the outer merge", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, v0
+  s_branch outer
+inner_exit:
+  v_add_nc_u32 v1, 1, v1
+  s_cmp_ge_u32 s8, 4
+  s_cbranch_scc1 done
+inner:
+  s_add_u32 s8, s8, 1
+  v_add_nc_u32 v1, 2, v1
+  s_cmp_ge_u32 s8, 2
+  s_cbranch_scc1 inner_exit
+outer:
+  v_add_nc_u32 v1, 8, v1
+  s_branch inner
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0xbe880380u, 0x7e020300u, 0xbf820007u, 0x4a020281u, 0xbf098408u, 0xbf850006u,
+                0x80088108u, 0x4a020282u, 0xbf098208u, 0xbf85fff9u, 0x4a020288u, 0xbf82fffau}), Split::Route},
         {"loop exit tail beside the continue block", R"(
   v_mov_b32 v1, 0
   s_mov_b32 s8, 0

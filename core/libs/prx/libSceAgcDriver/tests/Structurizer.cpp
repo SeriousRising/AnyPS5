@@ -123,6 +123,51 @@ int main() {
             Structurizer{}.Structurize(graph);
             if (GraphToString(graph) != normalized) throw std::runtime_error("loop normalization is not idempotent");
         }
+        for (const auto& edges : {std::vector<std::vector<std::uint32_t>>{{1}, {2}, {3, 1}, {4, 2}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2}, {1, 3}, {2, 4}, {}}}) {
+            auto graph = makeGraph(edges);
+            const auto original = graph;
+            Structurizer{}.Structurize(graph);
+            if (graph.naturalLoops.size() != 2u || graph.blocks.size() > original.blocks.size() + 8u) throw std::runtime_error("nested loop exit routing did not retain two bounded loops");
+            const auto firstMerge = graph.naturalLoops.front().mergeBlock;
+            if (firstMerge == graph.naturalLoops.back().mergeBlock) throw std::runtime_error("nested loops share a merge after exit routing");
+            for (const auto& source : original.blocks) {
+                const auto copies = std::count_if(graph.blocks.begin(), graph.blocks.end(), [&](const BasicBlock& block) {
+                    return block.instructionBegin == source.instructionBegin && block.instructionEnd == source.instructionEnd;
+                });
+                if (copies != 1) throw std::runtime_error("nested loop exit routing changed an instruction range");
+            }
+            requireEmptyContinuations(graph);
+            requireStructuredBranches(graph, "nested loop exits to the parent's merge and continuation");
+            const auto normalized = GraphToString(graph);
+            Structurizer{}.Structurize(graph);
+            if (GraphToString(graph) != normalized) throw std::runtime_error("nested loop exit routing is not idempotent");
+        }
+        for (const auto& edges : {std::vector<std::vector<std::uint32_t>>{{1}, {2, 4}, {3, 5}, {1}, {6}, {6}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3}, {4, 5}, {3, 6}, {6}, {7}, {1}, {}}}) {
+            auto graph = makeGraph(edges);
+            Structurizer{}.Structurize(graph);
+            for (const auto& block : graph.blocks) {
+                if (block.terminator.condition == BranchCondition::GotoVariable || block.terminator.gotoValue >= 0) throw std::runtime_error("a loop with a local merge unexpectedly requires exit routing");
+            }
+            requireEmptyContinuations(graph);
+            requireStructuredBranches(graph, "a loop whose merge stays in its enclosing construct");
+            const auto normalized = GraphToString(graph);
+            Structurizer{}.Structurize(graph);
+            if (GraphToString(graph) != normalized) throw std::runtime_error("local loop merge normalization is not idempotent");
+        }
+        for (const auto kind : {TerminatorKind::Unsupported, TerminatorKind::IndirectBranch}) {
+            auto graph = makeGraph({{1}, {2}, {3, 1}, {4, 2}, {}});
+            graph.FindBlock(2).terminator.kind = kind;
+            bool rejected = false;
+            try {
+                Structurizer{}.Structurize(graph);
+            } catch (const std::exception& error) {
+                if (std::string(error.what()).find("indirect or unsupported branch") == std::string::npos) throw;
+                rejected = true;
+            }
+            if (!rejected) throw std::runtime_error("loop exit routing accepted an unsupported terminator");
+        }
         auto conditionalLatch = makeGraph({{1}, {2, 5}, {3, 4}, {4, 6}, {5}, {6, 7}, {1, 7}, {}});
         Structurizer{}.Structurize(conditionalLatch);
         requireEmptyContinuations(conditionalLatch);
