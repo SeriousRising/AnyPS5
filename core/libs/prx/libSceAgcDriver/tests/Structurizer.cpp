@@ -74,12 +74,25 @@ void requireStructuredBranches(const ControlFlowGraph& graph, const char* name) 
     }
 }
 
+void requireEmptyContinuations(const ControlFlowGraph& graph) {
+    for (const auto& header : graph.blocks) {
+        if (!header.terminator.loopHeader) continue;
+        const auto& continuation = graph.FindBlock(header.terminator.continueBlock);
+        if (continuation.instructionBegin != continuation.instructionEnd || continuation.terminator.kind != TerminatorKind::Branch ||
+            continuation.terminator.trueBlock != header.id || continuation.successors != std::vector<std::uint32_t>{header.id}) {
+            throw std::runtime_error("loop continuation is not an empty unconditional backedge");
+        }
+    }
+}
+
 }
 
 int main() {
     try {
         for (const auto& edges : {std::vector<std::vector<std::uint32_t>>{{1}, {2, 3}, {1}, {}},
-                std::vector<std::vector<std::uint32_t>>{{1}, {2}, {1, 3}, {}}}) {
+                std::vector<std::vector<std::uint32_t>>{{1}, {2}, {1, 3}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 5}, {4, 3}, {4}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3, 6}, {5, 4}, {5}, {2}, {7}, {1}, {}}}) {
             auto graph = makeGraph(edges);
             const auto original = graph;
             Structurizer{}.Structurize(graph);
@@ -89,8 +102,16 @@ int main() {
                 });
                 if (copies != 1) throw std::runtime_error("loop normalization changed a guest instruction range");
             }
+            requireEmptyContinuations(graph);
             requireStructuredBranches(graph, "dedicated loop continuation");
+            const auto normalized = GraphToString(graph);
+            Structurizer{}.Structurize(graph);
+            if (GraphToString(graph) != normalized) throw std::runtime_error("loop normalization is not idempotent");
         }
+        auto sequentialContinues = makeGraph({{1}, {2, 6}, {4, 3}, {4, 5}, {1}, {4}, {}});
+        Structurizer{}.Structurize(sequentialContinues);
+        requireEmptyContinuations(sequentialContinues);
+        requireStructuredBranches(sequentialContinues, "sequential conditional continues");
         auto nested = makeGraph({{1}, {2}, {5, 3}, {5, 4}, {7}, {6, 7}, {}, {1}});
         Structurizer{}.Structurize(nested);
         if (nested.FindBlock(2).terminator.mergeBlock == nested.FindBlock(3).terminator.mergeBlock) {

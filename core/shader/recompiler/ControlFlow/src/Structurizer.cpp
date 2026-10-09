@@ -466,9 +466,19 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
     }
     const auto joinsAt = [&](std::uint32_t join, std::uint32_t other) {
         const auto& arm = graph.FindBlock(other);
-        const bool armLeavesOrJoins = arm.terminator.kind == TerminatorKind::ConditionalBranch && arm.predecessors.size() == 1u && std::all_of(arm.successors.begin(), arm.successors.end(), [&](std::uint32_t successor) {
-            return successor == join || successor == loop->continueBlock || successor == loop->mergeBlock;
-        });
+        const auto joinsOrLeaves = [&](std::uint32_t successor) {
+            std::vector<bool> visited(graph.blocks.size(), false);
+            for (;;) {
+                if (successor == loop->headerBlock) return false;
+                if (successor == join || successor == loop->continueBlock || successor == loop->mergeBlock) return true;
+                if (!isInsideLoopConstruct(graph, *loop, successor) || visited[successor]) return false;
+                visited[successor] = true;
+                const auto& next = graph.FindBlock(successor);
+                if (next.terminator.kind != TerminatorKind::Branch || next.successors.size() != 1u) return false;
+                successor = next.successors.front();
+            }
+        };
+        const bool armLeavesOrJoins = arm.terminator.kind == TerminatorKind::ConditionalBranch && arm.predecessors.size() == 1u && std::all_of(arm.successors.begin(), arm.successors.end(), joinsOrLeaves);
         return armLeavesOrJoins && isInsideLoopConstruct(graph, *loop, other) && isInsideLoopConstruct(graph, *loop, join) && graph.Dominates(block.id, join);
     };
     if (joinsAt(trueTarget, falseTarget)) {
@@ -1471,8 +1481,14 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph) const {
                     addUnique(latches, edge.sourceBlock);
                 }
             }
-            if (latches.size() <= 1u) {
+            if (latches.empty()) {
                 continue;
+            }
+            if (latches.size() == 1u) {
+                const auto& latch = graph.FindBlock(latches.front());
+                if (latch.instructionBegin == latch.instructionEnd && latch.terminator.kind == TerminatorKind::Branch) {
+                    continue;
+                }
             }
 
             const auto continueBlock = appendSyntheticBranchBlock(graph, loop.headerBlock);
