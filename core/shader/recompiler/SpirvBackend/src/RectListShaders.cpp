@@ -395,6 +395,12 @@ RectListShaders BuildRectListShaders(const RecompileResult& vertex, const Recomp
     const auto components = static_cast<std::uint32_t>((parameters.size() + 1) * 4);
     require(limits.maxPatchSize >= 4 && components <= limits.maxControlPerVertexInputComponents && components <= limits.maxControlPerVertexOutputComponents && components <= limits.maxEvaluationInputComponents && components <= limits.maxEvaluationOutputComponents && limits.maxControlPerPatchOutputComponents >= 6 && components * 4 + 6 <= limits.maxControlTotalOutputComponents, "tessellation interface exceeds device limits");
     const auto faultBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::TessellationControl, RuntimeAbi::Binding::FaultBuffer);
+    for (const auto* shader : {&vertex, &fragment}) {
+        for (const auto& binding : shader->bindings) {
+            require(binding.binding < std::numeric_limits<std::uint32_t>::max(), "descriptor binding overflow");
+            require(binding.descriptorSet != RuntimeAbi::DescriptorSet || binding.binding != faultBinding, "stage descriptor occupies the reserved fault binding");
+        }
+    }
     RectListEmitter control(parameters, spv::ExecutionModelTessellationControl, target.spirvVersion, faultBinding);
     RectListEmitter evaluation(parameters, spv::ExecutionModelTessellationEvaluation, target.spirvVersion, faultBinding);
     RectListShaders shaders;
