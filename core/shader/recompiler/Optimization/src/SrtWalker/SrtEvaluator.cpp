@@ -164,6 +164,15 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
     } else {
         std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
     }
+    if (!_flattened.empty()) {
+        for (const auto& read : _program.srtReads) {
+            if (read.value->Resolve() != &inst || read.flatOffset >= _flattened.size()) continue;
+            const bool clean = read.flatOffset < _cleanFlatSlots.size() && _cleanFlatSlots[read.flatOffset] != 0u;
+            if (clean && _cleanEvaluator != nullptr && read.flatOffset < _recordedClean.size() && _recordedClean[read.flatOffset] != 0u) continue;
+            _flattened[read.flatOffset] = word;
+            if (clean && _cleanEvaluator == nullptr && read.flatOffset < _recordedClean.size()) _recordedClean[read.flatOffset] = 1u;
+        }
+    }
     result = word;
     return true;
 }
@@ -186,7 +195,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::GetShaderBase: result = _runtime.shaderBase; return true;
         case IrOpcode::Phi: return EvaluatePhi(inst, result);
         case IrOpcode::ReadFirstLane: {
-            Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1));
+            Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1), _flattened, _recordedClean);
             return active.EvaluateWide(inst.Argument(0), result);
         }
         case IrOpcode::BitCastU32F32:

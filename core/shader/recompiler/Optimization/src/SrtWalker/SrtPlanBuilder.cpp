@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace ShaderRecompiler::Detail {
 
@@ -41,6 +42,36 @@ void PlanBuilder::Run() {
         }
     }
     PatchReads();
+    buildControlFlow();
+}
+
+void PlanBuilder::buildControlFlow() {
+    auto& flow = _program.Resources().controlFlow;
+    flow.clear();
+    const auto& blocks = _program.BlockOrder();
+    const auto& metadata = _program.Metadata().blockInfo;
+    if (_patches.empty() || metadata.size() != blocks.size()) return;
+    std::unordered_map<const IrBlock*, std::uint32_t> indices;
+    std::unordered_map<std::uint32_t, std::uint32_t> targets;
+    for (std::uint32_t index = 0; index < blocks.size(); ++index) {
+        indices.emplace(blocks[index], index);
+        targets.emplace(metadata[index].id, index);
+    }
+    flow.resize(blocks.size());
+    for (std::uint32_t index = 0; index < blocks.size(); ++index) {
+        auto& block = flow[index];
+        const auto& info = metadata[index];
+        if (info.terminator.kind == TerminatorKind::ConditionalBranch) {
+            block.condition = info.condition;
+            block.successors = {targets.at(info.terminator.trueBlock), targets.at(info.terminator.falseBlock)};
+        } else {
+            for (const auto* successor : blocks[index]->Successors()) block.successors.push_back(indices.at(successor));
+        }
+    }
+    for (const auto& patch : _patches) {
+        auto& reads = flow.at(indices.at(patch.inst->Parent())).reads;
+        if (std::ranges::find(reads, patch.slot) == reads.end()) reads.push_back(patch.slot);
+    }
 }
 
 void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {

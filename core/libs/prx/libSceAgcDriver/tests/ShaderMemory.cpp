@@ -5,6 +5,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
@@ -550,6 +551,196 @@ void verifyDescriptorPhis() {
 
     auto dynamic = makeRequest(dynamicCode);
     expectFailure([&] { static_cast<void>(GetResourcePlan(dynamic)); }, "GetSamplerResource dword 0 is not a valid runtime value", "descriptor Phi: an edge without an SRT slot was accepted");
+}
+
+void verifyInactiveSrtReads() {
+    using namespace ShaderRecompiler;
+    std::array<std::uint32_t, 14> code{
+        0xbf06800cu, 0xbf850005u, 0xf4000404u, 0xfa000000u, 0xbf8cc07fu, 0x7e020210u, 0xbf820004u,
+        0xf4000485u, 0xfa000000u, 0xbf8cc07fu, 0x7e020212u, 0xe0700000u, 0x80000100u, 0xbf810000u
+    };
+    constexpr std::uint64_t PayloadAddress = 0x110000u;
+    constexpr std::uint32_t Payload = 0x12345678u;
+    constexpr std::uint64_t SelectorAddress = 0x120000u;
+    struct Reads {
+        std::vector<std::uint64_t> addresses;
+        std::vector<std::uint64_t> cleanAddresses;
+        std::uint32_t selector = 0u;
+    };
+    const auto read = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& reads = *static_cast<Reads*>(context);
+        reads.addresses.push_back(address);
+        if (address != PayloadAddress && address != SelectorAddress) throw std::runtime_error("inactive SRT read requested inaccessible memory");
+        *value = address == SelectorAddress ? reads.selector : Payload;
+        return true;
+    };
+    std::array<std::uint32_t, 13> users{};
+    users[0] = 0x200000u;
+    users[2] = 4u;
+    users[3] = 0x31016facu;
+    auto target = BufferTarget();
+    target.vulkanVersion = 0x00401000u;
+    target.spirvVersion = 0x00010300u;
+    target.subgroupSize = 32u;
+    const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    RecompileRequest request{{ShaderStage::Compute, 0x10000u, code, 0u, {}}, {32u, 0u, users, compute, std::nullopt, std::nullopt, {}}, target, {0u, 0u, 0u, 128u}};
+    std::uint32_t failures = 0u;
+    for (const bool inverted : {false, true}) {
+        code[1] = inverted ? 0xbf840005u : 0xbf850005u;
+        for (const auto selector : {0u, 1u}) {
+            const bool taken = (selector == 0u) != inverted;
+            users[8] = taken ? 0u : static_cast<std::uint32_t>(PayloadAddress);
+            users[10] = taken ? static_cast<std::uint32_t>(PayloadAddress) : 0u;
+            users[12] = selector;
+            Reads reads;
+            SrtRuntime runtime{users, request.shader.codeAddress, read, &reads, read};
+            try {
+                const auto capture = CaptureResources(request, runtime);
+                require(reads.addresses == std::vector<std::uint64_t>{PayloadAddress}, "inactive SRT capture read an untaken branch");
+                require(std::ranges::find(capture->snapshot.flattenedSrt, Payload) != capture->snapshot.flattenedSrt.end(), "inactive SRT capture lost the selected payload");
+                auto duplicateCode = code;
+                duplicateCode[7] = 0xf4000484u;
+                auto duplicateUsers = users;
+                duplicateUsers[8] = static_cast<std::uint32_t>(PayloadAddress);
+                duplicateUsers[10] = 0u;
+                auto duplicate = request;
+                duplicate.shader.code = duplicateCode;
+                duplicate.context.userData = duplicateUsers;
+                Reads duplicateReads;
+                auto duplicateRuntime = runtime;
+                duplicateRuntime.userData = duplicateUsers;
+                duplicateRuntime.userContext = &duplicateReads;
+                const auto duplicateCapture = CaptureResources(duplicate, duplicateRuntime);
+                require(duplicateReads.addresses == std::vector<std::uint64_t>{PayloadAddress}, "equivalent branch SRT loads were not captured once");
+                require(duplicateCapture->snapshot.flattenedSrt == std::vector<std::uint32_t>{Payload}, "equivalent branch SRT loads lost their selected value");
+            } catch (const std::runtime_error& error) {
+                ++failures;
+                std::cerr << "inactive SRT " << (inverted ? "SCC0" : "SCC1") << " selector " << selector << ": " << error.what() << "; callback addresses";
+                for (const auto address : reads.addresses) std::cerr << " 0x" << std::hex << address << std::dec;
+                std::cerr << '\n';
+            }
+            auto unknownCode = code;
+            unknownCode[0] = 0xbf06800du;
+            auto unknown = request;
+            unknown.shader.code = unknownCode;
+            unknown.context.compute->groupIdEnable[0] = true;
+            Reads conservative;
+            runtime.userContext = &conservative;
+            expectFailure([&] { static_cast<void>(CaptureResources(unknown, runtime)); }, "inaccessible memory", "an unknown SRT branch accepted an invalid pointer");
+            require(std::ranges::find(conservative.addresses, 0u) != conservative.addresses.end(), "an unknown SRT branch was skipped");
+            std::vector<std::uint32_t> memoryCondition{0xf4000303u, 0xfa000000u, 0xbf8cc07fu};
+            memoryCondition.insert(memoryCondition.end(), code.begin(), code.end());
+            auto dirty = request;
+            dirty.shader.code = memoryCondition;
+            users[6] = static_cast<std::uint32_t>(SelectorAddress);
+            Reads dirtyReads;
+            dirtyReads.selector = selector;
+            runtime.userContext = &dirtyReads;
+            runtime.readSpecializationMemory = +[](void* context, std::uint64_t address, std::uint32_t*) {
+                static_cast<Reads*>(context)->cleanAddresses.push_back(address);
+                return false;
+            };
+            expectFailure([&] { static_cast<void>(CaptureResources(dirty, runtime)); }, "inaccessible memory", "a dirty SRT condition accepted an invalid pointer");
+            require(std::ranges::find(dirtyReads.addresses, 0u) != dirtyReads.addresses.end(), "a dirty SRT condition pruned an unknown branch");
+            users[6] = 0u;
+            users[8] = 0u;
+            users[10] = 0u;
+            Reads invalid;
+            runtime.userContext = &invalid;
+            runtime.readSpecializationMemory = read;
+            expectFailure([&] { static_cast<void>(CaptureResources(request, runtime)); }, "inaccessible memory", "the selected SRT branch accepted an invalid pointer");
+            require(!invalid.addresses.empty() && invalid.addresses.back() == 0u, "the selected invalid pointer was not read");
+        }
+    }
+    const std::array<std::uint32_t, 7> unconditionalCode{0xf4000404u, 0xfa000000u, 0xbf8cc07fu, 0x7e020210u, 0xe0700000u, 0x80000100u, 0xbf810000u};
+    auto unconditional = request;
+    unconditional.shader.code = unconditionalCode;
+    Reads invalid;
+    SrtRuntime runtime{users, unconditional.shader.codeAddress, read, &invalid, read};
+    expectFailure([&] { static_cast<void>(CaptureResources(unconditional, runtime)); }, "inaccessible memory", "an unconditional SRT load accepted an invalid pointer");
+    require(invalid.addresses == std::vector<std::uint64_t>{0u}, "the unconditional invalid pointer was not read");
+    require(failures == 0u, "clean uniform branches dereferenced inactive SRT pointers");
+}
+
+void verifyInactiveSrtDependencies() {
+    using namespace ShaderRecompiler;
+    for (const auto roots : {0u, 1u, 2u, 3u}) {
+        for (const bool nested : {false, true}) {
+            for (const bool clean : {false, true}) {
+                IrResourcePlan plan;
+                plan.srtPlanComplete = true;
+                MemoryInfo memory;
+                memory.kind = ResourceKind::ScalarAddress;
+                plan.memoryInfo.push_back(memory);
+                std::uint32_t next = 0;
+                const auto make = [&](IrOpcode op, IrType type, std::initializer_list<IrValue*> args = {}) -> IrValue& {
+                    plan.valueStorage.push_back(std::make_unique<IrValue>(op, type, next++));
+                    auto& value = *plan.valueStorage.back();
+                    for (auto* arg : args) value.AddArgument(arg);
+                    return value;
+                };
+                const auto constant = [&](std::uint32_t word) -> IrValue& {
+                    auto& value = make(IrOpcode::Void, IrType::U32);
+                    value.SetImmediateU32(word);
+                    return value;
+                };
+                auto& zero = constant(0);
+                auto& condition = make(IrOpcode::Void, IrType::Bool);
+                condition.SetImmediateBool(true);
+                auto& address = make(IrOpcode::GetAddressResource, IrType::AddressResource, {&constant(0x100000), &zero});
+                auto& pointer = make(IrOpcode::LoadAddressU32, IrType::U32, {&address, &zero});
+                pointer.SetFlags(MemoryFlags{0, 0});
+                auto& srt = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+                auto& pointerFlat = make(IrOpcode::ReadConst, IrType::U32, {&srt, &zero});
+                IrValue* payloadLow = &pointerFlat;
+                if (nested) payloadLow = &make(IrOpcode::ReadFirstLane, IrType::U32, {&pointerFlat, &condition});
+                auto& payloadAddress = make(IrOpcode::GetAddressResource, IrType::AddressResource, {payloadLow, &zero});
+                auto& payload = make(IrOpcode::LoadAddressU32, IrType::U32, {&payloadAddress, &zero});
+                payload.SetFlags(MemoryFlags{0, 0});
+                plan.srtReads = {{&pointer, 0}, {&payload, 1}};
+                plan.controlFlow = {{&condition, {1, 2}, {}, {}}, {nullptr, {}, {}, {1}}, {nullptr, {}, {}, {0}}};
+                std::array<std::uint32_t, 1> sources{0};
+                if (roots != 0u) {
+                    DescriptorSource source;
+                    source.dwordCount = roots == 1u ? 1u : 2u;
+                    source.dwords[0] = roots == 2u ? &pointerFlat : &pointer;
+                    source.dwords[1] = roots == 2u ? &pointer : &pointerFlat;
+                    plan.descriptorSources.push_back(source);
+                }
+                struct Reads { std::vector<std::uint64_t> runtime; std::vector<std::uint64_t> clean; } reads;
+                const auto read = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+                    auto& reads = *static_cast<Reads*>(context);
+                    reads.runtime.push_back(address);
+                    if (address == 0x100000) *word = 0x110000;
+                    else if (address == 0x110000) *word = 0x12345678;
+                    else if (address == 0x120000) *word = 0x87654321;
+                    else throw std::runtime_error("unexpected address");
+                    return true;
+                };
+                const auto readClean = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+                    auto& reads = *static_cast<Reads*>(context);
+                    reads.clean.push_back(address);
+                    if (address != 0x100000) throw std::runtime_error("unexpected clean address");
+                    *word = 0x120000;
+                    return true;
+                };
+                SrtRuntime runtime{{}, 0, read, &reads, readClean};
+                std::vector<DescriptorValue> results;
+                std::vector<std::uint32_t> flat;
+                std::vector<std::uint8_t> active;
+                const std::array<std::uint8_t, 2> cleanSlots{static_cast<std::uint8_t>(clean), 0};
+                SrtWalker{}.EvaluateRuntimeSources(plan, roots != 0u ? std::span(sources) : std::span<const std::uint32_t>{}, runtime, results, flat, cleanSlots, active);
+                const auto expected = clean ? std::vector<std::uint32_t>{0x120000, 0x87654321} : std::vector<std::uint32_t>{0x110000, 0x12345678};
+                require(flat == expected, "an active SRT dependency lost its flattened value");
+                if (roots != 0u) {
+                    const auto rawIndex = roots == 2u ? 1u : 0u;
+                    require(results.size() == 1u && results[0].dwords[rawIndex] == 0x110000u, "a direct SRT descriptor root lost its value");
+                    if (roots != 1u) require(results[0].dwords[1u - rawIndex] == expected[0], "a clean SRT descriptor root lost its selected value");
+                }
+                require(clean ? !reads.clean.empty() : reads.clean.empty(), "an active SRT dependency used the wrong memory callback");
+            }
+        }
+    }
 }
 
 void verifyProgramCounterRelativeData() {
@@ -1889,8 +2080,16 @@ int main(int argc, char** argv) {
             std::cout << "Bindless mapping, indexing capabilities and strict validation passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--inactive-srt") {
+            verifyInactiveSrtReads();
+            verifyInactiveSrtDependencies();
+            std::cout << "Inactive SRT reads and strict branch validation passed\n";
+            return 0;
+        }
         require(argc == 1, "unknown shader memory test arguments");
         verifyLogicalImageSpecialization();
+        verifyInactiveSrtReads();
+        verifyInactiveSrtDependencies();
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyPureFlatSlots();
