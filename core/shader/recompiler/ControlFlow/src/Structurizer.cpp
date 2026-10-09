@@ -464,9 +464,31 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
     if (isLoopControlGateway(graph, *loop, falseTarget) && graph.Dominates(block.id, falseTarget) && isInsideLoopConstruct(graph, *loop, trueTarget)) {
         return falseTarget;
     }
+    const bool nestedLoopProofSupported = std::none_of(loop->blocks.begin(), loop->blocks.end(), [&](std::uint32_t member) {
+        const auto& terminator = graph.FindBlock(member).terminator;
+        return terminator.kind == TerminatorKind::IndirectBranch || terminator.condition == BranchCondition::IndirectTarget;
+    });
+    const auto nestedLoopAt = [&](std::uint32_t entry) -> const NaturalLoop* {
+        if (!nestedLoopProofSupported) return nullptr;
+        for (const auto& nested : graph.naturalLoops) {
+            if (nested.headerBlock != entry || !graph.Dominates(block.id, entry) || nested.headerBlock == loop->headerBlock || nested.blocks.size() >= loop->blocks.size() || nested.exitBlocks.size() != 1u || nested.exitBlocks.front() != nested.mergeBlock || nested.mergeBlock == loop->headerBlock) continue;
+            const auto& header = graph.FindBlock(entry);
+            if (std::count_if(header.predecessors.begin(), header.predecessors.end(), [&](std::uint32_t predecessor) { return !contains(nested.blocks, predecessor); }) != 1) continue;
+            if (!std::all_of(nested.blocks.begin(), nested.blocks.end(), [&](std::uint32_t member) {
+                const auto& body = graph.FindBlock(member);
+                if (member == loop->headerBlock || !contains(loop->blocks, member)) return false;
+                if (member != nested.headerBlock && std::any_of(body.predecessors.begin(), body.predecessors.end(), [&](std::uint32_t predecessor) { return !contains(nested.blocks, predecessor); })) return false;
+                return (body.terminator.kind == TerminatorKind::Branch || body.terminator.kind == TerminatorKind::ConditionalBranch) &&
+                    body.terminator.condition != BranchCondition::GotoVariable && body.terminator.gotoValue < 0 &&
+                    std::all_of(body.successors.begin(), body.successors.end(), [&](std::uint32_t target) { return contains(nested.blocks, target) || target == nested.mergeBlock; });
+            })) continue;
+            return &nested;
+        }
+        return nullptr;
+    };
     const auto joinsAt = [&](std::uint32_t join, std::uint32_t other) {
         const auto* armTail = &graph.FindBlock(other);
-        while (armTail->terminator.kind == TerminatorKind::Branch) {
+        while (armTail->terminator.kind == TerminatorKind::Branch && nestedLoopAt(armTail->id) == nullptr) {
             if (armTail->id == block.id || armTail->id == loop->headerBlock || armTail->id == join || armTail->id == loop->continueBlock || armTail->id == loop->mergeBlock || !isInsideLoopConstruct(graph, *loop, armTail->id) || armTail->predecessors.size() != 1u || armTail->successors.size() != 1u || armTail->terminator.condition == BranchCondition::GotoVariable || armTail->terminator.gotoValue >= 0) return false;
             armTail = &graph.FindBlock(armTail->successors.front());
             if (armTail->id == block.id || armTail->id == loop->headerBlock || armTail->id == join || armTail->id == loop->continueBlock || armTail->id == loop->mergeBlock || !isInsideLoopConstruct(graph, *loop, armTail->id)) return false;
@@ -492,11 +514,13 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
                 if ((next.terminator.kind != TerminatorKind::Branch && next.terminator.kind != TerminatorKind::ConditionalBranch) || next.terminator.condition == BranchCondition::GotoVariable || next.successors.empty()) return false;
                 visited[blockId] = 1u;
                 pending.emplace_back(blockId, true);
-                for (const auto target : next.successors) pending.emplace_back(target, false);
+                if (const auto* nested = nestedLoopAt(blockId)) pending.emplace_back(nested->mergeBlock, false);
+                else for (const auto target : next.successors) pending.emplace_back(target, false);
             }
             return true;
         };
-        const bool armLeavesOrJoins = arm.terminator.kind == TerminatorKind::ConditionalBranch && arm.predecessors.size() == 1u && std::all_of(arm.successors.begin(), arm.successors.end(), joinsOrLeaves);
+        const auto* nestedArm = nestedLoopAt(arm.id);
+        const bool armLeavesOrJoins = nestedArm != nullptr ? joinsOrLeaves(nestedArm->mergeBlock) : arm.terminator.kind == TerminatorKind::ConditionalBranch && arm.predecessors.size() == 1u && std::all_of(arm.successors.begin(), arm.successors.end(), joinsOrLeaves);
         return armLeavesOrJoins && isInsideLoopConstruct(graph, *loop, other) && isInsideLoopConstruct(graph, *loop, join) && graph.Dominates(block.id, join);
     };
     if (joinsAt(trueTarget, falseTarget)) {

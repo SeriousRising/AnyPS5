@@ -161,6 +161,35 @@ int main() {
                 if (GraphToString(graph) != normalized) throw std::runtime_error("loop-local selection merges are not idempotent");
             }
         }
+        for (unsigned conditions = 0; conditions < 2u; ++conditions) {
+            for (unsigned mask = 0; mask < 32u; ++mask) {
+                auto edges = std::vector<std::vector<std::uint32_t>>{{1, 7}, {2, 6}, {3, 2}, {4, 5}, {5, 6}, {6}, {0}, {}};
+                unsigned condition = 0;
+                for (auto& targets : edges) {
+                    if (targets.size() == 2u && (mask & (1u << condition++))) std::swap(targets[0], targets[1]);
+                }
+                auto graph = makeGraph(edges);
+                if (conditions != 0u) {
+                    graph.FindBlock(1).terminator.condition = BranchCondition::ExecZero;
+                    graph.FindBlock(3).terminator.condition = BranchCondition::SccZero;
+                }
+                const auto original = graph;
+                Structurizer{}.Structurize(graph);
+                if (graph.blocks.size() > original.blocks.size() + 7u || graph.naturalLoops.size() != 2u) throw std::runtime_error("nested-loop selection joins did not retain two bounded loops");
+                for (const auto& source : original.blocks) {
+                    const auto expected = source.id == 5u || source.id == 6u ? 2 : 1;
+                    if (std::count_if(graph.blocks.begin(), graph.blocks.end(), [&](const BasicBlock& block) { return block.instructionBegin == source.instructionBegin && block.instructionEnd == source.instructionEnd; }) != expected) throw std::runtime_error("nested-loop selection joins copied or lost an instruction range");
+                }
+                for (const auto& member : graph.blocks) {
+                    if (member.terminator.condition == BranchCondition::GotoVariable || member.terminator.gotoValue >= 0) throw std::runtime_error("nested-loop selection joins introduced route variables");
+                }
+                requireEmptyContinuations(graph);
+                requireStructuredBranches(graph, "nested-loop selection joins");
+                const auto normalized = GraphToString(graph);
+                Structurizer{}.Structurize(graph);
+                if (GraphToString(graph) != normalized) throw std::runtime_error("nested-loop selection joins are not idempotent");
+            }
+        }
         for (unsigned control = 0; control < 8u; ++control) {
             auto graph = makeGraph({{1, 3}, {2}, {0, 5}, {4}, {5, 0}, {}});
             if (control == 0u) graph.FindBlock(3).terminator.kind = TerminatorKind::Unsupported;
@@ -266,7 +295,24 @@ int main() {
         Structurizer{}.Structurize(cyclicTail);
         requireEmptyContinuations(cyclicTail);
         requireStructuredBranches(cyclicTail, "a conditional tail containing a nested cycle");
-        requireMergeReachesRange(cyclicTail, 2u, 7u);
+        requireMergeReachesRange(cyclicTail, 2u, 4u);
+        for (unsigned control = 0; control < 6u; ++control) {
+            auto graph = makeGraph({{1}, {2, 8}, {3, 4}, {5, 6}, {7}, {5, 4}, {7}, {1}, {}});
+            auto& terminator = graph.FindBlock(5).terminator;
+            if (control == 0u) terminator.kind = TerminatorKind::Unsupported;
+            if (control == 1u) terminator.kind = TerminatorKind::IndirectBranch;
+            if (control == 2u) terminator.condition = BranchCondition::GotoVariable;
+            if (control == 3u) {
+                terminator.gotoVariable = 0;
+                terminator.gotoValue = 1;
+            }
+            if (control == 4u) graph.FindBlock(2).terminator.condition = BranchCondition::IndirectTarget;
+            if (control == 5u) terminator.condition = BranchCondition::IndirectTarget;
+            Structurizer{}.Structurize(graph);
+            requireMergeReachesRange(graph, 2u, 7u);
+            requireEmptyContinuations(graph);
+            requireStructuredBranches(graph, "nested-loop summary retains unsupported and route-state guards");
+        }
         auto sequentialContinues = makeGraph({{1}, {2, 6}, {4, 3}, {4, 5}, {1}, {4}, {}});
         Structurizer{}.Structurize(sequentialContinues);
         requireEmptyContinuations(sequentialContinues);
