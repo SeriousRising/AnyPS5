@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILER_PIPELINESPECIALIZATION_HPP
 #define CORE_SHADER_RECOMPILER_PIPELINESPECIALIZATION_HPP
 
+#include "RuntimeAbi.hpp"
 #include <cstdint>
 
 namespace ShaderRecompiler {
@@ -29,10 +30,12 @@ inline constexpr std::uint32_t DualSourceBlend = 8232u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 inline constexpr std::uint32_t DescriptorIndexBase = 16384u;
-inline constexpr std::uint32_t DescriptorIndexStride = 128u;
+inline constexpr std::uint32_t DescriptorIndexStride = 256u;
 inline constexpr std::uint32_t ImageModeBase = 32768u;
 inline constexpr std::uint32_t ImageModeStride = 256u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;
+
+static_assert(DescriptorIndexBase + static_cast<std::uint32_t>(RuntimeAbi::Binding::Count) * DescriptorIndexStride <= ImageModeBase);
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;

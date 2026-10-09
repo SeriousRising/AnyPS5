@@ -3,6 +3,7 @@
 #include "Optimization/BindingAllocator.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "ShaderDiskCache.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -147,7 +148,7 @@ void CheckHeaps() {
     const auto full = allocate(image, RuntimeAbi::SampledHeapCapacity, RuntimeAbi::SamplerHeapCapacity / 2u);
     Require(single.layout.ShaderDataDwords() == full.layout.ShaderDataDwords() && single.layout.memoryOffsetDword == full.layout.memoryOffsetDword && !full.layout.UsesPushData(), "runtime layout depends on resource count");
     Require(full.layout.memoryOffsetDword == 0u && full.layout.DispatchThreadLimitDword() == 0u && full.layout.ShaderDataDwords() == 0u, "direct image resources allocated runtime metadata");
-    Reject([&] { allocate(image, RuntimeAbi::SampledHeapCapacity + 1u); }, "heap capacity exceeded");
+    Require(BindingAllocator{}.FindBinding(allocate(image, RuntimeAbi::SampledHeapCapacity + 1u).layout, DescriptorBindingForImage(image)).resources.size() == RuntimeAbi::SampledHeapCapacity + 1u, "logical sampled heap was capped before compaction");
     Require(BindingAllocator{}.FindBinding(allocate(image, 40u).layout, DescriptorBindingForImage(image)).resources.size() == 40u, "a sampled heap does not hold 40 images of one class");
     Require(BindingAllocator{}.FindBinding(allocate(image, RuntimeAbi::SampledHeapCapacity).layout, DescriptorBindingForImage(image)).resources.size() == RuntimeAbi::SampledHeapCapacity, "a sampled heap does not hold a full class of images");
     Require(ResourceMaterializer::BindlessSlots() == 16u, "bindless image tables changed size with the sampled heap");
@@ -160,7 +161,7 @@ void CheckHeaps() {
         Require(resources.size() == count, "direct storage images did not retain their heap elements");
         for (std::uint32_t index = 0u; index < count; ++index) Require(resources[index] == index, "direct storage image resource indices changed");
     }
-    Reject([&] { allocate(image, 17u); }, "heap capacity exceeded");
+    Require(BindingAllocator{}.FindBinding(allocate(image, 17u).layout, DescriptorBindingForImage(image)).resources.size() == 17u, "logical storage heap was capped before compaction");
     image.mipMode = ImageMipMode::DynamicStorage;
     image.mipCount = RuntimeAbi::StorageMipSlots;
     const auto storage = allocate(image, 1u);
@@ -170,7 +171,8 @@ void CheckHeaps() {
     const auto capacity = RuntimeAbi::StorageHeapCapacity / image.mipCount;
     const auto filled = allocate(image, capacity);
     Require(BindingAllocator{}.FindBinding(filled.layout, DescriptorBindingForImage(image)).resources.size() == RuntimeAbi::StorageHeapCapacity, "a full storage heap was not allocated");
-    Reject([&] { allocate(image, capacity + 1u); }, "heap capacity exceeded");
+    Require(BindingAllocator{}.FindBinding(allocate(image, 5u).layout, DescriptorBindingForImage(image)).resources.size() == 20u, "logical dynamic storage heap was capped before compaction");
+    Reject([&] { allocate(image, ShaderInfo::MaxImages + 1u); }, "logical image heap specialization capacity");
     const auto allocateImages = [](std::vector<ImageResource> images) {
         IrProgram program;
         program.Metadata().shaderInfoComplete = true;
@@ -181,7 +183,7 @@ void CheckHeaps() {
     Require(BindingAllocator{}.FindBinding(interleaved.layout, DescriptorBindingForImage(image)).resources == std::vector<std::uint32_t>{0u, 1u, 1u, 1u, 1u, 2u, 3u, 3u, 3u, 3u}, "interleaved storage images overlap or changed their mip slots");
     const auto mixedFull = allocateImages({image, directStorage, image, directStorage, image, directStorage, directStorage});
     Require(BindingAllocator{}.FindBinding(mixedFull.layout, DescriptorBindingForImage(image)).resources == std::vector<std::uint32_t>{0u, 0u, 0u, 0u, 1u, 2u, 2u, 2u, 2u, 3u, 4u, 4u, 4u, 4u, 5u, 6u}, "a full mixed storage heap changed its resource or mip slots");
-    Reject([&] { allocateImages({image, directStorage, image, directStorage, image, directStorage, directStorage, directStorage}); }, "heap capacity exceeded");
+    Require(BindingAllocator{}.FindBinding(allocateImages({image, directStorage, image, directStorage, image, directStorage, directStorage, directStorage}).layout, DescriptorBindingForImage(image)).resources.size() == 17u, "logical mixed storage heap was capped before compaction");
     Reject([&] { allocate(image, 0u, RuntimeAbi::SamplerHeapCapacity / 2u + 1u); }, "sampler pairs");
     const std::array dimensions{RdnaImageDimension::Dim1D, RdnaImageDimension::Dim1DArray, RdnaImageDimension::Dim2D, RdnaImageDimension::Dim2DArray, RdnaImageDimension::Dim3D, RdnaImageDimension::Dim2DMsaa, RdnaImageDimension::Dim2DMsaaArray};
     std::set<std::uint32_t> classes;
@@ -234,6 +236,86 @@ void CheckStorageMips() {
     Reject(prepare, "invalid dynamic storage mip range");
 }
 
+ShaderRecompiler::ImageResource HeapImage(bool storage, bool array = false) {
+    using namespace ShaderRecompiler;
+    ImageResource image;
+    image.resourceClass = storage ? ImageResourceClass::Storage : ImageResourceClass::Sampled;
+    image.numericClass = IrTextureNumericClass::Float;
+    image.dimension = array ? RdnaImageDimension::Dim2DArray : RdnaImageDimension::Dim2D;
+    image.mipMode = storage ? ImageMipMode::DynamicStorage : ImageMipMode::None;
+    image.mipCount = storage ? RuntimeAbi::StorageMipSlots : 1u;
+    image.written = storage;
+    return image;
+}
+
+ShaderRecompiler::DescriptorValue HeapDescriptor(std::uint32_t index, bool integer, bool array = false, std::uint32_t levels = 1u) {
+    return {{index + 1u, ((integer ? 20u : 22u) << 20u) | (3u << 30u), 7u | (7u << 14u), 0xfacu | ((levels - 1u) << 16u) | ((array ? 13u : 9u) << 28u), 0u, 0u, 0u, 0u}, 8u};
+}
+
+void CheckCompact(std::uint32_t count, bool storage, bool array) {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Metadata().shaderInfoComplete = true;
+    auto& info = program.Resources().info;
+    info.images.assign(count, HeapImage(storage, array));
+    ResourceMaterializer::PrepareImageModes(info);
+    ResourceSnapshot snapshot;
+    for (std::uint32_t index = 0u; index < count; ++index) snapshot.images.push_back(HeapDescriptor(index, storage ? (index / 16u) % 2u != 0u : index >= 9u, array && index >= 32u));
+    auto allocation = BindingAllocator{}.Allocate(program, {0u, 0u, 0u, 128u});
+    for (const auto& logical : allocation.layout.descriptors) Require(logical.resources.size() == count * (storage ? 4u : 1u), "logical heap lost potential slots");
+    const auto plan = DescriptorBindingBuilder{}.Prepare(allocation.layout, info, IrShaderStage::Compute, snapshot);
+    auto malformed = allocation.layout;
+    malformed.descriptors.front().resources.resize(PipelineSpecialization::DescriptorIndexStride + 1u, 0u);
+    Reject([&] { DescriptorBindingBuilder{}.Prepare(malformed, info, IrShaderStage::Compute, snapshot); }, "logical heap specialization capacity");
+    std::set<std::uint32_t> ids;
+    for (const auto& value : plan.specialization) Require(ids.insert(value.id).second, "specialization IDs overlap");
+    std::uint32_t total = 0u;
+    for (const auto& entry : plan.bindings) {
+        Require(entry.resources.size() == entry.descriptor.count && entry.descriptor.count <= (storage ? RuntimeAbi::StorageHeapCapacity : RuntimeAbi::SampledHeapCapacity), "compact heap exceeds the physical limit");
+        total += entry.descriptor.count;
+    }
+    Require(total == count, "compact heap lost a runtime image");
+    for (const auto& logical : allocation.layout.descriptors) {
+        const auto kind = static_cast<std::uint32_t>(logical.kind);
+        std::uint32_t compact = 0u;
+        for (std::uint32_t element = 0u; element < logical.resources.size(); ++element) {
+            const auto resource = logical.resources[element];
+            const auto selected = ResourceMaterializer::RuntimeImageMode(info.images.at(resource), snapshot.images.at(resource), info.runtimeImageModes.at(resource));
+            const bool active = DescriptorBindingForImage(info.runtimeImageModes.at(resource).at(selected)) == logical.kind && (!storage || element % 4u == 0u);
+            const auto expected = active ? compact++ : 0u;
+            Require(std::ranges::find(plan.specialization, PipelineSpecializationConstant{PipelineSpecialization::DescriptorIndex(kind, element), expected}) != plan.specialization.end(), "logical-to-compact index mapping changed");
+        }
+    }
+    CompiledVariant variant;
+    variant.info.info = info;
+    variant.info.bindings = allocation.layout;
+    variant.bindings.layout = allocation.layout;
+    const std::array<std::byte, 3> key{std::byte{1}, std::byte{2}, std::byte{3}};
+    CompiledVariant decoded;
+    Require(ShaderDiskCache::DecodeEntry(ShaderDiskCache::EncodeEntry(key, variant), key, decoded) == ShaderDiskCache::LoadStatus::Loaded, "logical layout disk round trip failed");
+    Require(decoded.bindings.layout == allocation.layout && decoded.info.info == info, "disk cache lost the logical mapping");
+}
+
+void CheckPhysicalRejections() {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Metadata().shaderInfoComplete = true;
+    auto& info = program.Resources().info;
+    info.images.assign(RuntimeAbi::StorageHeapCapacity / RuntimeAbi::StorageMipSlots + 1u, HeapImage(true));
+    ResourceMaterializer::PrepareImageModes(info);
+    ResourceSnapshot snapshot;
+    for (std::uint32_t index = 0u; index < info.images.size(); ++index) snapshot.images.push_back(HeapDescriptor(index, false, false, RuntimeAbi::StorageMipSlots));
+    const auto allocation = BindingAllocator{}.Allocate(program, {0u, 0u, 0u, 128u});
+    Reject([&] { DescriptorBindingBuilder{}.Prepare(allocation.layout, info, IrShaderStage::Compute, snapshot); }, "heap capacity exceeded");
+}
+
+void CheckRanges() {
+    using namespace ShaderRecompiler;
+    Require(PipelineSpecialization::DescriptorIndexStride >= ShaderInfo::MaxImages * RuntimeAbi::StorageMipSlots, "descriptor specialization stride is smaller than the logical heap");
+    Require(PipelineSpecialization::DescriptorIndex(static_cast<std::uint32_t>(RuntimeAbi::Binding::Count) - 1u, 255u) < PipelineSpecialization::ImageModeBase, "descriptor specialization range overlaps image modes");
+    Require(PipelineSpecialization::ImageModeBase + ShaderInfo::MaxImages * PipelineSpecialization::ImageModeStride <= PipelineSpecialization::CompareBase, "image mode specialization range overlaps compare states");
+}
+
 }
 
 int main() {
@@ -241,6 +323,12 @@ int main() {
         CheckAbi();
         CheckHeaps();
         CheckStorageMips();
+        CheckCompact(5u, true, false);
+        CheckCompact(17u, false, false);
+        CheckCompact(33u, true, true);
+        CheckCompact(64u, true, true);
+        CheckPhysicalRejections();
+        CheckRanges();
         CheckProfile();
         std::cout << "shader runtime ABI and device profile tests passed\n";
         return 0;

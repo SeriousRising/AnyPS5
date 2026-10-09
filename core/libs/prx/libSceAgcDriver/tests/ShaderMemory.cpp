@@ -17,6 +17,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "CacheKey.hpp"
+#include "ShaderDiskCache.hpp"
 #include "BdaAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include <memory>
 #include <stdexcept>
 #include <span>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -3162,6 +3164,73 @@ void verifySrgbDepthCompareModes() {
     }
 }
 
+void verifyLogicalImageSpecialization() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 7> capabilities{spv::CapabilityShader, spv::CapabilityImageGatherExtended, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityImageQuery, spv::CapabilityStorageImageWriteWithoutFormat};
+    auto target = BufferTarget();
+    target.supportedCapabilities = capabilities;
+    target.subgroupSize = 32u;
+    target.vulkanVersion = 0x00402000u;
+    target.spirvVersion = 0x00010500u;
+    for (const auto count : {33u, ShaderInfo::MaxImages}) {
+        std::vector<std::uint32_t> code{0x7e3c0280u, 0x7e3e0280u, 0x7e400280u, 0x7e420280u, 0x7e1402ffu, 0x3f800000u};
+        for (std::uint32_t image = 0u; image < count; ++image) code.insert(code.end(), {0xf40c0200u, 0xfa000000u | (image * 32u), 0xf0241128u, 0x00020a1eu});
+        code.push_back(0xbf810000u);
+        const std::array<std::uint32_t, 2> userData{};
+        const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0u, {}}, {32u, 0u, userData, compute, std::nullopt, std::nullopt, {}}, target, {0u, 0u, 0u, 128u}};
+        const auto handle = PrepareShader(request);
+        const auto& artifact = GetPreparedArtifact(*handle);
+        const auto& words = artifact.spirv.Words();
+        std::set<std::uint32_t> ids;
+        for (std::size_t cursor = 5u; cursor < words.size();) {
+            const auto length = words[cursor] >> 16u;
+            require(length != 0u && length <= words.size() - cursor, "logical boundary module is truncated");
+            if ((words[cursor] & 0xffffu) == spv::OpDecorate && length == 4u && words[cursor + 2u] == spv::DecorationSpecId) require(ids.insert(words[cursor + 3u]).second, "logical boundary module has duplicate specialization IDs");
+            cursor += length;
+        }
+        require(ids.contains(PipelineSpecialization::DescriptorIndex(RuntimeAbi::FirstStorageImageBinding + 3u, (count - 1u) * RuntimeAbi::StorageMipSlots)), "logical boundary module lost its last resource");
+        require(artifact.runtimeImageCount == 0u, "direct logical slots allocated runtime metadata");
+    }
+    constexpr std::uint32_t PerFormat = 16u;
+    constexpr std::uint32_t Count = PerFormat * 3u;
+    std::vector<std::uint32_t> code{0x7e3c0280u, 0x7e3e0280u};
+    for (std::uint32_t image = 0u; image < Count; ++image) code.insert(code.end(), {0xf40c0200u, 0xfa000000u | (image * 32u), 0xf0001108u, 0x00020a1eu, 0xe0700000u | (image * 4u), 0x80010a00u});
+    code.push_back(0xbf810000u);
+    std::array<std::uint32_t, 8> userData{};
+    const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0u, {}}, {32u, 0u, userData, compute, std::nullopt, std::nullopt, {}}, target, {0u, 0u, 0u, 128u}};
+    const auto handle = PrepareShader(request);
+    const auto& artifact = GetPreparedArtifact(*handle);
+    require(!artifact.spirv.Words().empty() && artifact.runtimeImageCount == 0u, "direct sampled logical heap did not compile without runtime descriptors");
+    std::array<std::array<std::uint32_t, 8>, Count> table;
+    for (std::uint32_t image = 0u; image < Count; ++image) table[image] = {image + 1u, (22u << 20u) | (3u << 30u), 7u | (7u << 14u), 0x90000facu, 0u, 0u, 0u, 0u};
+    const auto address = reinterpret_cast<std::uintptr_t>(table.data());
+    userData[0] = static_cast<std::uint32_t>(address);
+    userData[1] = static_cast<std::uint32_t>(address >> 32u);
+    const std::array memory{MemoryRegion{address, std::as_bytes(std::span{table})}};
+    request.context.memory = memory;
+    constexpr std::array formats{22u, 20u, 21u};
+    for (std::uint32_t image = 0u; image < Count; ++image) table[image][1] = (formats[image / PerFormat] << 20u) | (3u << 30u);
+    const auto result = Recompile(request);
+    require(result.cacheHit && result.variantId == artifact.variantId, "runtime sampled formats changed the static artifact");
+    std::uint32_t heaps = 0u;
+    for (const auto& binding : result.bindings) {
+        if (binding.role != DescriptorRole::GuestImages) continue;
+        require(binding.count == PerFormat, "runtime sampled formats did not compact into complete typed heaps");
+        ++heaps;
+    }
+    require(heaps == 3u, "runtime sampled formats lost a typed heap");
+    std::vector<std::byte> encoded;
+    ShaderDiskCache::EncodeResult(result, encoded);
+    RecompileResult decoded;
+    require(ShaderDiskCache::DecodeResult(encoded, decoded), "logical image result disk round trip failed");
+    verifyResult(result, decoded);
+    require(result.specialization == decoded.specialization && result.runtimeImageResources == decoded.runtimeImageResources && result.runtimeImageCount == decoded.runtimeImageCount, "disk cache lost image specialization metadata");
+    const auto replay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(request));
+    verifyResult(result, Recompile(replay.request));
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
@@ -3181,6 +3250,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         require(argc == 1, "unknown shader memory test arguments");
+        verifyLogicalImageSpecialization();
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyFrontendPair();
