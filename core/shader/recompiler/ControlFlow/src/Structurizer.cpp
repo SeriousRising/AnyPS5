@@ -1538,7 +1538,7 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph) const {
 
         const NaturalLoop* unmerged = nullptr;
         for (const auto& loop : graph.naturalLoops) {
-            if (loop.exitBlocks.size() > 1u && loop.mergeBlock == InvalidControlFlowId && (unmerged == nullptr || loop.blocks.size() < unmerged->blocks.size())) {
+            if (loop.exitBlocks.size() > 1u && (loop.mergeBlock == InvalidControlFlowId || mergeLeavesContainingLoop(graph, loop.headerBlock, loop.mergeBlock)) && (unmerged == nullptr || loop.blocks.size() < unmerged->blocks.size())) {
                 unmerged = &loop;
             }
         }
@@ -1548,7 +1548,7 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph) const {
         std::string refusal;
         auto routed = routeLoopExits(graph, *unmerged, [this](ControlFlowGraph& candidate) { recomputeAnalyses(candidate); }, refusal);
         if (!routed) {
-            throw std::runtime_error("loop at block " + std::to_string(unmerged->headerBlock) + " has exits with no common post-dominator: " + refusal);
+            throw std::runtime_error("loop at block " + std::to_string(unmerged->headerBlock) + " cannot route exits to a local merge: " + refusal);
         }
         graph = std::move(*routed);
     }
