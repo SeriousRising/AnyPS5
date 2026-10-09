@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -438,6 +439,76 @@ void RegistrationWithoutSpecials() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void GraphicsHeaderCopies() {
+    alignas(256) std::array<std::uint32_t, 1> vertexCode{0xbf810000u};
+    alignas(256) std::array<std::uint32_t, 1> pixelCode{0xbf810000u};
+    struct Header {
+        Shader shader{};
+        ShaderUserData users{};
+        std::array<ShaderRegister, 3> registers{};
+        std::array<ShaderRegister, 6> context{{{0x2d5, 0x00402000u}, {0x1b6, 0x8000u}, {0x1b3, 0}, {0x1b4, 0}, {0x203, 0}, {0x1c5, 0}}};
+        std::array<std::uint16_t, ShaderRegs::AGC_DIRECT_RESOURCE_TYPE_COUNT> offsets{};
+        ShaderSemantic semantic{};
+    };
+    std::array<Header, 2> headers{};
+    for (std::size_t index = 0; index < headers.size(); ++index) {
+        auto& header = headers[index];
+        const auto* code = index == 0 ? vertexCode.data() : pixelCode.data();
+        const auto address = reinterpret_cast<std::uintptr_t>(code);
+        const auto program = index == 0 ? 0xc8u : 0x8u;
+        header.shader.file_header = 0x34333231u;
+        header.shader.version = 0x18;
+        header.shader.type = index == 0 ? 2u : 1u;
+        header.shader.header_size = sizeof(header);
+        header.shader.shader_size = sizeof(vertexCode);
+        header.shader.code = code;
+        header.shader.user_data = &header.users;
+        header.shader.sh_registers = header.registers.data();
+        header.shader.num_sh_registers = header.registers.size();
+        header.shader.cx_registers = header.context.data();
+        header.shader.num_cx_registers = header.context.size();
+        header.registers = {{{program, static_cast<std::uint32_t>(address >> 8u)}, {program + 1u, static_cast<std::uint32_t>(address >> 40u)}, {index == 0 ? 0x8bu : 0xbu, index == 0 ? 4u << 1u : 0u}}};
+    }
+    auto& vertex = headers.front();
+    vertex.offsets.fill(ShaderRegs::AGC_ILLEGAL_DIRECT_OFFSET);
+    vertex.offsets[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+    vertex.offsets[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+    vertex.users.direct_resource_offset = vertex.offsets.data();
+    vertex.users.direct_resource_count = vertex.offsets.size();
+    vertex.shader.input_semantics = &vertex.semantic;
+    vertex.shader.num_input_semantics = 1;
+    vertex.semantic.hardware_mapping = 8;
+    vertex.semantic.size_in_elements = 4;
+    const std::array<std::uint32_t, 4> users{};
+    const auto info = AgcDriver::Graphics::DecodeVertexStageInfo(std::as_bytes(std::span(&vertex, 1)), reinterpret_cast<std::uintptr_t>(&vertex), users, nullptr, true);
+    Require(info.fetchEmbedded && info.fetchBufferReg == 0 && info.fetchAttribReg == 2 && info.resourcesNum == 1 && info.resourcesDst[0].registerStart == 8 && info.resourcesDst[0].registersNum == 4, "registered header lost its vertex fetch ABI");
+    for (const auto& header : headers) AgcDriverRegisterShader_nid_postfix(&header.shader);
+    std::array<Shader, 2> copies{headers[0].shader, headers[1].shader};
+    static_assert(offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers) < sizeof(Shader));
+    for (auto& copy : copies) {
+        copy.user_data = nullptr;
+        reinterpret_cast<std::byte*>(&copy)[sizeof(Shader) - 1] = std::byte{0x7d};
+    }
+    const std::array<const Shader*, 2> stages{&copies[0], &copies[1]};
+    const std::array<ShaderRegister, 1> primitive{{{0x242, 7}}};
+    const auto resolve = [&] {
+        AgcDriverResolveGraphicsAbi_nid_postfix(&copies[0], &copies[1], 7);
+        AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, {}, primitive);
+    };
+    resolve();
+    for (auto& copy : copies) {
+        copy.target ^= 1u;
+        ExpectFailure([&] { AgcDriverResolveGraphicsAbi_nid_postfix(&copies[0], &copies[1], 7); }, "rectangle ABI refers to a replaced shader header");
+        ExpectFailure([&] { AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, {}, primitive); }, "graphics ABI refers to a replaced shader header");
+        copy.target ^= 1u;
+        copy.shader_size += 4;
+        ExpectFailure([&] { AgcDriverResolveGraphicsAbi_nid_postfix(&copies[0], &copies[1], 7); }, "rectangle ABI refers to a replaced shader header");
+        ExpectFailure([&] { AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, {}, primitive); }, "graphics ABI refers to a replaced shader header");
+        copy.shader_size -= 4;
+    }
+    resolve();
+}
+
 void Registration(bool indirect) {
     UnsupportedTypeRegistration();
     alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
@@ -670,6 +741,7 @@ int main(int argc, char** argv) {
         device.reset();
         SharedCodeHeaders();
         RegistrationWithoutSpecials();
+        GraphicsHeaderCopies();
         Registration(argc == 2);
         std::cout << "prepared shader and transactional registration tests passed\n";
         return 0;
