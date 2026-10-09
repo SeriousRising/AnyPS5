@@ -475,7 +475,7 @@ bool isFetchCall(const RdnaProgram& program, std::uint32_t index, const SwappcIn
     return swappc != nullptr && swappc->fetchCallAllowed && positional && (userDataPair || outsideProgram);
 }
 
-std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const SwappcInfo* swappc) {
+std::vector<SwappcCall> analyzeSwappcTargets(const RdnaProgram& program, const SwappcInfo* swappc, std::optional<std::uint32_t>* unresolved = nullptr) {
     std::vector<SwappcCall> calls;
     for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
         const auto& instruction = program.instructions[index];
@@ -508,12 +508,20 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
             continue;
         }
         if (!staticTarget || call.targetIndex == InvalidControlFlowId) {
+            if (unresolved != nullptr) {
+                *unresolved = instruction.programCounter;
+                return calls;
+            }
             throw std::invalid_argument("computed/data-dependent s_swappc_b64 call target at program counter " + toHexString(instruction.programCounter) + " is not statically resolvable");
         }
         call.targetProgramCounter = target;
         calls.push_back(call);
     }
+    return calls;
+}
 
+std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const SwappcInfo* swappc) {
+    auto calls = analyzeSwappcTargets(program, swappc);
     for (auto& call : calls) {
         std::uint32_t returnIndex = InvalidControlFlowId;
         for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
@@ -895,19 +903,9 @@ void GraphBuilder::linkBlocks(std::vector<BasicBlock>& blocks, const RdnaProgram
 }
 
 std::optional<std::uint32_t> UnresolvableSwappcTarget(const RdnaProgram& program, const SwappcInfo* swappc) {
-    for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
-        const auto& instruction = program.instructions[index];
-        if (instruction.op != RdnaOpcode::SSwappcB64) {
-            continue;
-        }
-        std::uint32_t target = instruction.branchTarget;
-        const bool staticTarget = resolveSetpcTarget(program, index, target);
-        const bool inProgram = staticTarget && instructionIndexOfProgramCounter(program, target) != InvalidControlFlowId;
-        if (!inProgram && !isFetchCall(program, index, swappc, staticTarget)) {
-            return instruction.programCounter;
-        }
-    }
-    return std::nullopt;
+    std::optional<std::uint32_t> unresolved;
+    static_cast<void>(analyzeSwappcTargets(program, swappc, &unresolved));
+    return unresolved;
 }
 
 ControlFlowGraph GraphBuilder::Build(const RdnaProgram& program, const SwappcInfo* swappc) const {
