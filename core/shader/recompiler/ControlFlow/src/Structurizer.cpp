@@ -467,16 +467,27 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
     const auto joinsAt = [&](std::uint32_t join, std::uint32_t other) {
         const auto& arm = graph.FindBlock(other);
         const auto joinsOrLeaves = [&](std::uint32_t successor) {
-            std::vector<bool> visited(graph.blocks.size(), false);
-            for (;;) {
-                if (successor == loop->headerBlock) return false;
-                if (successor == join || successor == loop->continueBlock || successor == loop->mergeBlock) return true;
-                if (!isInsideLoopConstruct(graph, *loop, successor) || visited[successor]) return false;
-                visited[successor] = true;
-                const auto& next = graph.FindBlock(successor);
-                if (next.terminator.kind != TerminatorKind::Branch || next.successors.size() != 1u) return false;
-                successor = next.successors.front();
+            std::vector<std::uint8_t> visited(graph.blocks.size(), 0u);
+            std::vector<std::pair<std::uint32_t, bool>> pending{{successor, false}};
+            while (!pending.empty()) {
+                const auto [blockId, completed] = pending.back();
+                pending.pop_back();
+                if (blockId == loop->headerBlock) return false;
+                if (blockId == join || blockId == loop->continueBlock || blockId == loop->mergeBlock) continue;
+                if (!isInsideLoopConstruct(graph, *loop, blockId)) return false;
+                if (completed) {
+                    visited[blockId] = 2u;
+                    continue;
+                }
+                if (visited[blockId] == 1u) return false;
+                if (visited[blockId] == 2u) continue;
+                const auto& next = graph.FindBlock(blockId);
+                if ((next.terminator.kind != TerminatorKind::Branch && next.terminator.kind != TerminatorKind::ConditionalBranch) || next.terminator.condition == BranchCondition::GotoVariable || next.successors.empty()) return false;
+                visited[blockId] = 1u;
+                pending.emplace_back(blockId, true);
+                for (const auto target : next.successors) pending.emplace_back(target, false);
             }
+            return true;
         };
         const bool armLeavesOrJoins = arm.terminator.kind == TerminatorKind::ConditionalBranch && arm.predecessors.size() == 1u && std::all_of(arm.successors.begin(), arm.successors.end(), joinsOrLeaves);
         return armLeavesOrJoins && isInsideLoopConstruct(graph, *loop, other) && isInsideLoopConstruct(graph, *loop, join) && graph.Dominates(block.id, join);
