@@ -38,11 +38,25 @@ alignas(256) constexpr std::array<std::uint32_t, 22> SelectionCode{
     0x80010401, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 27> NestedSelectionCode{
+    0x34020082, 0xe0302000, 0x80000401, 0xbf8c3f70, 0xbe890380, 0xbf0a0a09, 0xbf840011, 0xbe8b0380, 0xbf0a0809,
+    0xbf84000b, 0x4a080882, 0x800b810b, 0xbf0a0c0b, 0xbf85fffc, 0xbf068109, 0xbf840003, 0x4a080883, 0xbf0a0d09,
+    0xbf840002, 0x4a080887, 0xbf820000, 0x4a08088b, 0x80098109, 0xbf82ffed, 0xe0702000, 0x80010401, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 26> CyclicSelectionCode{
+    0x34020082, 0xe0302000, 0x80000401, 0xbf8c3f70, 0xbe890380, 0xbf0a0a09, 0xbf840010, 0xbe8b0380, 0xbf0a0809,
+    0xbf840006, 0xbf068109, 0xbf840006, 0x4a080882, 0x800b810b, 0xbf0a0c0b, 0xbf85fffc, 0x4a080883, 0xbf820002,
+    0x4a080887, 0xbf820000, 0x4a08088b, 0x80098109, 0xbf82ffee, 0xe0702000, 0x80010401, 0xbf810000,
+};
+
 struct Case {
     const char* name;
     std::uint32_t selector;
     std::uint32_t added;
     std::uint32_t limit = 4;
+    std::uint32_t innerLimit = 3;
+    std::uint32_t tailLimit = 2;
 };
 
 const std::array<Case, 5> Cases{{
@@ -70,6 +84,28 @@ const std::array<Case, 8> SelectionCases{{
     {"conditional repeat falls through to the local join", 2u, 35u, 2u},
 }};
 
+const std::array<Case, 9> NestedSelectionCases{{
+    {"nested loop bypassed on every iteration", 0u, 44u},
+    {"nested loop before the local join", 1u, 57u},
+    {"nested loop and both local joins", 2u, 73u},
+    {"nested loop on three outer iterations", 3u, 86u},
+    {"nested loop on every outer iteration", 4u, 99u},
+    {"single nested iteration", 2u, 65u, 4u, 1u},
+    {"conditional arm skips the inner local join", 2u, 66u, 4u, 3u, 0u},
+    {"short outer loop with both local joins", 2u, 51u, 2u},
+    {"outer loop bypassed", 4u, 0u, 0u},
+}};
+
+const std::array<Case, 7> CyclicSelectionCases{{
+    {"cyclic tail bypasses the nested loop", 0u, 56u},
+    {"cyclic tail enters its alternate arm", 1u, 60u},
+    {"cyclic tail enters the nested loop", 2u, 66u},
+    {"cyclic tail takes both sides of the join", 3u, 70u},
+    {"cyclic tail before every outer latch", 4u, 74u},
+    {"cyclic tail with a single nested iteration", 2u, 62u, 4u, 1u},
+    {"cyclic tail with a short outer loop", 2u, 38u, 2u},
+}};
+
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t count) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), count, 0x01016facu};
@@ -78,13 +114,15 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t co
 void Run(AgcDriver::VulkanDevice& device, const Case& test, std::uint32_t waveSize, std::span<const std::uint32_t> code) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) Input[tid * Stride] = tid * 0x01010101u + 7u;
     Output.fill(0xdeadbeefu);
-    std::vector<std::uint32_t> userData(SelectorRegister + 3u, 0u);
+    std::vector<std::uint32_t> userData(SelectorRegister + 6u, 0u);
     const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size()));
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size()));
     std::copy(input.begin(), input.end(), userData.begin());
     std::copy(output.begin(), output.end(), userData.begin() + 4);
     userData[SelectorRegister] = test.selector;
     userData[SelectorRegister + 2u] = test.limit;
+    userData[SelectorRegister + 4u] = test.innerLimit;
+    userData[SelectorRegister + 5u] = test.tailLimit;
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -127,6 +165,14 @@ int main() {
             }
             for (const auto& test : SelectionCases) {
                 Run(*device, test, waveSize, SelectionCode);
+                Check(test, waveSize);
+            }
+            for (const auto& test : NestedSelectionCases) {
+                Run(*device, test, waveSize, NestedSelectionCode);
+                Check(test, waveSize);
+            }
+            for (const auto& test : CyclicSelectionCases) {
+                Run(*device, test, waveSize, CyclicSelectionCode);
                 Check(test, waveSize);
             }
         }
