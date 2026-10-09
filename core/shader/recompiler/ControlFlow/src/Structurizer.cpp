@@ -465,7 +465,14 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
         return falseTarget;
     }
     const auto joinsAt = [&](std::uint32_t join, std::uint32_t other) {
-        const auto& arm = graph.FindBlock(other);
+        const auto* armTail = &graph.FindBlock(other);
+        while (armTail->terminator.kind == TerminatorKind::Branch) {
+            if (armTail->id == block.id || armTail->id == loop->headerBlock || armTail->id == join || armTail->id == loop->continueBlock || armTail->id == loop->mergeBlock || !isInsideLoopConstruct(graph, *loop, armTail->id) || armTail->predecessors.size() != 1u || armTail->successors.size() != 1u || armTail->terminator.condition == BranchCondition::GotoVariable || armTail->terminator.gotoValue >= 0) return false;
+            armTail = &graph.FindBlock(armTail->successors.front());
+            if (armTail->id == block.id || armTail->id == loop->headerBlock || armTail->id == join || armTail->id == loop->continueBlock || armTail->id == loop->mergeBlock || !isInsideLoopConstruct(graph, *loop, armTail->id)) return false;
+        }
+        const auto& arm = *armTail;
+        if (arm.id != other && (arm.terminator.condition == BranchCondition::GotoVariable || arm.terminator.gotoValue >= 0)) return false;
         const auto joinsOrLeaves = [&](std::uint32_t successor) {
             std::vector<std::uint8_t> visited(graph.blocks.size(), 0u);
             std::vector<std::pair<std::uint32_t, bool>> pending{{successor, false}};

@@ -32,10 +32,17 @@ alignas(256) constexpr std::array<std::uint32_t, 18> NestedCode{
     0x80098109, 0x4a080882, 0xbf098209, 0xbf85fff9, 0x4a080888, 0xbf82fffa, 0xe0702000, 0x80010401, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 22> SelectionCode{
+    0x34020082, 0xe0302000, 0x80000401, 0xbf8c3f70, 0xbf0a0a09, 0xbf84000d, 0xbf0a0809, 0xbf840008, 0x4a080883, 0xbf820000,
+    0xbf068109, 0xbf840004, 0x4a080887, 0x80098109, 0xbf0a0a09, 0xbf85fff4, 0x4a08088b, 0x80098109, 0xbf82fff1, 0xe0702000,
+    0x80010401, 0xbf810000,
+};
+
 struct Case {
     const char* name;
     std::uint32_t selector;
     std::uint32_t added;
+    std::uint32_t limit = 4;
 };
 
 const std::array<Case, 5> Cases{{
@@ -52,6 +59,17 @@ const std::array<Case, 3> NestedCases{{
     {"nested loop exit sharing the outer merge after four iterations", 4u, 27u},
 }};
 
+const std::array<Case, 8> SelectionCases{{
+    {"unconditional arm bypassed", 0u, 44u},
+    {"unconditional arm on the first iteration", 1u, 47u},
+    {"local join and conditional repeat", 2u, 46u},
+    {"unconditional arm on three iterations", 3u, 49u},
+    {"unconditional arm on every iteration", 4u, 52u},
+    {"short loop bypasses the arm", 0u, 22u, 2u},
+    {"short loop enters the arm once", 1u, 25u, 2u},
+    {"conditional repeat falls through to the local join", 2u, 35u, 2u},
+}};
+
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t count) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), count, 0x01016facu};
@@ -60,12 +78,13 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t co
 void Run(AgcDriver::VulkanDevice& device, const Case& test, std::uint32_t waveSize, std::span<const std::uint32_t> code) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) Input[tid * Stride] = tid * 0x01010101u + 7u;
     Output.fill(0xdeadbeefu);
-    std::vector<std::uint32_t> userData(SelectorRegister + 1u, 0u);
+    std::vector<std::uint32_t> userData(SelectorRegister + 3u, 0u);
     const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size()));
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size()));
     std::copy(input.begin(), input.end(), userData.begin());
     std::copy(output.begin(), output.end(), userData.begin() + 4);
     userData[SelectorRegister] = test.selector;
+    userData[SelectorRegister + 2u] = test.limit;
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -104,6 +123,10 @@ int main() {
             }
             for (const auto& test : NestedCases) {
                 Run(*device, test, waveSize, NestedCode);
+                Check(test, waveSize);
+            }
+            for (const auto& test : SelectionCases) {
+                Run(*device, test, waveSize, SelectionCode);
                 Check(test, waveSize);
             }
         }
