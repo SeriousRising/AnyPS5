@@ -74,7 +74,6 @@ void requireStructuredBranches(const ControlFlowGraph& graph, const char* name) 
     }
 }
 
-<<<<<<< HEAD
 void requireMergeReachesRange(const ControlFlowGraph& graph, std::uint32_t source, std::uint32_t target) {
     const auto header = std::find_if(graph.blocks.begin(), graph.blocks.end(), [&](const BasicBlock& block) {
         return block.instructionBegin == source * 2u && block.instructionEnd == source * 2u + 2u;
@@ -97,7 +96,10 @@ void requireEmptyContinuations(const ControlFlowGraph& graph) {
         if (continuation.instructionBegin != continuation.instructionEnd || continuation.terminator.kind != TerminatorKind::Branch ||
             continuation.terminator.trueBlock != header.id || continuation.successors != std::vector<std::uint32_t>{header.id}) {
             throw std::runtime_error("loop continuation is not an empty unconditional backedge");
-=======
+        }
+    }
+}
+
 void requireExactPostDominators(const ControlFlowGraph& graph, const char* name) {
     const auto count = static_cast<std::uint32_t>(graph.blocks.size());
     const auto reachesExitAvoiding = [&](std::uint32_t from, std::uint32_t avoided) {
@@ -123,7 +125,6 @@ void requireExactPostDominators(const ControlFlowGraph& graph, const char* name)
         }
         if (block.postDominators != expected) {
             throw std::runtime_error(std::string(name) + ": block " + std::to_string(block.id) + " has " + std::to_string(block.postDominators.size()) + " post-dominators, expected " + std::to_string(expected.size()));
->>>>>>> b29ef5af (perf(recompiler): compute post-dominators visiting successors first)
         }
     }
 }
