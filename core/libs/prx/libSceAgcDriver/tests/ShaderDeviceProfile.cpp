@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
 #include "BdaAbi.hpp"
 #include "Optimization/BindingAllocator.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -151,6 +153,14 @@ void CheckHeaps() {
     Require(ResourceMaterializer::BindlessSlots() == 16u, "bindless image tables changed size with the sampled heap");
     Reject([&] { allocate(image, 1u, RuntimeAbi::SamplerHeapCapacity + 1u); }, "metadata capacity");
     image.resourceClass = ImageResourceClass::Storage;
+    const auto directStorage = image;
+    for (const auto count : {5u, 16u}) {
+        const auto direct = allocate(image, count);
+        const auto& resources = BindingAllocator{}.FindBinding(direct.layout, DescriptorBindingForImage(image)).resources;
+        Require(resources.size() == count, "direct storage images did not retain their heap elements");
+        for (std::uint32_t index = 0u; index < count; ++index) Require(resources[index] == index, "direct storage image resource indices changed");
+    }
+    Reject([&] { allocate(image, 17u); }, "heap capacity exceeded");
     image.mipMode = ImageMipMode::DynamicStorage;
     image.mipCount = RuntimeAbi::StorageMipSlots;
     const auto storage = allocate(image, 1u);
@@ -161,6 +171,17 @@ void CheckHeaps() {
     const auto filled = allocate(image, capacity);
     Require(BindingAllocator{}.FindBinding(filled.layout, DescriptorBindingForImage(image)).resources.size() == RuntimeAbi::StorageHeapCapacity, "a full storage heap was not allocated");
     Reject([&] { allocate(image, capacity + 1u); }, "heap capacity exceeded");
+    const auto allocateImages = [](std::vector<ImageResource> images) {
+        IrProgram program;
+        program.Metadata().shaderInfoComplete = true;
+        program.Resources().info.images = std::move(images);
+        return BindingAllocator{}.Allocate(program, {0u, 0u, 0u, 128u});
+    };
+    const auto interleaved = allocateImages({directStorage, image, directStorage, image});
+    Require(BindingAllocator{}.FindBinding(interleaved.layout, DescriptorBindingForImage(image)).resources == std::vector<std::uint32_t>{0u, 1u, 1u, 1u, 1u, 2u, 3u, 3u, 3u, 3u}, "interleaved storage images overlap or changed their mip slots");
+    const auto mixedFull = allocateImages({image, directStorage, image, directStorage, image, directStorage, directStorage});
+    Require(BindingAllocator{}.FindBinding(mixedFull.layout, DescriptorBindingForImage(image)).resources == std::vector<std::uint32_t>{0u, 0u, 0u, 0u, 1u, 2u, 2u, 2u, 2u, 3u, 4u, 4u, 4u, 4u, 5u, 6u}, "a full mixed storage heap changed its resource or mip slots");
+    Reject([&] { allocateImages({image, directStorage, image, directStorage, image, directStorage, directStorage, directStorage}); }, "heap capacity exceeded");
     Reject([&] { allocate(image, 0u, RuntimeAbi::SamplerHeapCapacity / 2u + 1u); }, "sampler pairs");
     const std::array dimensions{RdnaImageDimension::Dim1D, RdnaImageDimension::Dim1DArray, RdnaImageDimension::Dim2D, RdnaImageDimension::Dim2DArray, RdnaImageDimension::Dim3D, RdnaImageDimension::Dim2DMsaa, RdnaImageDimension::Dim2DMsaaArray};
     std::set<std::uint32_t> classes;
@@ -182,12 +203,44 @@ void CheckHeaps() {
     Reject([] { RuntimeAbi::HeapCapacity(RuntimeAbi::Binding::ShaderData); }, "not a typed heap");
 }
 
+void CheckStorageMips() {
+    using namespace ShaderRecompiler;
+    ImageResource image;
+    image.resourceClass = ImageResourceClass::Storage;
+    image.numericClass = IrTextureNumericClass::Float;
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.mipMode = ImageMipMode::DynamicStorage;
+    image.mipCount = RuntimeAbi::StorageMipSlots;
+    const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+    Require(!modes.empty() && std::ranges::all_of(modes, [](const auto& mode) { return mode.mipCount == 4u; }), "runtime storage image modes changed the per-image mip span");
+    DescriptorValue descriptor{{1u, (20u << 20u) | (3u << 30u), 15u | (15u << 14u), 0x90000facu | (3u << 16u), 0u, 0u, 0u, 0u}, 8u};
+    Require(ResourceMaterializer::RuntimeImageMode(image, descriptor, modes) < modes.size(), "four storage mip levels were rejected");
+    IrProgram program;
+    program.Metadata().shaderInfoComplete = true;
+    program.Resources().info.images = {image};
+    ResourceMaterializer::PrepareImageModes(program.Resources().info);
+    const auto allocation = BindingAllocator{}.Allocate(program, {0u, 0u, 0u, 128u});
+    ResourceSnapshot snapshot;
+    snapshot.images = {descriptor};
+    const auto prepare = [&] { return DescriptorBindingBuilder{}.Prepare(allocation.layout, program.Resources().info, IrShaderStage::Compute, snapshot); };
+    const auto plan = prepare();
+    Require(plan.bindings.size() == 1u && plan.bindings.front().descriptor.count == 4u && plan.bindings.front().resources == std::vector<std::uint32_t>{0u, 0u, 0u, 0u}, "four storage mip levels did not retain their descriptor elements");
+    Require(std::ranges::find(plan.specialization, PipelineSpecializationConstant{PipelineSpecialization::MipCountBase, 4u}) != plan.specialization.end(), "four storage mip levels changed their specialization count");
+    descriptor.dwords[3] = 0x90000facu | (4u << 16u);
+    Reject([&] { ResourceMaterializer::RuntimeImageMode(image, descriptor, modes); }, "runtime storage image mip capacity exceeded");
+    snapshot.images = {descriptor};
+    Reject(prepare, "runtime storage image mip capacity exceeded");
+    snapshot.images.front().dwords[0] = 0u;
+    Reject(prepare, "invalid dynamic storage mip range");
+}
+
 }
 
 int main() {
     try {
         CheckAbi();
         CheckHeaps();
+        CheckStorageMips();
         CheckProfile();
         std::cout << "shader runtime ABI and device profile tests passed\n";
         return 0;

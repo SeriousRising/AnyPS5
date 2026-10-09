@@ -49,6 +49,16 @@ alignas(256) constexpr std::array<std::uint32_t, 17> MipCode{
     0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 23> HeapStoreCode{
+    0x7e3c0300u, 0x7e3e0280u,
+    0x7e1402ffu, 0x3f800000u, 0xf0201108u, 0x00000a1eu,
+    0x7e1402ffu, 0x40000000u, 0xf0201108u, 0x00020a1eu,
+    0x7e1402ffu, 0x40400000u, 0xf0201108u, 0x00040a1eu,
+    0x7e1402ffu, 0x40800000u, 0xf0201108u, 0x00060a1eu,
+    0x7e1402ffu, 0x40a00000u, 0xf0201108u, 0x00080a1eu,
+    0xbf810000u,
+};
+
 class GuestBlock {
 public:
     GuestBlock() {
@@ -191,6 +201,52 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std::span<const 
     device.WaitIdle();
 }
 
+void RunStorageHeap(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
+    constexpr std::array<std::uint32_t, 5> values{0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u, 0x40a00000u};
+    const auto& format = Formats[4];
+    const auto mips = Mips(format, false);
+    const auto initial = Initial();
+    std::array<std::uint32_t, 8u * values.size()> userData{};
+    for (std::size_t image = 0; image < values.size(); ++image) {
+        auto* surface = texels + image * TexelBytes;
+        std::copy(initial.begin(), initial.end(), surface);
+        const auto descriptor = TextureDescriptor(surface, format.format, IdentitySwizzle, 1u);
+        std::copy(descriptor.begin(), descriptor.end(), userData.begin() + image * descriptor.size());
+    }
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(HeapStoreCode.data()), std::as_bytes(std::span{HeapStoreCode})}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(HeapStoreCode.data()), HeapStoreCode, 0u, {}},
+        {32u, 0u, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0u, 0u, 0u, 128u}
+    };
+    request.useCache = false;
+    const auto result = ShaderRecompiler::Recompile(request);
+    const auto images = std::ranges::count_if(result.bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestImages; });
+    Require(images == 1u, "storage heap: the five images did not share a typed heap");
+    const auto binding = std::ranges::find_if(result.bindings, [](const auto& value) { return value.role == ShaderRecompiler::DescriptorRole::GuestImages; });
+    Require(binding->kind == ShaderRecompiler::DescriptorKind::StorageImage && binding->binding == ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 2u && binding->count == values.size(), "storage heap: the five 2D float storage descriptors were not compacted together");
+    device.Dispatch(result, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(HeapStoreCode.data()));
+    device.WaitIdle();
+    for (std::size_t image = 0; image < values.size(); ++image) {
+        AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(texels + image * TexelBytes), TexelBytes, nullptr, "test");
+    }
+    device.WaitIdle();
+    for (std::size_t image = 0; image < values.size(); ++image) {
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                const auto offset = TexelOffset(mips[0], format, x, y);
+                std::uint32_t actual = 0u;
+                std::uint32_t expected = values[image];
+                std::memcpy(&actual, texels + image * TexelBytes + offset, sizeof(actual));
+                if (y != 0u) std::memcpy(&expected, initial.data() + offset, sizeof(expected));
+                Require(actual == expected, "storage heap: image " + std::to_string(image) + " texel (" + std::to_string(x) + ", " + std::to_string(y) + ") did not retain its independent value");
+            }
+        }
+    }
+}
+
 void Check(const std::uint8_t* texels, const Format& format, bool mip, const std::string& what) {
     const auto expected = Expected(format, mip);
     const auto mips = Mips(format, mip);
@@ -233,6 +289,7 @@ int main() {
         if (!device) return VulkanTestSkipped;
         GuestBlock block;
         auto* texels = block.Data();
+        RunStorageHeap(*device, texels);
         for (const auto& format : Formats) {
             Run(*device, texels, StoreCode, format, IdentitySwizzle, false);
             Check(texels, format, false, "image_store_pck");
