@@ -64,6 +64,58 @@ struct Fixture {
     }
 };
 
+void DrawPreparedRectangle(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+    using namespace AgcDriver::DriverDetail;
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t extent = 16;
+    alignas(256) std::array<std::uint32_t, extent * extent * 4> pixels{};
+    constexpr std::array<std::array<float, 4>, 3> positions{{{-1, -1, 0, 1}, {-1, 1, 0, 1}, {1, -1, 0, 1}}};
+    constexpr std::array<std::uint32_t, 6> vertexCode{0xe0382000u, 0x80000005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u};
+    constexpr std::array<std::uint32_t, 4> values{0, 0x3e800000u, 0x3f000000u, 0x3f800000u};
+    const std::array<std::uint32_t, 11> pixelCode{0x7e0002ffu, values[0], 0x7e0202ffu, values[1], 0x7e0402ffu, values[2], 0x7e0602ffu, values[3], 0xf800180fu, 0x03020100u, 0xbf810000u};
+    const auto address = reinterpret_cast<std::uintptr_t>(positions.data());
+    const std::array<std::uint32_t, 4> users{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (16u << 16u), 3, 0x01016facu};
+    RecompileRequest vertexRequest{{ShaderStage::Vertex, 0x10000, vertexCode, 0, {}}, {waveSize, 0, users, {}, {}, ShaderVertexStageInfo{}, {}}, device.Target(), {0, 0, 0, 128}};
+    const auto vertex = Recompile(vertexRequest);
+    const auto pushOffset = AgcDriver::Graphics::StagePushOffset(static_cast<std::uint32_t>(vertex.pushConstants.size()), ShaderStage::Fragment, device.GraphicsPipelineLibraries());
+    AgcDriver::Registers context{{0x1b6, 0x8000}, {0x1b3, 0}, {0x1b4, 0}, {0x203, 0}, {0x1c5, 9}};
+    auto pixelInfo = AgcDriver::Graphics::DecodePixelStageInfo(context, {});
+    pixelInfo.wave32 = waveSize == 32;
+    pixelInfo.targetExportMapping.fill(0xe4u);
+    RecompileRequest pixelRequest{{ShaderStage::Fragment, 0x20000, pixelCode, 0, {}}, {waveSize, 0, {}, {}, pixelInfo, {}, {}}, device.Target(), {0, 0, pushOffset, 128 - pushOffset}};
+    const auto pixel = Recompile(pixelRequest);
+    ShaderSnapshot front{0x10000, 0, 2, {vertexCode.begin(), vertexCode.end()}, {}};
+    auto fragment = std::make_shared<ShaderSnapshot>(ShaderSnapshot{0x20000, 0, 1, {pixelCode.begin(), pixelCode.end()}, {}});
+    front.prepared->entries.push_back({0, PrepareShader(vertexRequest)});
+    fragment->prepared->entries.push_back({0, PrepareShader(pixelRequest)});
+    ResolvePreparedGraphics(front, fragment, 17, device.Target());
+    const auto rectangle = PreparedRectangle(front, vertex.variantId, pixel.variantId);
+    AgcDriver::Graphics::State state{};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0, waveSize, waveSize, {}, {}};
+    state.color = {reinterpret_cast<std::uintptr_t>(pixels.data()), {extent, extent}, VK_FORMAT_R32G32B32A32_SFLOAT, sizeof(pixels), 0xe4u};
+    state.color.elementBytes = 16;
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {extent, extent};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    state.rectList = true;
+    state.viewport = {0, static_cast<float>(extent), static_cast<float>(extent), -static_cast<float>(extent), 0, 1};
+    state.scissor = {{0, 0}, {extent, extent}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const AgcDriver::Pm4::DrawParameters draw{0, 3, 0, 1, 0, false};
+    const auto materializedRectangle = BuildRectListShaders(vertex, pixel, device.Target());
+    for (const auto* auxiliary : {&rectangle, &materializedRectangle}) {
+        const std::array<AgcDriver::Graphics::CompiledShader, 4> shaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::TessellationControl, &auxiliary->control, 0}, {ShaderStage::TessellationEvaluation, &auxiliary->evaluation, 0}, {ShaderStage::Fragment, &pixel, pushOffset}}};
+        pixels.fill(0xdeadbeefu);
+        device.Draw(state, draw, shaders);
+        device.WaitIdle();
+        for (std::size_t index = 0; index < pixels.size(); ++index) Require(pixels[index] == values[index % 4], "prepared rectangle draw produced incorrect pixels");
+    }
+}
+
 void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path, const std::filesystem::path& dump) {
     using namespace AgcDriver::DriverDetail;
     using namespace ShaderRecompiler;
@@ -359,6 +411,7 @@ int main(int argc, char** argv) {
         Check(*device, AgcDriver::Graphics::ShaderPath::Vertex, dump);
         Check(*device, AgcDriver::Graphics::ShaderPath::Geometry, dump);
         Check(*device, AgcDriver::Graphics::ShaderPath::Tessellation, dump);
+        for (const auto waveSize : {32u, 64u}) DrawPreparedRectangle(*device, waveSize);
         std::cout << "prepared graphics ABI tests passed\n";
         return 0;
     } catch (const std::exception& error) {

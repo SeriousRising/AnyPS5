@@ -21,6 +21,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "RuntimeAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -30,6 +31,7 @@
 #include <cstring>
 #include <exception>
 #include <initializer_list>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -3545,6 +3547,34 @@ void rectListTests() {
     }
 }
 
+void rectFaultBindingTests() {
+    using namespace ShaderRecompiler;
+    RecompileResult vertex;
+    RecompileResult fragment;
+    const std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityTessellation};
+    SpirvTarget target{};
+    target.vulkanVersion = VK_API_VERSION_1_2;
+    target.spirvVersion = 0x00010500u;
+    target.supportedCapabilities = capabilities;
+    target.tessellation = TessellationTargetLimits{32, 128, 128, 120, 4096, 128, 128};
+    const auto faultBinding = RuntimeAbi::BindingNumber(RuntimeAbi::Stage::TessellationControl, RuntimeAbi::Binding::FaultBuffer);
+    for (auto* shader : {&vertex, &fragment}) {
+        for (const auto invalidBinding : {faultBinding, std::numeric_limits<std::uint32_t>::max()}) {
+            shader->bindings = {{DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0, invalidBinding, 1, {}}};
+            expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, invalidBinding == faultBinding ? "reserved fault binding" : "descriptor binding overflow");
+        }
+        shader->bindings.clear();
+    }
+    vertex.bindings = {{DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0, RuntimeAbi::BindingNumber(RuntimeAbi::Stage::Main, RuntimeAbi::Binding::Buffers), 1, {}}};
+    fragment.bindings = {{DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0, RuntimeAbi::BindingNumber(RuntimeAbi::Stage::Fragment, RuntimeAbi::Binding::Buffers), 1, {}}};
+    const auto full = BuildRectListShaders(vertex, fragment, target);
+    vertex.bindings.clear();
+    fragment.bindings.clear();
+    const auto artifactOnly = BuildRectListShaders(vertex, fragment, target);
+    Require(full.control.spirv == artifactOnly.control.spirv && full.evaluation.spirv == artifactOnly.evaluation.spirv, "rect-list module depends on materialized stage descriptors");
+    Require(artifactOnly.control.bindings.size() == 1 && artifactOnly.control.bindings.front().binding == faultBinding, "artifact-only rectangle uses the wrong fault binding");
+}
+
 ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint32_t> controls, std::span<const std::uint32_t> code) {
     auto queue = makeState();
     queue.context[0x1b3] = 0x2u;
@@ -5026,6 +5056,7 @@ int main(int argc, char** argv) {
         rectListTests();
         floatControlsModeTests();
         barycentricEmulationTests();
+        rectFaultBindingTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;
