@@ -253,6 +253,21 @@ int main() {
                 return 1;
             }
         }
+        auto reorderedChain = makeGraph({{2}, {4}, {}, {1}, {0}});
+        reorderedChain.entryBlock = 3;
+        Structurizer{}.Structurize(reorderedChain);
+        requireExactPostDominators(reorderedChain, "a chain whose block ids do not follow control flow");
+        auto disconnected = makeGraph({{1}, {}, {3}, {4}, {}});
+        Structurizer{}.Structurize(disconnected);
+        requireExactPostDominators(disconnected, "a disconnected forward chain");
+        auto nonterminating = makeGraph({{1}, {2}, {1}});
+        try {
+            Structurizer{}.Structurize(nonterminating);
+            throw std::runtime_error("a nonterminating loop unexpectedly structurized");
+        } catch (const std::runtime_error& error) {
+            if (std::string(error.what()).find("has no structured merge/continue") == std::string::npos) throw;
+        }
+        requireExactPostDominators(nonterminating, "a nonterminating loop");
         std::vector<std::vector<std::uint32_t>> diamonds;
         for (std::uint32_t diamond = 0; diamond < 50u; ++diamond) {
             const auto head = diamond * 3u;
