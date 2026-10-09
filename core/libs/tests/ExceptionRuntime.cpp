@@ -1,5 +1,7 @@
 #undef NDEBUG
 #include <cassert>
+#include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <typeinfo>
 #include <cstddef>
@@ -9,7 +11,9 @@
 #include <functional>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unwind.h>
@@ -156,6 +160,43 @@ void CheckTerminate(void (*function)()) {
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 61);
 }
+void CheckDefaultTerminate(const std::string& message) {
+    int pipeEnds[2];
+    assert(pipe(pipeEnds) == 0);
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        const rlimit limit{0, 0};
+        assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+        close(pipeEnds[0]);
+        assert(dup2(pipeEnds[1], STDERR_FILENO) == STDERR_FILENO);
+        close(pipeEnds[1]);
+        _ZSt13_Xrange_errorPKc_nid_postfix(message.c_str());
+    }
+    close(pipeEnds[1]);
+    std::string output;
+    char buffer[1024];
+    for (;;) {
+        const auto count = read(pipeEnds[0], buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR) continue;
+        assert(count >= 0);
+        if (count == 0) break;
+        output.append(buffer, static_cast<std::size_t>(count));
+    }
+    close(pipeEnds[0]);
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    assert(output.ends_with("  what():  " + message + "\n"));
+}
+void CheckCompleteWhat() {
+    const std::string marker = "late marker %s %n %%";
+    for (const std::size_t size : {0u, 1022u, 1023u, 1024u, 8192u}) {
+        std::string message(size, 'x');
+        if (size >= marker.size()) message.replace(size - marker.size(), marker.size(), marker);
+        CheckDefaultTerminate(message);
+    }
+}
 struct ForcedGuard { ~ForcedGuard() { ++destroyed; } };
 [[gnu::noinline]] void ForceUnwind() {
     ForcedGuard guard;
@@ -222,6 +263,7 @@ int main() {
     CheckThreads();
     CheckTerminate(UncaughtThrow);
     CheckTerminate(NoexceptThrow);
+    CheckCompleteWhat();
     CheckForcedUnwind();
     int frames = 0;
     auto backtrace = _Unwind_Backtrace_nid_postfix([](_Unwind_Context* context, void* argument) {

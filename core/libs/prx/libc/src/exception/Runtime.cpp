@@ -1,6 +1,7 @@
 #include "prx/libc/include/exceptions/Runtime.hpp"
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #ifdef _WIN32
 #include <windows.h>
@@ -47,10 +48,18 @@ static void RawLog(const char* format, ...) {
         int status = 0;
         char* demangled = abi::__cxa_demangle(typeName, nullptr, nullptr, &status);
         const char* displayName = (status == 0 && demangled) ? demangled : typeName;
-        if (what)
-            RawLog("terminate called after throwing an instance of '%s'\n  what():  %s\n", displayName, what);
-        else
-            RawLog("terminate called after throwing an instance of '%s'\n", displayName);
+        RawLog("terminate called after throwing an instance of '%s'\n", displayName);
+        if (what) {
+            RawLog("  what():  ");
+            auto remaining = std::strlen(what);
+            while (remaining != 0u) {
+                const auto count = remaining > 1023u ? 1023u : remaining;
+                RawLog("%.*s", static_cast<int>(count), what);
+                what += count;
+                remaining -= count;
+            }
+            RawLog("\n");
+        }
         std::free(demangled);
     } else {
         RawLog("terminate called without an active exception\n");
