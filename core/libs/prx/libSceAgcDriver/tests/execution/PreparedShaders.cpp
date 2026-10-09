@@ -1,6 +1,8 @@
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
+#include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -35,6 +37,31 @@ void ExpectFailure(TAction action, const char* expected) {
     throw std::runtime_error("expected preparation failure");
 }
 
+void RegisterWhileGpuLocked(const Shader* shader) {
+    std::promise<void> registering;
+    auto started = registering.get_future();
+    std::future<void> registration;
+    std::future<void> preparation;
+    bool available;
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        registration = std::async(std::launch::async, [&] {
+            registering.set_value();
+            AgcDriverRegisterShader_nid_postfix(shader);
+        });
+        started.get();
+        const auto waiting = registration.wait_for(std::chrono::milliseconds(10));
+        preparation = std::async(std::launch::async, [] {
+            AgcDriver::DriverDetail::ShaderPreparationTransaction transaction;
+            transaction.Commit();
+        });
+        available = waiting == std::future_status::timeout && preparation.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready;
+    }
+    registration.get();
+    preparation.get();
+    Require(available, "shader registration held the preparation writer while waiting for the GPU mutex");
+}
+
 void RunLazyPreparation(AgcDriver::VulkanDevice& device, ShaderRecompiler::RecompileRequest request, bool deferred = false) {
     const auto code = request.shader.code;
     for (const bool sourceFirst : {false, true}) {
@@ -44,6 +71,13 @@ void RunLazyPreparation(AgcDriver::VulkanDevice& device, ShaderRecompiler::Recom
             snapshot.prepared->deferred = true;
         }
         request.shader.code = snapshot.code;
+        if (deferred) {
+            ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, snapshot.code.size(), request)); }, "outside the snapshot");
+            auto truncated = request;
+            truncated.shader.code = std::span(snapshot.code).first(snapshot.code.size() - 1);
+            ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, truncated)); }, "does not refer to registered code");
+            Require(snapshot.prepared->entries.empty(), "invalid lazy source published an artifact");
+        }
         if (sourceFirst) {
             const auto handle = AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request);
             Require(snapshot.prepared->entries.size() == 1 && snapshot.prepared->entries.front().handle == handle, "unregistered compute source was not cached");
@@ -217,7 +251,7 @@ void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
     ExpectFailure([&] { static_cast<void>(PrepareShader(request)); }, "storage image multisampling is unavailable on the target device");
 }
 
-void GraphicsHeaderCopies() {
+void GraphicsHeaderCopies(bool stagesFirst) {
     alignas(256) std::array<std::uint32_t, 1> vertexCode{0xbf810000u};
     alignas(256) std::array<std::uint32_t, 1> pixelCode{0xbf810000u};
     struct Header {
@@ -237,6 +271,7 @@ void GraphicsHeaderCopies() {
         header.shader.file_header = 0x34333231u;
         header.shader.version = 0x18;
         header.shader.type = index == 0 ? 2u : 1u;
+        header.shader.target = stagesFirst ? 1u : 0u;
         header.shader.header_size = sizeof(header);
         header.shader.shader_size = sizeof(vertexCode);
         header.shader.code = code;
@@ -270,8 +305,9 @@ void GraphicsHeaderCopies() {
     const std::array<const Shader*, 2> stages{&copies[0], &copies[1]};
     const std::array<ShaderRegister, 1> primitive{{{0x242, 7}}};
     const auto resolve = [&] {
+        if (stagesFirst) AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, {}, primitive);
         AgcDriverResolveGraphicsAbi_nid_postfix(&copies[0], &copies[1], 7);
-        AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, {}, primitive);
+        if (!stagesFirst) AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, {}, primitive);
     };
     resolve();
     for (auto& copy : copies) {
@@ -358,17 +394,17 @@ void Registration(bool indirect) {
     }
     std::uint32_t destination = 0;
     const auto destinationAddress = reinterpret_cast<std::uintptr_t>(&destination);
-    commands[threadRegisterIndex * 3 + 2] = 2;
+    commands[threadRegisterIndex * 3 + 2] = 0;
     commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7});
     packet = Packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "artifact is missing");
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "artifact is missing");
-    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "artifact is missing");
+    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "must be nonzero");
+    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "must be nonzero");
+    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "must be nonzero");
     Require(destination == 0, "failed dispatch executed a subsequent memory write");
 }
 
-void MissingProgramRegistration(AgcDriver::VulkanDevice& device) {
+void MissingProgramRegistration(AgcDriver::VulkanDevice& device, bool complete = false) {
     alignas(256) std::array<std::uint32_t, 5> code{0x34020082u, 0x7e040204u, 0xe0701000u, 0x80000201u, 0xbf810000u};
     alignas(256) std::array<std::uint32_t, 2> output{};
     const auto address = reinterpret_cast<std::uintptr_t>(code.data());
@@ -380,7 +416,7 @@ void MissingProgramRegistration(AgcDriver::VulkanDevice& device) {
     Require(output[0] == 7 && output[1] == 7, "deferred invocation did not execute both static ABIs");
     struct Header {
         Shader shader{};
-        std::array<ShaderRegister, 5> registers{{{0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 10}}};
+        std::array<ShaderRegister, 7> registers{{{0x20c, 0}, {0x20d, 0}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 10}}};
         ShaderSpecialRegs specials{};
     } header;
     header.shader.file_header = 0x34333231u;
@@ -388,12 +424,14 @@ void MissingProgramRegistration(AgcDriver::VulkanDevice& device) {
     header.shader.header_size = sizeof(header);
     header.shader.shader_size = sizeof(code);
     header.shader.code = code.data();
-    header.shader.sh_registers = header.registers.data();
-    header.shader.num_sh_registers = header.registers.size();
+    header.shader.sh_registers = header.registers.data() + (complete ? 0u : 2u);
+    header.shader.num_sh_registers = header.registers.size() - (complete ? 0u : 2u);
     header.shader.specials = &header.specials;
     header.specials.dispatch_modifier = 0x8000;
+    header.registers[0].value = static_cast<std::uint32_t>(address >> 8u);
+    header.registers[1].value = static_cast<std::uint32_t>(address >> 40u);
     AgcDriverRegisterShader_nid_postfix(&header.shader);
-    for (const std::uint32_t threads : {1u, 2u, 1u}) {
+    for (const std::uint32_t threads : {1u, 2u, 1u, 2u}) {
         output.fill(0);
         users[4] += 1;
         std::vector<std::uint32_t> commands;
@@ -411,7 +449,7 @@ void MissingProgramRegistration(AgcDriver::VulkanDevice& device) {
     }
 }
 
-void DeferredRegistration() {
+void DeferredRegistration(bool completeUnsupported = false, bool submit = true) {
     alignas(256) std::array<std::uint32_t, 2> code{0xbe842104u, 0xbf810000u};
     struct Header {
         Shader shader{};
@@ -429,30 +467,43 @@ void DeferredRegistration() {
     header.shader.specials = &header.specials;
     header.specials.dispatch_modifier = 0x8000;
     header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 12}, {0x207, 1}}};
-    code[0] = 0xbe852104u;
-    ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "unsupported scalar call link register");
-    code[0] = 0xbe842104u;
-    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    if (completeUnsupported) code[0] = 0xbe802204u;
+    else {
+        code[0] = 0xbe852104u;
+        ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "unsupported scalar call link register");
+        code[0] = 0xbe842104u;
+    }
+    if (completeUnsupported && !submit) RegisterWhileGpuLocked(&header.shader);
+    else AgcDriverRegisterShader_nid_postfix(&header.shader);
+    const auto expected = completeUnsupported ? "s_rfe_b64 at pc 0 returns from a trap handler" : "not statically resolvable";
+    if (completeUnsupported) ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {}); }, expected);
+    if (!submit) return;
     std::vector<std::uint32_t> commands;
     for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
     commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+    std::uint32_t destination = 0;
+    const auto destinationAddress = reinterpret_cast<std::uintptr_t>(&destination);
+    commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "not statically resolvable");
-    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "not statically resolvable");
+    ExpectFailure([&] { AgcDriverWaitIdle_nid_postfix(); }, expected);
+    ExpectFailure([&] { AgcDriverShutdown_nid_postfix(); }, expected);
+    Require(destination == 0, "unsupported shader dispatch executed a subsequent memory write");
 }
 
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred")), "invalid test arguments");
-        if (argc == 2 && std::string_view(argv[1]) == "--deferred") {
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--lazy-static")), "invalid test arguments");
+        if (argc == 2 && (std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--lazy-static")) {
+            const bool complete = std::string_view(argv[1]) == "--lazy-static";
             auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
-            MissingProgramRegistration(*device);
+            if (complete) DeferredRegistration(true, false);
+            MissingProgramRegistration(*device, complete);
             device.reset();
-            DeferredRegistration();
+            DeferredRegistration(complete);
             std::cout << "deferred shader preparation tests passed\n";
             return 0;
         }
@@ -462,7 +513,8 @@ int main(int argc, char** argv) {
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
         device.reset();
-        GraphicsHeaderCopies();
+        GraphicsHeaderCopies(false);
+        GraphicsHeaderCopies(true);
         Registration(argc == 2);
         std::cout << "prepared shader and transactional registration tests passed\n";
         return 0;

@@ -1,4 +1,5 @@
 #include "VulkanTestDevice.hpp"
+#include "SceShaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -110,6 +111,45 @@ void Registration(AgcDriver::VulkanDevice& device) {
     const std::array<std::uint32_t, 1> code{0xbf810000u};
     RecompileRequest request{{ShaderStage::Compute, 0x10000, code, 0, {}}, {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 0, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
     const auto handle = PrepareShader(request);
+    for (const bool sourceFirst : {false, true}) {
+        ShaderSnapshot lazy{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
+        lazy.header.resize(sizeof(Shader));
+        lazy.prepared->deferred = true;
+        auto lazyRequest = request;
+        lazyRequest.shader.code = lazy.code;
+        std::promise<void> preparing;
+        auto started = preparing.get_future();
+        std::future<void> writer;
+        bool blocked;
+        {
+            ShaderPreparationTransaction transaction;
+            transaction.Edit(lazy).entries.push_back({999, handle});
+            writer = std::async(std::launch::async, [&] {
+                preparing.set_value();
+                if (sourceFirst) static_cast<void>(SourceHandleFor(lazy, 0, lazyRequest));
+                else static_cast<void>(InvocationFor(lazy, 0, lazyRequest));
+            });
+            started.get();
+            blocked = writer.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+            transaction.Commit();
+        }
+        writer.get();
+        Require(blocked && lazy.prepared->entries.size() == 2 && lazy.prepared->entries.front().codeOffset == 999 && lazy.prepared->entries.back().codeOffset == 0, "lazy preparation interleaved with a transaction or lost an artifact");
+        const auto ready = SourceHandleFor(lazy, 0, lazyRequest);
+        std::barrier prepareStart(4);
+        std::vector<std::future<void>> preparations;
+        for (unsigned worker = 0; worker < 4; ++worker) {
+            preparations.push_back(std::async(std::launch::async, [&] {
+                prepareStart.arrive_and_wait();
+                for (unsigned iteration = 0; iteration < 8; ++iteration) {
+                    Require(SourceHandleFor(lazy, 0, lazyRequest) == ready, "concurrent lazy preparation replaced its artifact");
+                    static_cast<void>(InvocationFor(lazy, 0, lazyRequest));
+                }
+            }));
+        }
+        for (auto& preparation : preparations) preparation.get();
+        Require(lazy.prepared->entries.size() == 2, "concurrent lazy preparation duplicated an artifact");
+    }
     const auto makeSnapshot = [&] {
         auto snapshot = std::make_shared<ShaderSnapshot>();
         snapshot->codeAddress = 0x10000;
