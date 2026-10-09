@@ -213,6 +213,27 @@ static void CheckThrows() {
     });
 }
 
+static void CheckUnresolvedTargetValidation() {
+    const auto unresolved = Program({Sop1(0x00u, 4u, 0x21u, 8u), Sopp(0x04u, 0x01u)});
+    Require(UnresolvableSwappcTarget(unresolved, nullptr) == 0u);
+    Require(!UnresolvableSwappcTarget(Program({Sopp(0x00u, 0x01u)}), nullptr));
+    for (const bool preflight : {false, true}) {
+        const auto check = [=](const RdnaProgram& program) {
+            if (preflight) static_cast<void>(UnresolvableSwappcTarget(program, nullptr));
+            else static_cast<void>(Build(program));
+        };
+        ExpectThrow("unsupported scalar call link register", [&] {
+            check(Program({Sop1(0x00u, 5u, 0x21u, 4u), Sopp(0x04u, 0x01u)}));
+        });
+        ExpectThrow("invalid instruction boundary", [&] {
+            check(Program({Sopk(0x00u, 0x16u, 4u, 0x10u), Sop1(0x04u, 8u, 0x21u, 12u), Sopp(0x08u, 0x01u)}));
+        });
+        ExpectThrow("is shared with another call", [&] {
+            check(Program({Sopk(0x00u, 0x16u, 4u, 1u), Sop1(0x04u, 4u, 0x21u, 8u), Sop1(0x08u, 0u, 0x20u, 4u)}));
+        });
+    }
+}
+
 int main() {
     try {
         CheckDecodeIdentity();
@@ -220,6 +241,7 @@ int main() {
         CheckStaticCallRegion();
         CheckFetchCallAtEntry();
         CheckThrows();
+        CheckUnresolvedTargetValidation();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "scalar swappc regression: %s\n", error.what());
         return 1;

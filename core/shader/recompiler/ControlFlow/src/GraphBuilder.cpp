@@ -475,7 +475,7 @@ bool isFetchCall(const RdnaProgram& program, std::uint32_t index, const SwappcIn
     return swappc != nullptr && swappc->fetchCallAllowed && positional && (userDataPair || outsideProgram);
 }
 
-std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const SwappcInfo* swappc) {
+std::vector<SwappcCall> analyzeSwappcTargets(const RdnaProgram& program, const SwappcInfo* swappc, std::optional<std::uint32_t>* unresolved = nullptr) {
     std::vector<SwappcCall> calls;
     for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
         const auto& instruction = program.instructions[index];
@@ -506,12 +506,20 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
                 throw std::invalid_argument("unclosable scalar call/return pairing at program counter " + toHexString(instruction.programCounter) +
                     ": link register s[" + std::to_string(call.linkRegister) + "] is shared with another call");
             }
+            if (unresolved != nullptr) {
+                *unresolved = instruction.programCounter;
+                return calls;
+            }
             throw std::invalid_argument("computed/data-dependent s_swappc_b64 call target at program counter " + toHexString(instruction.programCounter) + " is not statically resolvable");
         }
         call.targetProgramCounter = target;
         calls.push_back(call);
     }
+    return calls;
+}
 
+std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const SwappcInfo* swappc) {
+    auto calls = analyzeSwappcTargets(program, swappc);
     const auto sharedLinkError = [&](const SwappcCall& call) {
         return std::invalid_argument("unclosable scalar call/return pairing at program counter " + toHexString(program.instructions[call.callIndex].programCounter) +
             ": link register s[" + std::to_string(call.linkRegister) + "] is shared with another call");
@@ -943,19 +951,9 @@ void GraphBuilder::linkBlocks(std::vector<BasicBlock>& blocks, const RdnaProgram
 }
 
 std::optional<std::uint32_t> UnresolvableSwappcTarget(const RdnaProgram& program, const SwappcInfo* swappc) {
-    for (std::uint32_t index = 0; index < program.instructions.size(); ++index) {
-        const auto& instruction = program.instructions[index];
-        if (instruction.op != RdnaOpcode::SSwappcB64) {
-            continue;
-        }
-        std::uint32_t target = instruction.branchTarget;
-        const bool staticTarget = resolveSetpcTarget(program, index, target);
-        const bool inProgram = staticTarget && instructionIndexOfProgramCounter(program, target) != InvalidControlFlowId;
-        if (!inProgram && !isFetchCall(program, index, swappc, staticTarget)) {
-            return instruction.programCounter;
-        }
-    }
-    return std::nullopt;
+    std::optional<std::uint32_t> unresolved;
+    static_cast<void>(analyzeSwappcTargets(program, swappc, &unresolved));
+    return unresolved;
 }
 
 std::vector<UserDataCall> FindUserDataCalls(const RdnaProgram& program, const SwappcInfo& swappc) {

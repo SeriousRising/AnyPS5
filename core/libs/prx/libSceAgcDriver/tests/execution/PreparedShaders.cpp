@@ -2,6 +2,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
@@ -45,10 +46,14 @@ void ExpectFailure(TAction action, const char* expected) {
     throw std::runtime_error("expected preparation failure");
 }
 
-void RunUnregistered(AgcDriver::VulkanDevice& device, ShaderRecompiler::RecompileRequest request) {
+void RunLazyPreparation(AgcDriver::VulkanDevice& device, ShaderRecompiler::RecompileRequest request, bool deferred = false) {
     const auto code = request.shader.code;
     for (const bool sourceFirst : {false, true}) {
         AgcDriver::DriverDetail::ShaderSnapshot snapshot{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
+        if (deferred) {
+            snapshot.header.resize(sizeof(Shader));
+            snapshot.prepared->deferred = true;
+        }
         request.shader.code = snapshot.code;
         if (sourceFirst) {
             const auto handle = AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request);
@@ -58,6 +63,7 @@ void RunUnregistered(AgcDriver::VulkanDevice& device, ShaderRecompiler::Recompil
         Require(snapshot.prepared->entries.size() == 1, "unregistered compute invocation did not cache exactly one artifact");
         const auto handle = snapshot.prepared->entries.front().handle;
         const auto& artifact = ShaderRecompiler::GetPreparedArtifact(*handle);
+        std::shared_ptr<const ShaderRecompiler::RecompileResult> firstResult;
         for (const bool useCache : {false, true}) {
             request.useCache = useCache;
             Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == handle, "unregistered compute source was prepared again");
@@ -66,10 +72,28 @@ void RunUnregistered(AgcDriver::VulkanDevice& device, ShaderRecompiler::Recompil
             runtime.userData = request.context.userData;
             const auto capture = repeated.Capture(runtime);
             const auto result = repeated.Materialize(*capture);
-            Require(snapshot.prepared->entries.size() == 1 && result->variantId == artifact.variantId && result->spirv.data() == artifact.spirv.data(), "unregistered compute invocation replaced its cached artifact");
+            if (!firstResult) firstResult = result;
+            Require(snapshot.prepared->entries.size() == 1 && result->variantId == artifact.variantId && result->spirv.data() == firstResult->spirv.data() && result->PipelineVariantId() == firstResult->PipelineVariantId(), "lazy compute invocation replaced its cached artifact or specialization");
+            const auto repeatedCapture = repeated.Capture(runtime);
+            const auto repeatedResult = repeated.Materialize(*repeatedCapture);
+            Require(repeatedResult->variantId == result->variantId && repeatedResult->spirv.data() == result->spirv.data() && repeatedResult->PipelineVariantId() == result->PipelineVariantId(), "lazy compute invocation rebuilt an unchanged specialization");
             device.Dispatch(*result, 1, 1, 1);
         }
         device.WaitIdle();
+        if (deferred) {
+            request.context.compute->numThreads[0] += 1;
+            const auto changed = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+            Require(snapshot.prepared->entries.size() == 2 && snapshot.prepared->entries.back().handle != handle, "deferred preparation reused an artifact with a changed static ABI");
+            const auto changedHandle = snapshot.prepared->entries.back().handle;
+            Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == changedHandle, "changed deferred source was prepared again");
+            ShaderRecompiler::SrtRuntime runtime{};
+            runtime.userData = request.context.userData;
+            const auto capture = changed.Capture(runtime);
+            device.Dispatch(*changed.Materialize(*capture), 1, 1, 1);
+            device.WaitIdle();
+            request.context.compute->numThreads[0] -= 1;
+            Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == handle && snapshot.prepared->entries.size() == 2, "deferred preparation lost the previous static ABI");
+        }
     }
 }
 
@@ -95,7 +119,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     std::array<std::uint32_t, 4> users{};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
     ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
-    RunUnregistered(device, request);
+    RunLazyPreparation(device, request);
     {
         AgcDriver::DriverDetail::ShaderSnapshot unpredicted{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
         unpredicted.header.resize(sizeof(Shader));
@@ -602,6 +626,49 @@ void Registration(bool indirect) {
     Require(destination == 0, "failed dispatch executed a subsequent memory write");
 }
 
+void MissingProgramRegistration(AgcDriver::VulkanDevice& device) {
+    alignas(256) std::array<std::uint32_t, 5> code{0x34020082u, 0x7e040204u, 0xe0701000u, 0x80000201u, 0xbf810000u};
+    alignas(256) std::array<std::uint32_t, 2> output{};
+    const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+    const auto outputAddress = reinterpret_cast<std::uintptr_t>(output.data());
+    std::array<std::uint32_t, 5> users{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), sizeof(output), 0x31016facu, 7u};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
+    ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, address, code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    RunLazyPreparation(device, request, true);
+    Require(output[0] == 7 && output[1] == 7, "deferred invocation did not execute both static ABIs");
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 5> registers{{{0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 10}}};
+        ShaderSpecialRegs specials{};
+    } header;
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    header.shader.specials = &header.specials;
+    header.specials.dispatch_modifier = 0x8000;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    for (const std::uint32_t threads : {1u, 2u, 1u}) {
+        output.fill(0);
+        users[4] += 1;
+        std::vector<std::uint32_t> commands;
+        for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.offset == 0x207 ? threads : reg.value});
+        commands.insert(commands.end(), {0xc0017600u, 0x20c, static_cast<std::uint32_t>(address >> 8u), 0xc0017600u, 0x20d, static_cast<std::uint32_t>(address >> 40u)});
+        for (std::uint32_t index = 0; index < users.size(); ++index) commands.insert(commands.end(), {0xc0017600u, 0x240 + index, users[index]});
+        commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        sceAgcDriverSubmitAcb(0x20, &packet);
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(outputAddress, sizeof(output));
+        if (output[0] != users[4] || output[1] != (threads == 2 ? users[4] : 0)) {
+            throw std::runtime_error("shader registered without a program address: threads=" + std::to_string(threads) + " value=" + std::to_string(users[4]) + " output=" + std::to_string(output[0]) + "," + std::to_string(output[1]));
+        }
+    }
+}
+
 void RegisteredVertexWorkgroup(const ShaderRecompiler::SpirvTarget& target, bool registrationOnly = false) {
     if (!registrationOnly && ((target.subgroupSize != 32u && target.subgroupSize != 64u) || std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), spv::CapabilityMeshShadingEXT) == target.supportedCapabilities.end())) {
         std::cout << "registered NGG wave64 preparation not run: requires mesh shading and a 32- or 64-lane host subgroup; subgroup=" << target.subgroupSize << '\n';
@@ -668,6 +735,9 @@ void DeferredRegistration() {
     header.shader.specials = &header.specials;
     header.specials.dispatch_modifier = 0x8000;
     header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 12}, {0x207, 1}}};
+    code[0] = 0xbe852104u;
+    ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "unsupported scalar call link register");
+    code[0] = 0xbe842104u;
     AgcDriverRegisterShader_nid_postfix(&header.shader);
     std::vector<std::uint32_t> commands;
     for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
@@ -719,7 +789,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred") {
-            if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
+            auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            MissingProgramRegistration(*device);
+            device.reset();
             DeferredRegistration();
             std::cout << "deferred shader preparation tests passed\n";
             return 0;
