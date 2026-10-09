@@ -104,6 +104,62 @@ void requireEmptyContinuations(const ControlFlowGraph& graph) {
 
 int main() {
     try {
+        for (const auto& edges : {std::vector<std::vector<std::uint32_t>>{{1, 3}, {2}, {0, 5}, {4}, {5, 0}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1, 6}, {2, 5}, {3}, {5, 4}, {5, 0}, {0}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1, 7}, {2, 6}, {3}, {4}, {6, 5}, {6, 0}, {0}, {}}}) {
+            const auto conditionCount = std::count_if(edges.begin(), edges.end(), [](const auto& targets) { return targets.size() == 2u; });
+            for (unsigned mask = 0; mask < (1u << conditionCount); ++mask) {
+                auto oriented = edges;
+                unsigned condition = 0;
+                for (auto& targets : oriented) {
+                    if (targets.size() == 2u && (mask & (1u << condition++))) std::swap(targets[0], targets[1]);
+                }
+                auto graph = makeGraph(oriented);
+                const auto original = graph;
+                Structurizer{}.Structurize(graph);
+                if (graph.blocks.size() > original.blocks.size() + 3u || graph.naturalLoops.size() != 1u) throw std::runtime_error("loop-local selection merges did not bound graph growth");
+                for (const auto& source : original.blocks) {
+                    const auto expected = original.blocks.size() > 6u && source.id + 2u == original.blocks.size() ? 2 : 1;
+                    if (std::count_if(graph.blocks.begin(), graph.blocks.end(), [&](const BasicBlock& block) { return block.instructionBegin == source.instructionBegin && block.instructionEnd == source.instructionEnd; }) != expected) throw std::runtime_error("loop-local selection merges copied or lost an unexpected instruction range");
+                }
+                for (const auto& block : graph.blocks) {
+                    if (block.terminator.condition == BranchCondition::GotoVariable || block.terminator.gotoValue >= 0) throw std::runtime_error("loop-local selection merges introduced route variables");
+                }
+                requireEmptyContinuations(graph);
+                requireStructuredBranches(graph, "loop-local selection merge through an unconditional arm");
+                const auto normalized = GraphToString(graph);
+                Structurizer{}.Structurize(graph);
+                if (GraphToString(graph) != normalized) throw std::runtime_error("loop-local selection merges are not idempotent");
+            }
+        }
+        for (unsigned control = 0; control < 8u; ++control) {
+            auto graph = makeGraph({{1, 3}, {2}, {0, 5}, {4}, {5, 0}, {}});
+            if (control == 0u) graph.FindBlock(3).terminator.kind = TerminatorKind::Unsupported;
+            if (control == 1u) graph.FindBlock(3).terminator.kind = TerminatorKind::IndirectBranch;
+            if (control == 2u) graph.FindBlock(4).terminator.condition = BranchCondition::GotoVariable;
+            if (control == 3u) {
+                graph.FindBlock(2).successors = {0, 3};
+                graph.FindBlock(2).terminator.falseBlock = 3;
+                std::erase(graph.FindBlock(5).predecessors, 2u);
+                graph.FindBlock(3).predecessors.push_back(2);
+            }
+            if (control == 4u) graph.FindBlock(4).terminator.kind = TerminatorKind::Unsupported;
+            if (control == 5u) graph.FindBlock(3).terminator.condition = BranchCondition::GotoVariable;
+            if (control == 6u || control == 7u) {
+                auto& terminator = graph.FindBlock(control == 6u ? 3u : 4u).terminator;
+                terminator.gotoVariable = 0;
+                terminator.gotoValue = 1;
+            }
+            Structurizer{}.Structurize(graph);
+            requireMergeReachesRange(graph, 0u, 3u);
+            requireEmptyContinuations(graph);
+            requireStructuredBranches(graph, "unconditional arm retains unsupported and external-entry guards");
+        }
+        auto endpointOnlyArm = makeGraph({{1}, {2, 5}, {3, 4}, {4}, {1}, {}});
+        Structurizer{}.Structurize(endpointOnlyArm);
+        requireMergeReachesRange(endpointOnlyArm, 2u, 4u);
+        requireEmptyContinuations(endpointOnlyArm);
+        requireStructuredBranches(endpointOnlyArm, "unconditional arm ends without a conditional tail");
         for (const auto& edges : {std::vector<std::vector<std::uint32_t>>{{1}, {2, 3}, {1}, {}},
                 std::vector<std::vector<std::uint32_t>>{{1}, {2}, {1, 3}, {}},
                 std::vector<std::vector<std::uint32_t>>{{1}, {2, 5}, {4, 3}, {4}, {1}, {}},

@@ -445,6 +445,33 @@ latch:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
          Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860004u, 0x7d880088u, 0xbf870003u, 0x4a020281u, 0xbf820002u, 0x4a020282u, 0x4a020283u, 0x80089008u, 0xbf0ac008u, 0xbf85fff5u}), Split::Clone},
+        {"loop-local selection merge through an unconditional arm", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s9, 0
+  s_mov_b32 s10, 4
+loop:
+  s_cmp_lt_u32 s9, s10
+  s_cbranch_scc0 done
+  s_cmp_lt_u32 s9, s2
+  s_cbranch_scc0 latch
+  v_add_nc_u32 v1, 3, v1
+  s_branch inner
+inner:
+  s_cmp_eq_u32 s9, 1
+  s_cbranch_scc0 latch
+  v_add_nc_u32 v1, 7, v1
+  s_add_u32 s9, s9, 1
+  s_cmp_lt_u32 s9, s10
+  s_cbranch_scc1 loop
+latch:
+  v_add_nc_u32 v1, 11, v1
+  s_add_u32 s9, s9, 1
+  s_branch loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0x7e020280u, 0xbe890380u, 0xbe8a0384u, 0xbf0a0a09u, 0xbf84000du, 0xbf0a0209u, 0xbf840008u, 0x4a020283u, 0xbf820000u,
+             0xbf068109u, 0xbf840004u, 0x4a020287u, 0x80098109u, 0xbf0a0a09u, 0xbf85fff4u, 0x4a02028bu, 0x80098109u, 0xbf82fff1u}), Split::Clone, 3u, {}, {{15u, 18u}}},
         {"continue beside the inner merge of a nested selection in a loop", R"(
   s_mov_b32 s8, 0
   v_mov_b32 v1, 0
