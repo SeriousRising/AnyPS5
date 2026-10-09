@@ -58,18 +58,28 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     }
     SrtRuntime cleanRuntime = runtime;
     cleanRuntime.readMemory = runtime.readSpecializationMemory;
-    Evaluator cleanEvaluator(program, cleanRuntime);
-    Evaluator evaluator(program, runtime, cleanFlatSlots, &cleanEvaluator);
+    std::vector<std::uint32_t> flattened(evaluateFlat ? program.srtReads.size() : 0u);
+    std::vector<std::uint8_t> recordedClean(flattened.size());
+    Evaluator cleanEvaluator(program, cleanRuntime, cleanFlatSlots, nullptr, nullptr, flattened, recordedClean);
+    Evaluator evaluator(program, runtime, cleanFlatSlots, &cleanEvaluator, nullptr, flattened, recordedClean);
     std::vector<std::uint8_t> active;
+    std::vector<std::uint8_t> activeReads;
     if (evaluateFlat) {
         active.assign(program.descriptorSources.size(), 1u);
+        activeReads.assign(program.srtReads.size(), 1u);
     }
     if (evaluateFlat && !program.controlFlow.empty()) {
         for (const auto& block : program.controlFlow) {
             for (const auto source : block.sources) {
                 active.at(source) = 0u;
             }
+            for (const auto read : block.reads) activeReads.at(read) = 0u;
         }
+        auto conditionRuntime = runtime;
+        conditionRuntime.readMemory = +[](void*, std::uint64_t, std::uint32_t*) { return false; };
+        conditionRuntime.readSpecializationMemory = conditionRuntime.readMemory;
+        conditionRuntime.readTrace = nullptr;
+        Evaluator conditionEvaluator(program, conditionRuntime);
         std::vector<std::uint8_t> visited(program.controlFlow.size());
         std::vector<std::uint32_t> pending {0};
         while (!pending.empty()) {
@@ -83,8 +93,9 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
             for (const auto source : block.sources) {
                 active[source] = 1u;
             }
+            for (const auto read : block.reads) activeReads[read] = 1u;
             std::uint32_t condition = 0;
-            const bool cleanEvaluable = block.condition != nullptr && runtime.readSpecializationMemory != nullptr && cleanEvaluator.Evaluate(block.condition, condition);
+            const bool cleanEvaluable = block.condition != nullptr && block.successors.size() == 2u && conditionEvaluator.Evaluate(block.condition, condition);
             if (cleanEvaluable) {
                 pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
             } else {
@@ -116,10 +127,9 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         }
         evaluated.push_back(value);
     }
-    std::vector<std::uint32_t> flattened;
     if (evaluateFlat) {
-        flattened.resize(program.srtReads.size());
         for (const auto& read : program.srtReads) {
+            if (read.flatOffset < activeReads.size() && activeReads[read.flatOffset] == 0u) continue;
             const bool clean = read.flatOffset < cleanFlatSlots.size() && cleanFlatSlots[read.flatOffset] != 0u;
             auto& selected = clean ? cleanEvaluator : evaluator;
             // A pure slot's raw read is reachable from no root, so it was not evaluated (nor
