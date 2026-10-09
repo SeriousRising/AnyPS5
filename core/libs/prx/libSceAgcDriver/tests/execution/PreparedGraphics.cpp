@@ -237,13 +237,9 @@ void DrawLazyRectangle(AgcDriver::VulkanDevice& device) {
     drawContext[0x114] = 0;
     drawContext[0xb4] = 0;
     drawContext[0xb5] = std::bit_cast<std::uint32_t>(1.0f);
-    std::vector<std::uint32_t> commands;
-    for (const auto& [offset, value] : drawContext) commands.insert(commands.end(), {0xc0016900u, offset, value});
-    for (const auto& header : headers) for (const auto& reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
-    for (std::size_t index = 0; index < users.size(); ++index) commands.insert(commands.end(), {0xc0017600u, 0x8cu + static_cast<std::uint32_t>(index), users[index]});
-    commands.insert(commands.end(), {0xc0017900u, 0x242, 7, 0xc0002f00u, 1, 0xc0012d00u, 3, 2});
-    const Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     for (unsigned helperOrder = 0; helperOrder < 3; ++helperOrder) {
+        auto submittedContext = drawContext;
+        std::array<ShaderRegister, 4> primitive{};
         if (helperOrder != 0) {
             for (std::size_t stage = 0; stage < headers.size(); ++stage) {
                 auto& header = headers[stage];
@@ -258,7 +254,6 @@ void DrawLazyRectangle(AgcDriver::VulkanDevice& device) {
                 AgcDriverRegisterShader_nid_postfix(&header.shader);
             }
             std::array<ShaderRegister, 3> primitiveContext{};
-            std::array<ShaderRegister, 4> primitive{};
             std::array<ShaderRegister, 33> interpolants{};
             primitiveContext.back() = primitive.back() = interpolants.back() = {0xdeadbeefu, 0xcafebabeu};
             const auto prepare = [&] { Require(sceAgcCreatePrimState(primitiveContext.data(), primitive.data(), nullptr, &headers[0].shader, 7) == 0, "primitive helper rejected a lazy rectangle"); };
@@ -268,8 +263,17 @@ void DrawLazyRectangle(AgcDriver::VulkanDevice& device) {
             Require(primitiveContext[0].offset == ShaderRegs::VGT_SHADER_STAGES_EN && primitiveContext[0].value == 0x00402000 && primitive[2].value == 7, "primitive helper lost its vertex-owned routing");
             Require(interpolants[0].offset == ShaderRegs::SPI_PS_INPUT_CNTL_0 && interpolants[0].value == 0x403u, "mapping helper lost its nonzero flat interpolant");
             for (const auto reg : {primitiveContext.back(), primitive.back(), interpolants.back()}) Require(reg.offset == 0xdeadbeefu && reg.value == 0xcafebabeu, "shader helper overwrote output padding");
-            AgcDriverResolveGraphicsAbi_nid_postfix(&headers[0].shader, &headers[1].shader, 7);
+            for (std::size_t index = 0; index < primitiveContext.size() - 1; ++index) submittedContext[primitiveContext[index].offset] = primitiveContext[index].value;
+            for (std::size_t index = 0; index < interpolants.size() - 1; ++index) submittedContext[interpolants[index].offset] = interpolants[index].value;
         }
+        std::vector<std::uint32_t> commands;
+        for (const auto& [offset, value] : submittedContext) commands.insert(commands.end(), {0xc0016900u, offset, value});
+        for (const auto& header : headers) for (const auto& reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
+        for (std::size_t index = 0; index < users.size(); ++index) commands.insert(commands.end(), {0xc0017600u, 0x8cu + static_cast<std::uint32_t>(index), users[index]});
+        if (helperOrder == 0) commands.insert(commands.end(), {0xc0017900u, 0x242, 7});
+        else for (std::size_t index = 0; index < primitive.size() - 1; ++index) commands.insert(commands.end(), {0xc0017900u, primitive[index].offset, primitive[index].value});
+        commands.insert(commands.end(), {0xc0002f00u, 1, 0xc0012d00u, 3, 2});
+        const Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
         for (unsigned iteration = 0; iteration < 2; ++iteration) {
             pixels.fill(0xdeadbeefu);
             sceAgcDriverSubmitDcb(&packet);
