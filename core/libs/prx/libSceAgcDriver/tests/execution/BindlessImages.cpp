@@ -83,6 +83,42 @@ void Run(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void RunMixedDirectImages(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+    alignas(256) static std::array<std::array<std::uint32_t, 2048>, 17> surfaces;
+    alignas(4096) static std::array<std::uint32_t, 64> output;
+    std::array<std::array<std::uint32_t, 8>, 17> table;
+    std::vector<std::uint32_t> code{0x7e3c0280u, 0x7e3e0280u};
+    for (std::uint32_t image = 0u; image < table.size(); ++image) code.insert(code.end(), {0xf40c0200u, 0xfa000000u | (image * 32u), 0xf0001108u, 0x00020a1eu, 0xe0700000u | (image * 4u), 0x80010a00u});
+    code.push_back(0xbf810000u);
+    const auto tableAddress = reinterpret_cast<std::uintptr_t>(table.data());
+    const auto outputAddress = reinterpret_cast<std::uintptr_t>(output.data());
+    const std::array<std::uint32_t, 8> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>(outputAddress >> 32u), 256u, 0x31016facu};
+    const std::array memory{MemoryRegion{tableAddress, std::as_bytes(std::span{table})}};
+    const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    RecompileRequest request{{ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0u, {}}, {waveSize, 0u, userData, compute, std::nullopt, std::nullopt, memory}, device.Target(), {0u, 0u, 0u, 128u}};
+    CompiledShaderArtifact first;
+    for (std::uint32_t iteration = 0u; iteration < 2u; ++iteration) {
+        for (std::uint32_t image = 0u; image < table.size(); ++image) {
+            surfaces[image].fill(0x3f800000u + image * 0x800000u);
+            const auto address = reinterpret_cast<std::uintptr_t>(surfaces[image].data());
+            table[image] = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>(address >> 40u) | (((image + iteration) % 17u < 9u ? 22u : 20u) << 20u) | (3u << 30u), 7u | (7u << 14u), 0x90000facu, 0u, 0u, 0u, 0u};
+        }
+        output.fill(0xa5a5a5a5u);
+        const auto result = Recompile(request);
+        if (first.variantId == 0u) first = result;
+        else Require(result.cacheHit && result.variantId == first.variantId, "mixed sampled formats changed the static artifact");
+        std::vector<std::uint32_t> counts;
+        for (const auto& binding : result.bindings) if (binding.role == DescriptorRole::GuestImages) counts.push_back(binding.count);
+        std::sort(counts.begin(), counts.end());
+        Require(counts == std::vector<std::uint32_t>{8u, 9u}, "mixed sampled resources did not compact into 8/9 heaps");
+        device.Dispatch(result, 1u, 1u, 1u);
+        device.WaitIdle();
+        for (std::uint32_t image = 0u; image < 64u; ++image) {
+            Require(output[image] == (image < table.size() ? surfaces[image][0] : 0xa5a5a5a5u), "mixed sampled compact index or output guard failed");
+        }
+    }
+}
+
 }
 
 int main() {
@@ -90,6 +126,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(*device);
+        for (const auto waveSize : {32u, 64u}) RunMixedDirectImages(*device, waveSize);
         std::cout << "bindless image materialization tests passed\n";
         return 0;
     } catch (const std::exception& error) {
