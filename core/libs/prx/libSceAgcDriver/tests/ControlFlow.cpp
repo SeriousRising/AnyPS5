@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -35,6 +36,7 @@ struct Program {
     Split split;
     std::size_t clonedLimit = 0;
     std::vector<std::uint32_t> reference = {};
+    std::pair<std::uint32_t, std::uint32_t> clonedRange{};
 };
 
 using RouteState = std::map<std::uint32_t, bool>;
@@ -60,7 +62,38 @@ bool inEnclosingContinueConstruct(const ControlFlowGraph& graph, std::uint32_t h
     });
 }
 
+ControlFlowGraph structuralGraph(const ControlFlowGraph& graph) {
+    auto structural = graph;
+    std::vector<std::uint32_t> all;
+    for (const auto& block : graph.blocks) {
+        all.push_back(block.id);
+        for (const auto target : {block.terminator.mergeBlock, block.terminator.continueBlock}) {
+            if (target == InvalidControlFlowId) continue;
+            auto& predecessors = structural.FindBlock(target).predecessors;
+            if (std::find(predecessors.begin(), predecessors.end(), block.id) == predecessors.end()) predecessors.push_back(block.id);
+        }
+    }
+    for (auto& block : structural.blocks) block.dominators = block.id == structural.entryBlock ? std::vector{block.id} : all;
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (auto& block : structural.blocks) {
+            if (block.id == structural.entryBlock) continue;
+            auto next = block.predecessors.empty() ? std::vector{block.id} : all;
+            for (const auto predecessor : block.predecessors) {
+                std::erase_if(next, [&](std::uint32_t dominator) { return !structural.Dominates(dominator, predecessor); });
+            }
+            if (std::find(next.begin(), next.end(), block.id) == next.end()) next.push_back(block.id);
+            std::sort(next.begin(), next.end());
+            if (next == block.dominators) continue;
+            block.dominators = std::move(next);
+            changed = true;
+        }
+    }
+    return structural;
+}
+
 void verifyStructured(const std::string& prefix, const ControlFlowGraph& graph) {
+    const auto structural = structuralGraph(graph);
     std::map<std::uint32_t, std::uint32_t> mergeOwners;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> loopExits;
     for (const auto& block : graph.blocks) {
@@ -72,10 +105,10 @@ void verifyStructured(const std::string& prefix, const ControlFlowGraph& graph) 
     for (const auto& block : graph.blocks) {
         const auto& terminator = block.terminator;
         if (terminator.loopHeader || terminator.mergeBlock == InvalidControlFlowId) continue;
-        for (const auto member : constructBlocks(graph, block.id, terminator.mergeBlock)) {
-            if (inEnclosingContinueConstruct(graph, block.id, member)) continue;
+        for (const auto member : constructBlocks(structural, block.id, terminator.mergeBlock)) {
+            if (inEnclosingContinueConstruct(structural, block.id, member)) continue;
             for (const auto successor : graph.FindBlock(member).successors) {
-                if (successor == terminator.mergeBlock || (graph.Dominates(block.id, successor) && !graph.Dominates(terminator.mergeBlock, successor))) continue;
+                if (successor == terminator.mergeBlock || (structural.Dominates(block.id, successor) && !structural.Dominates(terminator.mergeBlock, successor))) continue;
                 const bool loopExit = std::any_of(loopExits.begin(), loopExits.end(), [&](const auto& exits) { return successor == exits.first || successor == exits.second; });
                 require(loopExit, prefix + "block " + std::to_string(member) + " of the selection at block " + std::to_string(block.id) + " branches to block " + std::to_string(successor) + " outside the construct");
             }
@@ -84,12 +117,48 @@ void verifyStructured(const std::string& prefix, const ControlFlowGraph& graph) 
     for (const auto& loop : graph.blocks) {
         if (!loop.terminator.loopHeader) continue;
         const auto continueBlock = loop.terminator.continueBlock;
-        for (const auto member : constructBlocks(graph, loop.id, loop.terminator.mergeBlock)) {
+        for (const auto member : constructBlocks(structural, loop.id, loop.terminator.mergeBlock)) {
             const auto& terminator = graph.FindBlock(member).terminator;
-            if (terminator.loopHeader || graph.Dominates(continueBlock, member)) continue;
+            if (terminator.loopHeader || structural.Dominates(continueBlock, member)) continue;
             require(terminator.mergeBlock != continueBlock, prefix + "the selection at block " + std::to_string(member) + " in the loop at block " + std::to_string(loop.id) + " merges at the loop's continue block " + std::to_string(continueBlock));
         }
     }
+}
+
+void verifyConstructMembership() {
+    const std::vector<std::vector<std::uint32_t>> edges{{1, 10}, {2}, {3}, {4}, {5, 6}, {7}, {12, 7}, {8}, {9, 11}, {10}, {}, {}, {3}};
+    ControlFlowGraph graph;
+    graph.entryBlock = 0;
+    for (std::uint32_t id = 0; id < edges.size(); ++id) {
+        BasicBlock block;
+        block.id = id;
+        block.successors = edges[id];
+        block.terminator.kind = edges[id].empty() ? TerminatorKind::Return : edges[id].size() == 1u ? TerminatorKind::Branch : TerminatorKind::ConditionalBranch;
+        if (!edges[id].empty()) block.terminator.trueBlock = edges[id][0];
+        if (edges[id].size() == 2u) block.terminator.falseBlock = edges[id][1];
+        graph.blocks.push_back(std::move(block));
+    }
+    for (const auto& block : graph.blocks) {
+        for (const auto successor : block.successors) graph.FindBlock(successor).predecessors.push_back(block.id);
+    }
+    graph.FindBlock(0).terminator.mergeBlock = 10;
+    graph.FindBlock(3).terminator.loopHeader = true;
+    graph.FindBlock(3).terminator.mergeBlock = 7;
+    graph.FindBlock(3).terminator.continueBlock = 12;
+    graph.FindBlock(4).terminator.mergeBlock = 6;
+    graph.FindBlock(8).terminator.mergeBlock = 9;
+    require(constructBlocks(structuralGraph(graph), 4, 6) == std::vector<std::uint32_t>{4, 5}, "inner selection includes the post-loop kill tail");
+    verifyStructured("structural construct membership: ", graph);
+    graph.FindBlock(5).successors = {10};
+    graph.FindBlock(5).terminator.trueBlock = 10;
+    std::erase(graph.FindBlock(7).predecessors, 5u);
+    graph.FindBlock(10).predecessors.push_back(5);
+    try { verifyStructured("invalid selection exit: ", graph); }
+    catch (const std::exception& error) {
+        require(std::string(error.what()).find("outside the construct") != std::string::npos, error.what());
+        return;
+    }
+    throw std::runtime_error("structural construct verification accepted an invalid selection exit");
 }
 
 std::uint32_t followEmptyBlocks(const std::string& prefix, const ControlFlowGraph& graph, std::uint32_t blockId, RouteState& routes) {
@@ -134,11 +203,14 @@ void verifySameExecutions(const std::string& prefix, const ControlFlowGraph& ori
     }
 }
 
-std::size_t clonedInstructions(const ControlFlowGraph& graph) {
+std::size_t clonedInstructions(const ControlFlowGraph& graph, std::pair<std::uint32_t, std::uint32_t> expectedRange) {
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::size_t> copies;
     std::size_t cloned = 0;
     for (const auto& block : graph.blocks) {
-        if (block.instructionBegin != block.instructionEnd && copies[{block.instructionBegin, block.instructionEnd}]++ != 0) cloned += block.instructionEnd - block.instructionBegin;
+        const auto range = std::make_pair(block.instructionBegin, block.instructionEnd);
+        if (block.instructionBegin == block.instructionEnd || copies[range]++ == 0) continue;
+        if (expectedRange.second != 0u) require(range == expectedRange, "loop normalization cloned a range other than the semantic latch");
+        cloned += block.instructionEnd - block.instructionBegin;
     }
     return cloned;
 }
@@ -157,7 +229,7 @@ struct Structured {
     std::size_t routeVariables;
 };
 
-Structured verifyGraph(const std::string& name, std::span<const std::uint32_t> code) {
+Structured verifyGraph(const std::string& name, std::span<const std::uint32_t> code, std::pair<std::uint32_t, std::uint32_t> clonedRange = {}) {
     const std::string prefix = name + ": ";
     const auto decoded = RdnaInstructionDecoder{}.Decode(code);
     const auto original = GraphBuilder{}.Build(decoded);
@@ -165,7 +237,7 @@ Structured verifyGraph(const std::string& name, std::span<const std::uint32_t> c
     Structurizer{}.Structurize(graph);
     verifyStructured(prefix, graph);
     verifySameExecutions(prefix, original, graph);
-    return {graph.blocks.size() - original.blocks.size(), clonedInstructions(graph), routeVariables(graph)};
+    return {graph.blocks.size() - original.blocks.size(), clonedInstructions(graph, clonedRange), routeVariables(graph)};
 }
 
 std::vector<std::uint32_t> Store(std::vector<std::uint32_t> code) {
@@ -210,11 +282,12 @@ std::size_t recompile(const std::string& name, std::span<const std::uint32_t> co
 
 void verifyProgram(const Program& program) {
     const std::string name(program.name);
-    const auto result = verifyGraph(name, program.code);
+    const auto result = verifyGraph(name, program.code, program.clonedRange);
     if (program.split == Split::None) {
         require(result.clonedInstructions == 0 && result.routeVariables == 0, name + ": expected no clone or routing, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
     } else if (program.split == Split::Clone) {
         require(result.clonedInstructions != 0 && result.routeVariables == 0, name + ": expected a clone, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
+        if (program.clonedLimit != 0u) require(result.clonedInstructions == program.clonedLimit, name + ": cloned instruction count differs from the expected semantic latch");
     } else {
         require(result.clonedInstructions <= program.clonedLimit && result.routeVariables != 0, name + ": expected routing with at most " + std::to_string(program.clonedLimit) + " cloned instructions, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
     }
@@ -393,7 +466,7 @@ latch:
 done:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
-         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850002u, 0x80089008u, 0xbf82fff4u}), Split::None},
+         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850002u, 0x80089008u, 0xbf82fff4u}), Split::Clone, 2u, {}, {12u, 14u}},
         {"loop exit to the end of the program beside a kill exit", R"(
   v_mov_b32 v1, 0
   s_mov_b64 s[20:21], exec
@@ -933,6 +1006,7 @@ done:
         }
     }
     try {
+        verifyConstructMembership();
         verifyNullSwappc();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
