@@ -36,7 +36,7 @@ struct Program {
     Split split;
     std::size_t clonedLimit = 0;
     std::vector<std::uint32_t> reference = {};
-    std::pair<std::uint32_t, std::uint32_t> clonedRange{};
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> clonedRanges{};
 };
 
 using RouteState = std::map<std::uint32_t, bool>;
@@ -203,15 +203,16 @@ void verifySameExecutions(const std::string& prefix, const ControlFlowGraph& ori
     }
 }
 
-std::size_t clonedInstructions(const ControlFlowGraph& graph, std::pair<std::uint32_t, std::uint32_t> expectedRange) {
+std::size_t clonedInstructions(const ControlFlowGraph& graph, std::span<const std::pair<std::uint32_t, std::uint32_t>> expectedRanges) {
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::size_t> copies;
     std::size_t cloned = 0;
     for (const auto& block : graph.blocks) {
         const auto range = std::make_pair(block.instructionBegin, block.instructionEnd);
         if (block.instructionBegin == block.instructionEnd || copies[range]++ == 0) continue;
-        if (expectedRange.second != 0u) require(range == expectedRange, "loop normalization cloned a range other than the semantic latch");
+        if (!expectedRanges.empty()) require(std::find(expectedRanges.begin(), expectedRanges.end(), range) != expectedRanges.end(), "loop normalization cloned an unexpected instruction range");
         cloned += block.instructionEnd - block.instructionBegin;
     }
+    for (const auto& range : expectedRanges) require(copies[range] == 2u, "loop normalization did not copy an expected instruction range exactly once");
     return cloned;
 }
 
@@ -229,7 +230,7 @@ struct Structured {
     std::size_t routeVariables;
 };
 
-Structured verifyGraph(const std::string& name, std::span<const std::uint32_t> code, std::pair<std::uint32_t, std::uint32_t> clonedRange = {}) {
+Structured verifyGraph(const std::string& name, std::span<const std::uint32_t> code, std::span<const std::pair<std::uint32_t, std::uint32_t>> clonedRanges = {}) {
     const std::string prefix = name + ": ";
     const auto decoded = RdnaInstructionDecoder{}.Decode(code);
     const auto original = GraphBuilder{}.Build(decoded);
@@ -237,7 +238,7 @@ Structured verifyGraph(const std::string& name, std::span<const std::uint32_t> c
     Structurizer{}.Structurize(graph);
     verifyStructured(prefix, graph);
     verifySameExecutions(prefix, original, graph);
-    return {graph.blocks.size() - original.blocks.size(), clonedInstructions(graph, clonedRange), routeVariables(graph)};
+    return {graph.blocks.size() - original.blocks.size(), clonedInstructions(graph, clonedRanges), routeVariables(graph)};
 }
 
 std::vector<std::uint32_t> Store(std::vector<std::uint32_t> code) {
@@ -282,12 +283,12 @@ std::size_t recompile(const std::string& name, std::span<const std::uint32_t> co
 
 void verifyProgram(const Program& program) {
     const std::string name(program.name);
-    const auto result = verifyGraph(name, program.code, program.clonedRange);
+    const auto result = verifyGraph(name, program.code, program.clonedRanges);
     if (program.split == Split::None) {
         require(result.clonedInstructions == 0 && result.routeVariables == 0, name + ": expected no clone or routing, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
     } else if (program.split == Split::Clone) {
         require(result.clonedInstructions != 0 && result.routeVariables == 0, name + ": expected a clone, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
-        if (program.clonedLimit != 0u) require(result.clonedInstructions == program.clonedLimit, name + ": cloned instruction count differs from the expected semantic latch");
+        if (program.clonedLimit != 0u) require(result.clonedInstructions == program.clonedLimit, name + ": cloned instruction count differs from the expected ranges");
     } else {
         require(result.clonedInstructions <= program.clonedLimit && result.routeVariables != 0, name + ": expected routing with at most " + std::to_string(program.clonedLimit) + " cloned instructions, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
     }
@@ -466,7 +467,62 @@ latch:
 done:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
-         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850002u, 0x80089008u, 0xbf82fff4u}), Split::Clone, 2u, {}, {12u, 14u}},
+         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850002u, 0x80089008u, 0xbf82fff4u}), Split::Clone, 2u, {}, {{12u, 14u}}},
+        {"conditional repeat beside the inner merge of a nested selection in a loop", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, 0
+loop:
+  v_cmp_gt_u32 vcc, s8, v0
+  s_cbranch_vccz join
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccnz inner
+  v_cmp_gt_u32 vcc, 4, v0
+  s_cbranch_vccnz latch
+inner:
+  v_add_nc_u32 v1, 1, v1
+join:
+  v_add_nc_u32 v1, 2, v1
+  s_cmp_ge_u32 s8, 64
+  s_cbranch_scc1 done
+latch:
+  s_add_u32 s8, s8, 16
+  s_cmp_lt_u32 s8, 64
+  s_cbranch_scc1 loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850003u, 0x80089008u, 0xbf0ac008u, 0xbf85fff3u}), Split::Clone, 7u, {}, {{8u, 9u}, {9u, 12u}, {12u, 15u}}},
+        {"reconverging conditional tails before a loop repeat test", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, 0
+loop:
+  v_cmp_gt_u32 vcc, s8, v0
+  s_cbranch_vccz join
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccnz inner
+  v_cmp_gt_u32 vcc, 4, v0
+  s_cbranch_vccnz latch
+inner:
+  v_add_nc_u32 v1, 1, v1
+join:
+  v_add_nc_u32 v1, 2, v1
+  s_cmp_ge_u32 s8, 64
+  s_cbranch_scc1 done
+latch:
+  s_add_u32 s8, s8, 16
+  v_cmp_gt_u32 vcc, 4, v0
+  s_cbranch_vccnz right
+  v_add_nc_u32 v1, 1, v1
+  s_branch repeat
+right:
+  v_add_nc_u32 v1, 2, v1
+repeat:
+  s_cmp_lt_u32 s8, 64
+  s_cbranch_scc1 loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850008u, 0x80089008u, 0x7d880084u, 0xbf870002u, 0x4a020281u, 0xbf820001u, 0x4a020282u, 0xbf0ac008u, 0xbf85ffeeu}), Split::Route},
         {"loop exit to the end of the program beside a kill exit", R"(
   v_mov_b32 v1, 0
   s_mov_b64 s[20:21], exec

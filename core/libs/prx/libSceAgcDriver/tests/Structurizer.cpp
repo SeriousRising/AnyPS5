@@ -74,6 +74,21 @@ void requireStructuredBranches(const ControlFlowGraph& graph, const char* name) 
     }
 }
 
+void requireMergeReachesRange(const ControlFlowGraph& graph, std::uint32_t source, std::uint32_t target) {
+    const auto header = std::find_if(graph.blocks.begin(), graph.blocks.end(), [&](const BasicBlock& block) {
+        return block.instructionBegin == source * 2u && block.instructionEnd == source * 2u + 2u;
+    });
+    if (header == graph.blocks.end()) throw std::runtime_error("selection instruction range was not preserved");
+    auto merge = header->terminator.mergeBlock;
+    for (std::size_t steps = 0; merge != InvalidControlFlowId && steps < graph.blocks.size(); ++steps) {
+        const auto& block = graph.FindBlock(merge);
+        if (block.instructionBegin == target * 2u && block.instructionEnd == target * 2u + 2u) return;
+        if (block.instructionBegin != block.instructionEnd || block.terminator.kind != TerminatorKind::Branch || block.successors.size() != 1u) break;
+        merge = block.successors.front();
+    }
+    throw std::runtime_error("selection merge does not reach the expected original instruction range through empty blocks");
+}
+
 void requireEmptyContinuations(const ControlFlowGraph& graph) {
     for (const auto& header : graph.blocks) {
         if (!header.terminator.loopHeader) continue;
@@ -108,6 +123,20 @@ int main() {
             Structurizer{}.Structurize(graph);
             if (GraphToString(graph) != normalized) throw std::runtime_error("loop normalization is not idempotent");
         }
+        auto conditionalLatch = makeGraph({{1}, {2, 5}, {3, 4}, {4, 6}, {5}, {6, 7}, {1, 7}, {}});
+        Structurizer{}.Structurize(conditionalLatch);
+        requireEmptyContinuations(conditionalLatch);
+        requireStructuredBranches(conditionalLatch, "nested selection beside a conditional latch");
+        auto sharedTail = makeGraph({{1}, {2, 9}, {3, 4}, {5, 6}, {8}, {7}, {7}, {4, 8}, {1}, {}});
+        Structurizer{}.Structurize(sharedTail);
+        requireEmptyContinuations(sharedTail);
+        requireStructuredBranches(sharedTail, "conditional tails sharing an acyclic join");
+        requireMergeReachesRange(sharedTail, 2u, 4u);
+        auto cyclicTail = makeGraph({{1}, {2, 8}, {3, 4}, {5, 6}, {7}, {5, 4}, {7}, {1}, {}});
+        Structurizer{}.Structurize(cyclicTail);
+        requireEmptyContinuations(cyclicTail);
+        requireStructuredBranches(cyclicTail, "a conditional tail containing a nested cycle");
+        requireMergeReachesRange(cyclicTail, 2u, 7u);
         auto sequentialContinues = makeGraph({{1}, {2, 6}, {4, 3}, {4, 5}, {1}, {4}, {}});
         Structurizer{}.Structurize(sequentialContinues);
         requireEmptyContinuations(sequentialContinues);
