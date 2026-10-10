@@ -138,6 +138,9 @@ Set `APS5_THREAD_PRIORITY=high` to raise the AGC driver's queue workers and the 
 ## Loop guard
 
 Set `APS5_LOOP_GUARD=<count>` to find a recompiled shader loop that does not end. Each invocation counts the loop exits it evaluates, over all the loops of the shader; past `<count>` it takes every loop exit it reaches, so the shader finishes instead of hanging the GPU. The first exit taken this way is reported once per shader and instruction: `[gpu] loop guard: compute shader 0x<address> loop exit at instruction 0x<offset> passed <count> evaluations`, the offset being that of the block holding the exit branch, in bytes from the start of the shader. Only shaders with address-based memory accesses can report; others are cut without a line. A cut loop leaves its work unfinished, so the title sees different results: use it for diagnosis only. The value is part of the shader cache key. The setting is disabled by default.
+## Frames in flight
+
+A submission that carries a flip waits on the submitting thread while `APS5_FRAMES_IN_FLIGHT` earlier flips (default 1, at most 16) have not completed; a flip completes when the GPU work submitted before it and its presentation are done. This keeps a title from rewriting a frame's memory while the GPU work that reads it is still queued. `sceVideoOutIsFlipPending` therefore reports at most that many flips, and `sceVideoOutSubmitFlip` waits instead of returning `VIDEO_OUT_ERROR_FLIP_QUEUE_FULL` unless the value is 16. A larger value lets the title prepare more frames ahead of the GPU.
 
 ## Shader recompiler
 

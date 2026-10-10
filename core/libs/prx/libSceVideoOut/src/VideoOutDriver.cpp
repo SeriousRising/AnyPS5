@@ -121,13 +121,25 @@ public:
     }
 
     void WaitForFlipRoom() override {
+        static const std::size_t bound = [] {
+            const char* value = std::getenv("APS5_FRAMES_IN_FLIGHT");
+            if (value == nullptr) return std::size_t{1};
+            const long parsed = std::strtol(value, nullptr, 10);
+            if (parsed >= 1 && parsed <= static_cast<long>(VIDEO_OUT_FLIP_QUEUE_CAPACITY)) return static_cast<std::size_t>(parsed);
+            std::fprintf(stderr, "[videoout] APS5_FRAMES_IN_FLIGHT=%s refused (1 to %zu flips may wait for their GPU work); using 1\n", value, VIDEO_OUT_FLIP_QUEUE_CAPACITY);
+            return std::size_t{1};
+        }();
         std::unique_lock queueLock(queue->mutex);
-        const bool room = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(FLIP_ROOM_WAIT_MICROS), [&] {
-            return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY;
-        });
-        if (queue->failure) std::rethrow_exception(queue->failure);
-        if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
-        require(room, "flip queue stayed full for 60 s: the presenter is not completing flips");
+        for (unsigned minutes = 1;; ++minutes) {
+            const bool room = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(FLIP_ROOM_WAIT_MICROS), [&] {
+                return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < bound;
+            });
+            if (queue->failure) std::rethrow_exception(queue->failure);
+            if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
+            if (room) return;
+            require(queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY, "flip queue stayed full for 60 s: the presenter is not completing flips");
+            std::fprintf(stderr, "[videoout] a flip submission has waited %u min for %zu earlier flips to complete (APS5_FRAMES_IN_FLIGHT=%zu)\n", minutes, queue->reservations.load(), bound);
+        }
     }
 
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override {

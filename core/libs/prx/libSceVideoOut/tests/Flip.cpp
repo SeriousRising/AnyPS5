@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <string>
 #include <limits>
@@ -553,13 +555,24 @@ BusyLoop prepareBusyLoop(std::uint32_t iterations) {
     alignas(256) static const std::array<std::uint32_t, 12> code{
         0xbe850380, 0x7e040281, 0xd5690002, 0x00020502, 0x4a040481, 0x80058105,
         0xbf070405, 0xbf85fffa, 0x7e020280, 0xe0701000, 0x80000201, 0xbf810000};
-    static Shader shader{};
-    shader.file_header = 0x34333231;
-    shader.version = 0x18;
-    shader.header_size = sizeof(Shader);
-    shader.shader_size = sizeof(code);
-    shader.code = code.data();
-    AgcDriverRegisterShader_nid_postfix(&shader);
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        ShaderSpecialRegs specials{};
+    };
+    static Header header{};
+    const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+    header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 32}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 5u << 1u}}};
+    header.specials.dispatch_modifier = 0x8000u;
+    header.shader.file_header = 0x34333231;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(Header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    header.shader.specials = &header.specials;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
     std::int64_t physical = 0;
     void* mapped = nullptr;
     check(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, 65536, 65536, 0, &physical) == 0, "direct memory allocation failed");
@@ -670,6 +683,50 @@ void testUnopenedEventRegistration() {
     LibcRunShutdown_nid_postfix();
 }
 
+bool framesInFlightStarted = false;
+
+void testFramesInFlight() {
+    std::filesystem::create_directories("app0/sce_sys");
+    std::ofstream("app0/sce_sys/param.json", std::ios::binary) << R"({"titleId":"TEST00000","localizedParameters":{"en-US":{"titleName":"Example"}},"downloadDataSize":0})";
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    framesInFlightStarted = true;
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    std::vector<std::byte> allocation(6 * 65536 + 65535);
+    const auto storage = alignedBuffer(allocation);
+    fillBuffer(storage, 259, 137);
+    VideoOutBuffers buffer{storage.data(), nullptr, {nullptr, nullptr}};
+    VideoOutBufferAttribute2 attribute{};
+    sceVideoOutSetBufferAttribute2(&attribute, 0x8000000000000000ull, 0, 259, 137, 0, 0, 0);
+    sceVideoOutRegisterBuffers2(handle, 0, 0, &buffer, 1, &attribute, 0, nullptr);
+    constexpr std::uint32_t iterations = 10000000u;
+    auto busy = prepareBusyLoop(iterations);
+    Packet packet{busy.commands.data(), static_cast<std::uint32_t>(busy.commands.size()), 0, {}};
+    check(sceVideoOutSubmitFlip(handle, 0, 1, 1) == 0, "the first flip was not accepted");
+    {
+        std::unique_lock lock(cfg->mutex);
+        const bool done = cfg->vblankCond.wait_for(lock, std::chrono::seconds(30), [&] { return cfg->failure || cfg->flipStatus.count == 1; });
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(done, "the first flip did not complete");
+    }
+    for (std::int64_t frame = 2; frame <= 4; ++frame) {
+        *busy.label = 0;
+        *busy.result = 0;
+        check(sceAgcDriverSubmitDcb(&packet) == 0, "a frame's GPU work was not accepted");
+        check(sceVideoOutSubmitFlip(handle, 0, 1, frame) == 0, "a frame's flip was not accepted");
+        check(sceVideoOutIsFlipPending(handle) <= 1, "more than one flip was pending under the default bound");
+        check(sceVideoOutSubmitFlip(handle, 0, 1, frame + 100) == 0, "the next frame's flip was not accepted");
+        const bool landed = *busy.label == 1 && *busy.result == busyLoopResult(iterations);
+        std::unique_lock lock(cfg->mutex);
+        check(landed && cfg->flipStatus.count >= static_cast<std::uint64_t>(2 * frame - 2), "the next frame's flip was accepted while the frame before it had unfinished GPU work");
+        const bool done = cfg->vblankCond.wait_for(lock, std::chrono::seconds(30), [&] { return cfg->failure || cfg->flipStatus.count == static_cast<std::uint64_t>(2 * frame - 1); });
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(done, "the next frame's flip did not complete");
+    }
+    sceVideoOutUnregisterBuffers(handle, 0);
+    sceVideoOutClose(handle);
+    LibcRunShutdown_nid_postfix();
+}
+
 void testOneDevice() {
     const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
@@ -719,11 +776,13 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "overlay") testOverlay();
         else if (argc == 2 && std::string(argv[1]) == "deferred") testDeferredBuffer();
         else if (argc == 2 && std::string(argv[1]) == "unregistered") testUnregisteredBuffer();
+        else if (argc == 2 && std::string(argv[1]) == "inflight") testFramesInFlight();
         else testLifetime(argc == 2 && std::string(argv[1]) == "reopen");
         std::puts("VideoOut flip tests passed");
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
+        if (argc == 2 && std::string(argv[1]) == "inflight" && !framesInFlightStarted && std::getenv("ANYPS5_REQUIRE_DISPLAY") == nullptr && std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr) return 77;
         try { LibcRunShutdown_nid_postfix(); }
         catch (const std::exception& shutdown) { std::fprintf(stderr, "shutdown: %s\n", shutdown.what()); }
         if (std::string(error.what()).find("Vulkan support") != std::string::npos && !std::getenv("ANYPS5_REQUIRE_DISPLAY")) {
