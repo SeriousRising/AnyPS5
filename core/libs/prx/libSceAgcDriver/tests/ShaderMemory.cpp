@@ -8,7 +8,9 @@
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
+#include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "Optimization/SrtWalker/SrtRuntimeValidator.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -803,7 +805,7 @@ void verifyInactiveSrtReads() {
     require(failures == 0u, "uniform branches dereferenced inactive SRT pointers");
 }
 
-void verifyInactiveSrtDependencies() {
+void verifyInactiveSrtDependencies(bool analyzed) {
     using namespace ShaderRecompiler;
     for (const auto roots : {0u, 1u, 2u, 3u}) {
         for (const bool nested : {false, true}) {
@@ -840,6 +842,7 @@ void verifyInactiveSrtDependencies() {
                 payload.SetFlags(MemoryFlags{0, 0});
                 plan.srtReads = {{&pointer, 0}, {&payload, 1}};
                 plan.controlFlow = {{&condition, {1, 2}, {}, {}}, {nullptr, {}, {}, {1}}, {nullptr, {}, {}, {0}}};
+                if (analyzed) Detail::AnalyzeFlatBackedConditions(plan);
                 std::array<std::uint32_t, 1> sources{0};
                 if (roots != 0u) {
                     DescriptorSource source;
@@ -884,7 +887,7 @@ void verifyInactiveSrtDependencies() {
     }
 }
 
-void verifyFlatBackedSrtConditions() {
+void verifyFlatBackedSrtConditions(bool analyzed) {
     using namespace ShaderRecompiler;
     enum class Guard { Flat, FlatLane, ActivePointer, SharedDag, Raw, Unplanned, GpuTail, Cycle, InvalidSlot, FailedRead, GpuMask, FalseMask, MemoryFreeGpuMask, FlatMask, MixedRaw };
     std::uint32_t failures = 0u;
@@ -958,6 +961,7 @@ void verifyFlatBackedSrtConditions() {
                     plan.controlFlow[1].reads = {1u};
                     plan.controlFlow[2].reads = {0u, 2u, 3u};
                 }
+                if (analyzed) Detail::AnalyzeFlatBackedConditions(plan);
                 struct Reads {
                     std::vector<std::uint64_t> runtime;
                     std::vector<std::uint64_t> clean;
@@ -1269,6 +1273,73 @@ void verifyGpuDescriptorCaptureBoundary() {
         require(reads.addresses == (captured ? std::vector<std::uint64_t>{0x100000u} : std::vector<std::uint64_t>{}), "CPU descriptor materialization read an unflattened scalar dependency");
         if (!native) require(values.size() == 1u && values[0].dwords[0] == 0x110000u && flat == std::vector<std::uint32_t>{0x110000u}, "captured descriptor contents differ from its planned word");
     }
+}
+
+void verifyFlatBackedConditionAnalysisCount() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Reads = 300u;
+    constexpr std::uint32_t Evaluations = 50u;
+    const auto build = [](IrResourcePlan& plan) {
+        plan.srtPlanComplete = true;
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        plan.memoryInfo.push_back(memory);
+        std::uint32_t next = 0;
+        const auto make = [&](IrOpcode op, IrType type, std::initializer_list<IrValue*> args = {}) -> IrValue& {
+            plan.valueStorage.push_back(std::make_unique<IrValue>(op, type, next++));
+            auto& value = *plan.valueStorage.back();
+            for (auto* arg : args) value.AddArgument(arg);
+            return value;
+        };
+        const auto constant = [&](std::uint32_t word) -> IrValue& {
+            auto& value = make(IrOpcode::Void, IrType::U32);
+            value.SetImmediateU32(word);
+            return value;
+        };
+        auto& zero = constant(0u);
+        auto& srt = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+        IrValue* previous = &zero;
+        for (std::uint32_t read = 0; read < Reads; ++read) {
+            auto& low = make(IrOpcode::IAdd32, IrType::U32, {&constant(0x100000u + read * 4u), previous});
+            auto& address = make(IrOpcode::GetAddressResource, IrType::AddressResource, {&low, &zero});
+            auto& raw = make(IrOpcode::LoadAddressU32, IrType::U32, {&address, &zero});
+            raw.SetFlags(MemoryFlags{0, 0});
+            plan.srtReads.push_back({&raw, read});
+            previous = &make(IrOpcode::ReadConst, IrType::U32, {&srt, &constant(read)});
+            auto& condition = make(IrOpcode::IEqual32, IrType::Bool, {previous, &zero});
+            plan.controlFlow.push_back({&condition, {read + 1u, read + 1u}, {}, {read}});
+        }
+        plan.controlFlow.push_back({nullptr, {}, {}, {}});
+    };
+    const auto read = +[](void*, std::uint64_t, std::uint32_t* word) {
+        *word = 0u;
+        return true;
+    };
+    const SrtRuntime runtime{{}, 0, read, nullptr, read};
+    const auto run = [&](const IrResourcePlan& plan, std::vector<std::uint32_t>& flat) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto before = Detail::RuntimeValidator::CycleAnalyses();
+        for (std::uint32_t evaluation = 0; evaluation < Evaluations; ++evaluation) {
+            std::vector<DescriptorValue> results;
+            std::vector<std::uint8_t> active;
+            SrtWalker{}.EvaluateRuntimeSources(plan, {}, runtime, results, flat, {}, active);
+        }
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        return std::pair{Detail::RuntimeValidator::CycleAnalyses() - before, ms};
+    };
+    IrResourcePlan plain;
+    build(plain);
+    IrResourcePlan analyzed;
+    build(analyzed);
+    Detail::AnalyzeFlatBackedConditions(analyzed);
+    std::vector<std::uint32_t> plainFlat;
+    std::vector<std::uint32_t> analyzedFlat;
+    const auto [plainAnalyses, plainMs] = run(plain, plainFlat);
+    const auto [analyzedAnalyses, analyzedMs] = run(analyzed, analyzedFlat);
+    std::printf("flat-backed conditions: %u evaluations of %u SRT reads took %.1f ms and %llu cycle analyses without the stored analysis, %.1f ms and %llu with it\n", Evaluations, Reads, plainMs, static_cast<unsigned long long>(plainAnalyses), analyzedMs, static_cast<unsigned long long>(analyzedAnalyses));
+    require(plainAnalyses >= Evaluations, "the cycle analysis counter does not count the analysis of a plan without stored conditions");
+    require(analyzedAnalyses == 0u, ("evaluating a plan with stored conditions " + std::to_string(Evaluations) + " times ran the cycle analysis " + std::to_string(analyzedAnalyses) + " times").c_str());
+    require(plainFlat == analyzedFlat && plainFlat.size() == Reads, "the stored condition analysis changed the flattened SRT");
 }
 
 void verifyProgramCounterRelativeData() {
@@ -2698,8 +2769,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--inactive-srt") {
             verifyInactiveSrtReads();
-            verifyInactiveSrtDependencies();
-            verifyFlatBackedSrtConditions();
+            verifyInactiveSrtDependencies(false);
+            verifyInactiveSrtDependencies(true);
+            verifyFlatBackedSrtConditions(false);
+            verifyFlatBackedSrtConditions(true);
+            verifyFlatBackedConditionAnalysisCount();
             std::cout << "Inactive SRT reads and strict branch validation passed\n";
             return 0;
         }
@@ -2719,9 +2793,12 @@ int main(int argc, char** argv) {
         verifyGpuControlledSrtReads();
         verifyGpuDescriptorCaptureBoundary();
         verifyInactiveSrtReads();
-        verifyInactiveSrtDependencies();
+        verifyInactiveSrtDependencies(false);
+            verifyInactiveSrtDependencies(true);
         verifyRuntimeValidationCache();
-        verifyFlatBackedSrtConditions();
+        verifyFlatBackedSrtConditions(false);
+            verifyFlatBackedSrtConditions(true);
+            verifyFlatBackedConditionAnalysisCount();
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyPureFlatSlots();

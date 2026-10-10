@@ -38,10 +38,16 @@ bool Fail(std::string reason) {
     return false;
 }
 
-bool isFlatBackedCondition(const IrResourcePlan& program, IrValue* condition, Evaluator& memoryFreeEvaluator) {
+struct FlatBackedCondition {
+    bool valid = false;
+    std::vector<IrValue*> laneMasks;
+};
+
+FlatBackedCondition analyzeFlatBackedCondition(const IrResourcePlan& program, IrValue* condition) {
     RuntimeValidator validator(program, RuntimeValueType::Any);
     std::unordered_set<IrValue*> visiting;
     std::unordered_set<IrValue*> validated;
+    FlatBackedCondition result;
     const auto validate = [&](auto&& self, IrValue* raw, bool flatTarget = false) -> bool {
         auto* value = raw->Resolve();
         const auto op = value->Opcode();
@@ -66,15 +72,24 @@ bool isFlatBackedCondition(const IrResourcePlan& program, IrValue* condition, Ev
         } else {
             for (std::size_t index = 0; valid && index < value->ArgumentCount(); ++index) valid = self(self, value->Argument(index));
         }
-        if (valid && op == IrOpcode::ReadFirstLane) {
-            std::uint32_t mask = 0u;
-            valid = memoryFreeEvaluator.Evaluate(value->Argument(1), mask) && mask != 0u;
-        }
+        if (valid && op == IrOpcode::ReadFirstLane) result.laneMasks.push_back(value->Argument(1));
         visiting.erase(value);
         if (valid) validated.insert(value);
         return valid;
     };
-    return validate(validate, condition);
+    result.valid = validate(validate, condition);
+    return result;
+}
+
+bool isFlatBackedCondition(const IrResourcePlan& program, const ResourceBlock& block, Evaluator& memoryFreeEvaluator) {
+    FlatBackedCondition analyzed;
+    if (!block.conditionAnalyzed) analyzed = analyzeFlatBackedCondition(program, block.condition);
+    if (!(block.conditionAnalyzed ? block.conditionFlatBacked : analyzed.valid)) return false;
+    for (auto* laneMask : block.conditionAnalyzed ? block.conditionLaneMasks : analyzed.laneMasks) {
+        std::uint32_t mask = 0u;
+        if (!memoryFreeEvaluator.Evaluate(laneMask, mask) || mask == 0u) return false;
+    }
+    return true;
 }
 
 const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t source) {
@@ -84,6 +99,17 @@ const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t sour
     return &program.descriptorSources[source];
 }
 
+}
+
+void AnalyzeFlatBackedConditions(IrResourcePlan& plan) {
+    for (auto& block : plan.controlFlow) {
+        block.conditionAnalyzed = false;
+        if (block.condition == nullptr || block.successors.size() != 2u) continue;
+        auto analyzed = analyzeFlatBackedCondition(plan, block.condition);
+        block.conditionFlatBacked = analyzed.valid;
+        block.conditionLaneMasks = std::move(analyzed.laneMasks);
+        block.conditionAnalyzed = true;
+    }
 }
 
 bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
@@ -137,7 +163,7 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
             }
             for (const auto read : block.reads) activeReads[read] = 1u;
             std::uint32_t condition = 0;
-            const bool evaluable = block.condition != nullptr && block.successors.size() == 2u && isFlatBackedCondition(program, block.condition, conditionEvaluator);
+            const bool evaluable = block.condition != nullptr && block.successors.size() == 2u && isFlatBackedCondition(program, block, conditionEvaluator);
             if (evaluable) {
                 if (!evaluator.Evaluate(block.condition, condition)) return Fail("SRT branch condition in block " + std::to_string(index) + ": " + DescribeValue(block.condition, 4));
                 pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
