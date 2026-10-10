@@ -93,6 +93,7 @@ public:
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
         pendingClear = 0;
         if (aspects == 0) return;
+        ++version;
         auto* recorder = RecorderFor(context);
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
@@ -163,6 +164,13 @@ public:
         recorder->Keep(storage);
     }
 
+    bool DescribesDepth(std::span<const std::uint32_t> words, const GuestTextureResource& resource) const {
+        if (resource.baseAddress != target.address || resource.width != target.extent.width || resource.height != target.extent.height) return false;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const bool depthBits = words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
+        return ResolveTextureFormat(resource.format) == (d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT) || depthBits;
+    }
+
     bool Storable() const { return target.samples == 1 && hostFormat == target.format; }
 
     bool Holds(const Texture* texture) const {
@@ -171,6 +179,7 @@ public:
 
     VkImageAspectFlags pendingClear = 0;
     bool handedOff = false;
+    std::uint64_t version = 1;
     GuestTextureResource storage{};
     float clearDepth = 0.0f;
     std::uint8_t clearStencil = 0;
@@ -235,6 +244,169 @@ void takeBack(const Context& context, std::uint64_t address) {
     if (surface == nullptr) return;
     surface->CopyDepth(texture, false);
     surface->handedOff = false;
+    ++surface->version;
+}
+
+class DepthArray {
+public:
+    DepthArray(const Context& context, std::uint64_t address, VkFormat format, VkImageAspectFlags aspects, VkExtent2D extent, std::uint32_t layers) : context(context), address(address), format(format), aspects(aspects), extent(extent), versions(layers) {
+        this->context.bufferPool.reset();
+        try {
+            VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = format;
+            info.extent = {extent.width, extent.height, 1};
+            info.mipLevels = 1;
+            info.arrayLayers = layers;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage depth array");
+            VkMemoryRequirements requirements{};
+            context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory depth array");
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth array");
+            Record([&](VkCommandBuffer commands) {
+                VkImageMemoryBarrier toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                toGeneral.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                toGeneral.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toGeneral.image = image;
+                toGeneral.subresourceRange = {aspects, 0, 1, 0, layers};
+                context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+                const VkClearDepthStencilValue clear{1.0f, 0u};
+                context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &toGeneral.subresourceRange);
+            });
+        } catch (...) {
+            release();
+            throw;
+        }
+    }
+    ~DepthArray() { release(); }
+    DepthArray(const DepthArray&) = delete;
+    DepthArray& operator=(const DepthArray&) = delete;
+
+    void CopyLayer(const DepthSurface& surface, std::uint32_t layer) {
+        Record([&](VkCommandBuffer commands) {
+            VkImageCopy region{};
+            region.srcSubresource = {aspects, 0, 0, 1};
+            region.dstSubresource = {aspects, 0, layer, 1};
+            region.extent = {extent.width, extent.height, 1};
+            context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, surface.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        });
+        versions[layer] = surface.version;
+    }
+
+    std::shared_ptr<Texture> Sampled(VkComponentMapping components) {
+        const std::array<std::uint32_t, 4> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a)};
+        if (const auto found = textures.find(key); found != textures.end()) return found->second;
+        auto texture = std::make_shared<Texture>(context, image, format, VK_IMAGE_ASPECT_DEPTH_BIT, components, static_cast<std::uint32_t>(versions.size()));
+        textures.emplace(key, texture);
+        return texture;
+    }
+
+    const Context context;
+    const std::uint64_t address;
+    const VkFormat format;
+    const VkImageAspectFlags aspects;
+    const VkExtent2D extent;
+    std::vector<std::uint64_t> versions;
+
+private:
+    template<typename TRecord>
+    void Record(const TRecord& record) const {
+        constexpr VkAccessFlags every = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, every, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        record(commands);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, every);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Copy, 2);
+    }
+
+    void release() noexcept {
+        textures.clear();
+        if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+        if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        image = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+    }
+
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::map<std::array<std::uint32_t, 4>, std::shared_ptr<Texture>> textures;
+};
+
+std::vector<std::unique_ptr<DepthArray>>& arrays() {
+    static auto* list = new std::vector<std::unique_ptr<DepthArray>>();
+    return *list;
+}
+
+std::vector<std::pair<std::uint32_t, DepthSurface*>> arraySlices(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource) {
+    std::vector<std::pair<std::uint32_t, DepthSurface*>> slices;
+    if (resource.dimension != TextureDimension::k2DArray || resource.depthOrLastArray < resource.baseArray) return slices;
+    auto plane = resource;
+    plane.dimension = TextureDimension::k2D;
+    plane.baseArray = 0;
+    for (const auto& surface : surfaces()) {
+        const auto& target = surface->target;
+        if (surface->context.device != context.device || target.samples != 1 || target.address == 0 || target.address < resource.baseAddress) continue;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto sliceBytes = DepthSliceBytes(target.extent, d16 ? 2u : 4u);
+        const auto offset = target.address - resource.baseAddress;
+        if (offset % sliceBytes != 0 || offset / sliceBytes < resource.baseArray || offset / sliceBytes > resource.depthOrLastArray) continue;
+        plane.baseAddress = target.address;
+        if (surface->DescribesDepth(words, plane)) slices.emplace_back(static_cast<std::uint32_t>(offset / sliceBytes), surface.get());
+    }
+    return slices;
+}
+
+std::shared_ptr<Texture> arrayTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+    std::vector<std::pair<std::uint32_t, DepthSurface*>> slices;
+    DepthArray* array = nullptr;
+    {
+        std::lock_guard lock(surfacesMutex());
+        slices = arraySlices(context, words, resource);
+        if (slices.empty()) return nullptr;
+        const auto& first = *slices.front().second;
+        const auto layers = resource.depthOrLastArray - resource.baseArray + 1u;
+        const auto sliceBytes = DepthSliceBytes(first.target.extent, first.target.format == VK_FORMAT_D16_UNORM || first.target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u);
+        const auto address = resource.baseAddress + resource.baseArray * sliceBytes;
+        for (const auto& slice : slices) {
+            if (slice.second->hostFormat == first.hostFormat) continue;
+            char text[224];
+            std::snprintf(text, sizeof(text), "AGC graphics: sampling the 2D array 0x%llx over depth surfaces of different formats (vk %d and %d) is not implemented", static_cast<unsigned long long>(resource.baseAddress), static_cast<int>(first.hostFormat), static_cast<int>(slice.second->hostFormat));
+            throw std::runtime_error(text);
+        }
+        for (const auto& candidate : arrays()) {
+            if (candidate->context.device == context.device && candidate->address == address && candidate->format == first.hostFormat && candidate->extent.width == first.target.extent.width && candidate->extent.height == first.target.extent.height && candidate->versions.size() == layers) array = candidate.get();
+        }
+        if (array == nullptr) {
+            const bool stencil = first.hostFormat == VK_FORMAT_D16_UNORM_S8_UINT || first.hostFormat == VK_FORMAT_D24_UNORM_S8_UINT || first.hostFormat == VK_FORMAT_D32_SFLOAT_S8_UINT;
+            arrays().push_back(std::make_unique<DepthArray>(context, address, first.hostFormat, VK_IMAGE_ASPECT_DEPTH_BIT | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u), first.target.extent, layers));
+            array = arrays().back().get();
+            if (slices.size() != layers) std::fprintf(stderr, "[gpu] 2D array 0x%llx (%ux%u, %u slices) is sampled over %zu depth surfaces: slices no draw used as a depth target read as depth 1.0\n", static_cast<unsigned long long>(resource.baseAddress), first.target.extent.width, first.target.extent.height, layers, slices.size());
+        }
+    }
+    for (const auto& [slice, surface] : slices) {
+        takeBack(context, surface->target.address);
+        std::lock_guard lock(surfacesMutex());
+        surface->ApplyFastClear();
+        const auto layer = slice - resource.baseArray;
+        if (array->versions[layer] != surface->version) array->CopyLayer(*surface, layer);
+    }
+    std::lock_guard lock(surfacesMutex());
+    return array->Sampled(components);
 }
 
 }
@@ -289,6 +461,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     const bool cleared = target.htileAddress != 0 && clearedHtiles().erase(target.htileAddress) != 0;
     for (const auto& surface : surfaces()) {
         if (surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
+        ++surface->version;
         surface->clearDepth = target.clearDepth;
         surface->clearStencil = target.clearStencil;
         if (cleared) surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -320,10 +493,12 @@ void NoteHtileDepthClear(std::uint64_t htileAddress) {
 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
+    std::erase_if(arrays(), [&](const auto& array) { return array->context.device == device; });
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+    if (auto array = arrayTexture(context, words, resource, components)) return array;
     takeBack(context, resource.baseAddress);
     std::lock_guard lock(surfacesMutex());
     const auto& list = surfaces();
@@ -402,7 +577,7 @@ bool DepthPlaneStorable(const Context& context, const GuestTextureResource& reso
     std::lock_guard lock(surfacesMutex());
     const auto& list = surfaces();
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.address == resource.baseAddress; });
-    return found != list.rend() && (*found)->Storable();
+    return resource.dimension == TextureDimension::k2D && found != list.rend() && (*found)->Storable();
 }
 
 void GiveDepthPlaneTo(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& storage) {
