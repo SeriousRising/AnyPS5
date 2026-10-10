@@ -74,6 +74,10 @@ SDL and FreeType settings forced by the root `CMakeLists.txt` cannot be overridd
 
 Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newly created graphics or compute pipeline. This requires `VK_KHR_pipeline_executable_properties` and `pipelineExecutableInfo`; an unsupported device fails with an error. Statistic names and units are driver-specific. Capturing statistics can increase pipeline compilation cost. The setting is disabled by default.
 
+## Loop guard
+
+Set `APS5_LOOP_GUARD=<count>` to find a recompiled shader loop that does not end. Each invocation counts the loop exits it evaluates, over all the loops of the shader; past `<count>` it takes every loop exit it reaches, so the shader finishes instead of hanging the GPU. The first exit taken this way is reported once per shader and instruction: `[gpu] loop guard: compute shader 0x<address> loop exit at instruction 0x<offset> passed <count> evaluations`, the offset being that of the block holding the exit branch, in bytes from the start of the shader. Only shaders with address-based memory accesses can report; others are cut without a line. A cut loop leaves its work unfinished, so the title sees different results: use it for diagnosis only. The value is part of the shader cache key. The setting is disabled by default.
+
 ## Shader recompiler
 
 The shader recompilation logic in [core/shader/recompiler](../../core/shader/recompiler) is isolated from the rest of the project and is a pure function of its input data, designed for integration into any other project. The current CMake target also includes cache support and links a supplied runtime target, glslang, and optionally SPIRV-Tools.
