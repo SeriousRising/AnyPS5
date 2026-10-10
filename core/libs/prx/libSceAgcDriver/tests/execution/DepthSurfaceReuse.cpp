@@ -59,6 +59,13 @@ alignas(256) constexpr std::array<std::uint32_t, 9> LoadCode{
     0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 9> NextRowLoadCode{
+    0x34020084, 0x7e3c0300, 0x7e3e0281, 0xf0001f08, 0x0001141e, 0xbf8c3f70, 0xe0781000, 0x80001401,
+    0xbf810000,
+};
+
+constexpr std::byte Kept{0x40};
+
 constexpr std::array<std::array<float, 4>, 3> Triangle{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
 }};
@@ -117,7 +124,8 @@ std::uint32_t Stored(std::uint32_t tid, std::uint32_t component) {
     return std::bit_cast<std::uint32_t>(static_cast<float>(tid * 4u + component) + 0.25f);
 }
 
-void DrawDepth(AgcDriver::VulkanDevice& device, std::uint8_t* depth) {
+void DrawDepth(AgcDriver::VulkanDevice& device, std::uint8_t* depth, bool write = true, VkCompareOp compare = VK_COMPARE_OP_ALWAYS) {
+    Pixels.fill(Kept);
     const auto target = device.Target();
     std::vector<std::uint32_t> vertexUserData(4, 0u);
     const auto vertexBuffer = BufferDescriptor(Triangle.data(), 16u, static_cast<std::uint32_t>(Triangle.size()));
@@ -162,8 +170,8 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint8_t* depth) {
     state.hasColorTarget = true;
     state.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(depth), 0u, {Width, Height}, VK_FORMAT_D32_SFLOAT, 1.0f, 0u};
     state.depthTest = true;
-    state.depthWrite = true;
-    state.depthCompare = VK_COMPARE_OP_ALWAYS;
+    state.depthWrite = write;
+    state.depthCompare = compare;
     state.renderExtent = {Width, Height};
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
@@ -207,14 +215,32 @@ void CheckDepthLoad(AgcDriver::VulkanDevice& device, std::uint8_t* depth, const 
     }
 }
 
-void CheckLiveRefusal(AgcDriver::VulkanDevice& device, std::uint8_t* depth) {
-    std::string refusal;
-    try {
-        Dispatch(device, StoreCode, TextureDescriptor(depth, Format32Float, Width, Height));
-    } catch (const std::exception& error) {
-        refusal = error.what();
+std::uint32_t DepthStored(std::uint32_t tid, std::uint32_t component) {
+    return std::bit_cast<std::uint32_t>(component == 0u ? 0.25f + static_cast<float>(tid) / 128.0f : 0.0f);
+}
+
+void CheckLiveStore(AgcDriver::VulkanDevice& device, std::uint8_t* depth) {
+    const auto plane = TextureDescriptor(depth, Format32Float, Width, Height);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        for (std::uint32_t component = 0; component < 4u; ++component) Buffer[tid * 4u + component] = DepthStored(tid, component);
     }
-    Require(refusal.find("storage image access to depth/stencil surface") != std::string::npos && refusal.find("64x32") != std::string::npos, "a storage image that describes a live depth surface was not refused: " + refusal);
+    Dispatch(device, StoreCode, plane);
+    Buffer.fill(0xdeadbeefu);
+    Dispatch(device, LoadCode, plane);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        Require(Buffer[tid * 4u] == DepthStored(tid, 0u), "depth loaded after an image_store to the live depth surface: thread " + std::to_string(tid) + " is " + std::to_string(std::bit_cast<float>(Buffer[tid * 4u])) + ", expected " + std::to_string(std::bit_cast<float>(DepthStored(tid, 0u))));
+    }
+    Buffer.fill(0xdeadbeefu);
+    Dispatch(device, NextRowLoadCode, plane);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        Require(std::bit_cast<float>(Buffer[tid * 4u]) == 0.5f, "depth the image_store did not write: thread " + std::to_string(tid) + " is " + std::to_string(std::bit_cast<float>(Buffer[tid * 4u])) + ", expected 0.5");
+    }
+    DrawDepth(device, depth, false, VK_COMPARE_OP_LESS_OR_EQUAL);
+    for (std::uint32_t pixel = 0; pixel < Width * Height; ++pixel) {
+        const bool stored = pixel < Threads;
+        const auto expected = stored ? Kept : std::byte{255};
+        Require(Pixels[pixel * 4u] == expected, std::string("a draw at depth 0.5 tested against the stored depth: pixel ") + std::to_string(pixel) + " is " + std::to_string(static_cast<unsigned>(Pixels[pixel * 4u])) + ", expected " + std::to_string(static_cast<unsigned>(expected)) + (stored ? " (the stored depth is nearer)" : ""));
+    }
 }
 
 void CheckReuse(AgcDriver::VulkanDevice& device, std::uint8_t* memory) {
@@ -251,8 +277,7 @@ int main() {
         GuestBlock block;
         DrawDepth(*device, block.Data());
         CheckDepthLoad(*device, block.Data(), "live depth surface");
-        CheckLiveRefusal(*device, block.Data());
-        CheckDepthLoad(*device, block.Data(), "live depth surface after a refused storage access");
+        CheckLiveStore(*device, block.Data());
         CheckReuse(*device, block.Data());
         DrawDepth(*device, block.Data());
         CheckDepthLoad(*device, block.Data(), "depth surface bound again after its memory was reused");

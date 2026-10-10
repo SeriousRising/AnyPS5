@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -42,7 +43,7 @@ public:
             info.arrayLayers = 1;
             info.samples = static_cast<VkSampleCountFlagBits>(target.samples);
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
-            info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (target.samples == 1 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u);
+            info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (target.samples == 1 ? VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
             info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage depth");
@@ -132,11 +133,45 @@ public:
         return texture;
     }
 
+    void CopyDepth(const std::shared_ptr<StorageTexture>& storage, bool toStorage) const {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM;
+        const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (d16 ? 2u : 4u);
+        auto staging = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        constexpr VkAccessFlags every = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        VkBufferImageCopy depthRegion{};
+        depthRegion.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        depthRegion.imageExtent = {target.extent.width, target.extent.height, 1};
+        auto colorRegion = depthRegion;
+        colorRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        const auto toBuffer = context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+        const auto toImage = context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, every, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        toBuffer(commands, toStorage ? image : storage->Image(), VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, toStorage ? &depthRegion : &colorRegion);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        toImage(commands, staging->Handle(), toStorage ? storage->Image() : image, VK_IMAGE_LAYOUT_GENERAL, 1, toStorage ? &colorRegion : &depthRegion);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, every);
+        if (batch) {
+            batch->SubmitAndWait();
+            return;
+        }
+        Recorder::CountBarriers(Recorder::CommandClass::Copy, 3);
+        recorder->Keep(std::move(staging));
+        recorder->Keep(storage);
+    }
+
+    bool Storable() const { return target.samples == 1 && hostFormat == target.format; }
+
     bool Holds(const Texture* texture) const {
         return std::any_of(textures.begin(), textures.end(), [&](const auto& entry) { return entry.second.get() == texture; });
     }
 
     VkImageAspectFlags pendingClear = 0;
+    bool handedOff = false;
+    GuestTextureResource storage{};
     float clearDepth = 0.0f;
     std::uint8_t clearStencil = 0;
     const Context context;
@@ -177,6 +212,29 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
 std::set<std::uint64_t>& clearedHtiles() {
     static auto* cleared = new std::set<std::uint64_t>();
     return *cleared;
+}
+
+DepthSurface* handedOffAt(const Context& context, std::uint64_t address) {
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device == context.device && surface->handedOff && surface->target.address == address) return surface.get();
+    }
+    return nullptr;
+}
+
+void takeBack(const Context& context, std::uint64_t address) {
+    GuestTextureResource storage;
+    {
+        std::lock_guard lock(surfacesMutex());
+        const auto* surface = handedOffAt(context, address);
+        if (surface == nullptr) return;
+        storage = surface->storage;
+    }
+    const auto texture = CachedStorageSurface(context, storage);
+    std::lock_guard lock(surfacesMutex());
+    auto* surface = handedOffAt(context, address);
+    if (surface == nullptr) return;
+    surface->CopyDepth(texture, false);
+    surface->handedOff = false;
 }
 
 }
@@ -226,6 +284,7 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+    takeBack(context, target.address);
     std::lock_guard lock(surfacesMutex());
     const bool cleared = target.htileAddress != 0 && clearedHtiles().erase(target.htileAddress) != 0;
     for (const auto& surface : surfaces()) {
@@ -265,6 +324,7 @@ void ClearDepthSurfaces(VkDevice device) {
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+    takeBack(context, resource.baseAddress);
     std::lock_guard lock(surfacesMutex());
     const auto& list = surfaces();
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
@@ -336,6 +396,26 @@ bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words
     const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
     const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
     return ResolveTextureFormat(resource.format) == expected || depthBits;
+}
+
+bool DepthPlaneStorable(const Context& context, const GuestTextureResource& resource) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.address == resource.baseAddress; });
+    return found != list.rend() && (*found)->Storable();
+}
+
+void GiveDepthPlaneTo(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& storage) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.address == resource.baseAddress; });
+    Require(found != list.rend() && (*found)->Storable(), "no depth surface can give its depth plane to the storage image");
+    auto& surface = **found;
+    if (surface.handedOff) return;
+    surface.ApplyFastClear();
+    surface.CopyDepth(storage, true);
+    surface.handedOff = true;
+    surface.storage = resource;
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
