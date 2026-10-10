@@ -331,8 +331,8 @@ private:
     std::map<std::array<std::uint32_t, 4>, std::shared_ptr<Texture>> textures;
 };
 
-std::vector<std::unique_ptr<DepthArray>>& arrays() {
-    static auto* list = new std::vector<std::unique_ptr<DepthArray>>();
+std::vector<std::shared_ptr<DepthArray>>& arrays() {
+    static auto* list = new std::vector<std::shared_ptr<DepthArray>>();
     return *list;
 }
 
@@ -379,7 +379,7 @@ std::shared_ptr<Texture> arrayTexture(const Context& context, std::span<const st
             if (candidate->context.device == context.device && candidate->address == address && candidate->format == first.format && candidate->extent.width == first.extent.width && candidate->extent.height == first.extent.height && candidate->versions.size() == layers) array = candidate.get();
         }
         if (array == nullptr) {
-            arrays().push_back(std::make_unique<DepthArray>(context, address, first.format, first.extent, layers));
+            arrays().push_back(std::make_shared<DepthArray>(context, address, first.format, first.extent, layers));
             array = arrays().back().get();
             if (slices.size() != layers) std::fprintf(stderr, "[gpu] 2D array 0x%llx (%ux%u, %u slices) is sampled over %zu depth surfaces: slices no draw used as a depth target read as depth 1.0\n", static_cast<unsigned long long>(resource.baseAddress), first.extent.width, first.extent.height, layers, slices.size());
         }
@@ -414,6 +414,63 @@ std::vector<std::shared_ptr<DepthSurface>>& retired() {
     return *list;
 }
 
+std::vector<std::shared_ptr<DepthArray>>& retiredArrays() {
+    static auto* list = new std::vector<std::shared_ptr<DepthArray>>();
+    return *list;
+}
+
+// With the lock held: the memory of slices `firstSlice`..`lastSlice` of a depth surface at `base`
+// now holds depth planes of `extent`, so the surfaces of another extent whose depth plane overlaps
+// it, and the arrays assembled at another extent there, leave the registry. Their images live until
+// the recorded batch ends (the caller hands them to keepStale), or with the device outside one.
+std::vector<std::shared_ptr<void>> retireResized(const Context& context, std::uint64_t base, std::uint32_t firstSlice, std::uint32_t lastSlice, VkExtent2D extent, const GuestTextureResource* resource) {
+    std::vector<std::shared_ptr<void>> stale;
+    const auto texel = [](VkFormat format) { return format == VK_FORMAT_D16_UNORM || format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u; };
+    const auto plane = [](VkExtent2D of, std::uint32_t bytesPerTexel) { return static_cast<std::uint64_t>(of.width) * of.height * bytesPerTexel; };
+    const auto overlaps = [&](std::uint64_t address, std::uint64_t bytes, std::uint32_t bytesPerTexel) {
+        const auto step = DepthSliceBytes(extent, bytesPerTexel);
+        return address < base + lastSlice * step + plane(extent, bytesPerTexel) && base + firstSlice * step < address + bytes;
+    };
+    const auto other = [&](VkExtent2D of) { return of.width != extent.width || of.height != extent.height; };
+    const bool recorded = Recorder::Active() != nullptr;
+    static unsigned reported = 0;
+    auto& list = surfaces();
+    for (auto it = list.begin(); it != list.end();) {
+        const auto& target = (*it)->target;
+        const auto bytesPerTexel = texel(target.format);
+        if ((*it)->context.device != context.device || target.address == 0 || !other(target.extent) || !overlaps(target.address, plane(target.extent, bytesPerTexel), bytesPerTexel) || (resource != nullptr && ((*it)->Stencil(*resource) || !(*it)->PlaneFormat(*resource)))) {
+            ++it;
+            continue;
+        }
+        if (reported < 32) {
+            ++reported;
+            std::fprintf(stderr, "[gpu] depth surface 0x%llx (%ux%u, VkFormat %d) retired: its memory is now %s %ux%u depth planes at 0x%llx\n", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource != nullptr ? "sampled as" : "drawn as", extent.width, extent.height, static_cast<unsigned long long>(base));
+        }
+        if (!recorded) retired().push_back(*it);
+        stale.push_back(std::move(*it));
+        it = list.erase(it);
+    }
+    auto& assembled = arrays();
+    for (auto it = assembled.begin(); it != assembled.end();) {
+        const auto bytesPerTexel = texel((*it)->format);
+        const auto bytes = ((*it)->versions.size() - 1u) * DepthSliceBytes((*it)->extent, bytesPerTexel) + plane((*it)->extent, bytesPerTexel);
+        if ((*it)->context.device != context.device || !other((*it)->extent) || !overlaps((*it)->address, bytes, bytesPerTexel)) {
+            ++it;
+            continue;
+        }
+        if (!recorded) retiredArrays().push_back(*it);
+        stale.push_back(std::move(*it));
+        it = assembled.erase(it);
+    }
+    return stale;
+}
+
+void keepStale(std::vector<std::shared_ptr<void>>& stale) {
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        for (auto& object : stale) recorder->Keep(std::move(object));
+    }
+}
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -426,18 +483,22 @@ std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     std::shared_ptr<DepthSurface> found;
+    std::vector<std::shared_ptr<void>> stale;
     {
         std::lock_guard lock(surfacesMutex());
         for (const auto& surface : surfaces()) {
             if (surface->context.device == context.device && sameSurface(surface->target, target)) found = surface;
         }
         if (found == nullptr) {
-            surfaces().push_back(std::make_shared<DepthSurface>(context, target));
-            return surfaces().back()->view;
+            if (target.address != 0) stale = retireResized(context, target.address, 0, 0, target.extent, nullptr);
+            found = std::make_shared<DepthSurface>(context, target);
+            surfaces().push_back(found);
+        } else {
+            found->target = target;
+            ++found->version;
         }
-        found->target = target;
-        ++found->version;
     }
+    keepStale(stale);
     settle(found);
     if (found->handedOff) takeBack(found);
     return found->view;
@@ -478,9 +539,18 @@ void ClearDepthSurfaces(VkDevice device) {
     std::erase_if(arrays(), [&](const auto& array) { return array->context.device == device; });
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
     std::erase_if(retired(), [&](const auto& surface) { return surface->context.device == device; });
+    std::erase_if(retiredArrays(), [&](const auto& array) { return array->context.device == device; });
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+    if (resource.baseAddress != 0 && resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray >= resource.baseArray) {
+        std::vector<std::shared_ptr<void>> stale;
+        {
+            std::lock_guard lock(surfacesMutex());
+            stale = retireResized(context, resource.baseAddress, resource.baseArray, resource.depthOrLastArray, {resource.width, resource.height}, &resource);
+        }
+        keepStale(stale);
+    }
     if (auto array = arrayTexture(context, words, resource, components)) return array;
     std::shared_ptr<DepthSurface> surface;
     std::vector<std::shared_ptr<DepthSurface>> reused;
