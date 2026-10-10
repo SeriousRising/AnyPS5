@@ -656,7 +656,7 @@ void verifyDescriptorPhis() {
     require(countOps(Recompile(twoLane, *twoLaneCapture)->spirv, OpImageSampleExplicitLod) == 4u, "descriptor Phi: the specialized two-lane SPIR-V does not sample once per edge and half");
 
     auto dynamic = makeRequest(dynamicCode);
-    expectFailure([&] { static_cast<void>(GetResourcePlan(dynamic)); }, "GetSamplerResource dword 0 is not a valid runtime value", "descriptor Phi: an edge without an SRT slot was accepted");
+    expectFailure([&] { static_cast<void>(GetResourcePlan(dynamic)); }, "its descriptor phis were not split: a selected descriptor is not read from the SRT or the user data", "descriptor Phi: an edge without an SRT slot was accepted");
 }
 
 void verifyInactiveSrtReads() {

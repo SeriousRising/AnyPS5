@@ -476,6 +476,7 @@ private:
     }
 
     static constexpr std::uint32_t phiSearchDepth = 8u;
+    static constexpr std::size_t maxDescriptorPaths = 64u;
 
     static bool SplittableImageRead(const IrValue& inst) {
         switch (inst.Opcode()) {
@@ -529,28 +530,135 @@ private:
         return EmitBefore(position, original.Opcode(), original.Type(), arguments, original.Flags<std::uint64_t>());
     }
 
-    IrValue* Rematerialize(IrValue* value, IrValue& position, bool emit, std::uint32_t depth) {
+    struct PhiChoice {
+        IrBlock* block = nullptr;
+        std::size_t edge = 0;
+        std::int32_t parent = -1;
+    };
+    using PhiPath = std::vector<PhiChoice>;
+
+    static std::int32_t ChoiceOf(const PhiPath& path, const IrBlock* block) {
+        for (std::size_t index = 0; index < path.size(); index++) {
+            if (path[index].block == block) {
+                return static_cast<std::int32_t>(index);
+            }
+        }
+        return -1;
+    }
+
+    static IrValue* ChosenIncoming(const IrValue& phi, const PhiChoice& choice) {
+        return PhiIncoming(phi, choice.block->Predecessors()[choice.edge]);
+    }
+
+    const char* FindPendingPhi(IrValue* value, const PhiPath& path, std::int32_t parent, std::vector<const IrBlock*>& crossed, std::uint32_t depth, IrValue*& pending, std::int32_t& pendingParent) const {
+        value = value->Resolve();
+        if (pending != nullptr || value->HasImmediate()) {
+            return nullptr;
+        }
+        if (value->IsPhi()) {
+            if (ResolveInvariantPhi(m_program.Resources(), value) != nullptr) {
+                return nullptr;
+            }
+            const IrBlock* block = value->Parent();
+            if (block == nullptr || block->Predecessors().size() < 2u || value->PhiBlockCount() != block->Predecessors().size()) {
+                return "a descriptor phi does not have one operand for each predecessor of its block";
+            }
+            const auto choice = ChoiceOf(path, block);
+            if (choice < 0) {
+                pending = value;
+                pendingParent = parent;
+                return nullptr;
+            }
+            if (std::ranges::find(crossed, block) != crossed.end()) {
+                return "a descriptor phi is carried around a loop";
+            }
+            if (path[choice].parent != parent) {
+                return "the phis of one block are reached both directly and through another phi, or through different phis";
+            }
+            IrValue* incoming = ChosenIncoming(*value, path[choice]);
+            if (incoming == nullptr) {
+                return "a descriptor phi does not have one operand for each predecessor of its block";
+            }
+            crossed.push_back(block);
+            const char* refusal = FindPendingPhi(incoming, path, choice, crossed, phiSearchDepth, pending, pendingParent);
+            crossed.pop_back();
+            return refusal;
+        }
+        if (depth == 0u || !Detail::IsRuntimeUniformOp(value->Opcode())) {
+            return nullptr;
+        }
+        for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+            if (const char* refusal = FindPendingPhi(value->Argument(index), path, parent, crossed, depth - 1u, pending, pendingParent)) {
+                return refusal;
+            }
+        }
+        return nullptr;
+    }
+
+    const char* EnumeratePhiPaths(std::span<IrValue* const> handles, PhiPath& path, std::vector<PhiPath>& paths) const {
+        IrValue* pending = nullptr;
+        std::int32_t parent = -1;
+        std::vector<const IrBlock*> crossed;
+        for (IrValue* handle : handles) {
+            for (std::size_t dword = 0; dword < handle->ArgumentCount(); dword++) {
+                if (const char* refusal = FindPendingPhi(handle->Argument(dword), path, -1, crossed, phiSearchDepth, pending, parent)) {
+                    return refusal;
+                }
+            }
+        }
+        if (pending == nullptr) {
+            if (paths.size() == maxDescriptorPaths) {
+                return "the descriptor is selected along more than 64 control-flow paths";
+            }
+            paths.push_back(path);
+            return nullptr;
+        }
+        IrBlock* block = pending->Parent();
+        for (std::size_t edge = 0; edge < block->Predecessors().size(); edge++) {
+            path.push_back({block, edge, parent});
+            const char* refusal = EnumeratePhiPaths(handles, path, paths);
+            path.pop_back();
+            if (refusal != nullptr) {
+                return refusal;
+            }
+        }
+        return nullptr;
+    }
+
+    IrValue* SubstitutePath(IrValue* value, const PhiPath& path, IrValue& position, bool emit, bool crossed, std::uint32_t depth) {
         value = value->Resolve();
         if (value->HasImmediate()) {
             return value;
         }
         if (value->IsPhi()) {
-            IrValue* invariant = ResolveInvariantPhi(m_program.Resources(), value);
-            return invariant == nullptr || invariant->IsPhi() ? nullptr : Rematerialize(invariant, position, emit, depth);
-        }
-        if (depth == 0u) {
-            return nullptr;
+            if (IrValue* invariant = ResolveInvariantPhi(m_program.Resources(), value)) {
+                if (!crossed) {
+                    return value;
+                }
+                return invariant->IsPhi() ? nullptr : SubstitutePath(invariant, path, position, emit, true, depth);
+            }
+            const auto choice = ChoiceOf(path, value->Parent());
+            IrValue* incoming = choice < 0 ? nullptr : ChosenIncoming(*value, path[choice]);
+            return incoming == nullptr ? nullptr : SubstitutePath(incoming, path, position, emit, true, phiSearchDepth);
         }
         const auto op = value->Opcode();
         const bool register_ = op == IrOpcode::GetUserData;
-        const bool argumentless = (op == IrOpcode::GetShaderBase || op == IrOpcode::GetSrtResource) && value->ArgumentCount() == 0u;
-        const bool srtRead = op == IrOpcode::ReadConst && value->ArgumentCount() == 2u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(1)->Resolve()->HasImmediate();
-        if (!register_ && !argumentless && !srtRead && !Detail::IsRuntimeUniformOp(op)) {
-            return nullptr;
+        if (crossed) {
+            const bool argumentless = (op == IrOpcode::GetShaderBase || op == IrOpcode::GetSrtResource) && value->ArgumentCount() == 0u;
+            const bool srtRead = op == IrOpcode::ReadConst && value->ArgumentCount() == 2u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(1)->Resolve()->HasImmediate();
+            if (depth == 0u || (!register_ && !argumentless && !srtRead && !Detail::IsRuntimeUniformOp(op))) {
+                return nullptr;
+            }
+        } else {
+            std::vector<IrValue*> phis;
+            CollectDescriptorPhis(value, phis, depth);
+            if (phis.empty()) {
+                return value;
+            }
         }
         std::vector<IrValue*> arguments;
         for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
-            IrValue* argument = register_ ? value->Argument(index) : Rematerialize(value->Argument(index), position, emit, depth - 1u);
+            IrValue* argument = crossed && register_ ? value->Argument(index) : SubstitutePath(value->Argument(index), path, position, emit, crossed, depth - 1u);
             if (argument == nullptr) {
                 return nullptr;
             }
@@ -559,53 +667,80 @@ private:
         return emit ? EmitCopy(*value, arguments, position) : value;
     }
 
-    IrValue* SubstituteEdge(IrValue* value, const IrBlock* predecessor, IrValue& position, bool emit, std::uint32_t depth) {
+    IrValue* PathHead(IrValue* value, const PhiPath& path) const {
         value = value->Resolve();
-        std::vector<IrValue*> phis;
-        CollectDescriptorPhis(value, phis, depth);
-        if (phis.empty()) {
-            return value;
-        }
-        if (value->IsPhi()) {
-            IrValue* incoming = PhiIncoming(*value, predecessor);
-            return incoming == nullptr ? nullptr : Rematerialize(incoming, position, emit, phiSearchDepth);
-        }
-        std::vector<IrValue*> arguments;
-        for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
-            IrValue* argument = SubstituteEdge(value->Argument(index), predecessor, position, emit, depth - 1u);
-            if (argument == nullptr) {
-                return nullptr;
+        while (value->IsPhi()) {
+            if (IrValue* invariant = ResolveInvariantPhi(m_program.Resources(), value)) {
+                return invariant;
             }
-            arguments.push_back(argument);
+            const auto choice = ChoiceOf(path, value->Parent());
+            IrValue* incoming = choice < 0 ? nullptr : ChosenIncoming(*value, path[choice]);
+            if (incoming == nullptr) {
+                return value;
+            }
+            value = incoming->Resolve();
         }
-        return emit ? EmitCopy(*value, arguments, position) : value;
+        return value;
     }
 
-    IrValue& EdgeSelector(IrBlock& block, const std::vector<bool>& edges) {
+    bool SameOnPaths(IrValue* left, const PhiPath& leftPath, IrValue* right, const PhiPath& rightPath, std::uint32_t depth) const {
+        left = PathHead(left, leftPath);
+        right = PathHead(right, rightPath);
+        std::vector<IrValue*> phis;
+        CollectDescriptorPhis(left, phis, phiSearchDepth);
+        CollectDescriptorPhis(right, phis, phiSearchDepth);
+        if (phis.empty()) {
+            return EquivalentValue(m_program.Resources(), left, right);
+        }
+        if (depth == 0u || left->IsPhi() || right->IsPhi() || left->Opcode() != right->Opcode() || left->Type() != right->Type() || left->ArgumentCount() != right->ArgumentCount() || left->Flags<std::uint64_t>() != right->Flags<std::uint64_t>()) {
+            return false;
+        }
+        for (std::size_t index = 0; index < left->ArgumentCount(); index++) {
+            if (!SameOnPaths(left->Argument(index), leftPath, right->Argument(index), rightPath, depth - 1u)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    IrValue* EdgeSelector(IrBlock& block, std::size_t edge, IrValue* taken) {
         for (const auto& selector : m_edgeSelectors) {
-            if (selector.block == &block && selector.edges == edges) {
-                return *selector.value;
+            if (selector.block == &block && selector.edge == edge && selector.taken == taken) {
+                return selector.value;
             }
         }
         IrValue& phi = m_program.CreateValue(IrOpcode::Phi, IrType::Bool);
         const auto& predecessors = block.Predecessors();
         for (std::size_t index = 0; index < predecessors.size(); index++) {
-            phi.AddPhiOperand(predecessors[index], &m_builder.ConstantBool(edges[index]));
+            phi.AddPhiOperand(predecessors[index], index != edge ? &m_builder.ConstantBool(false) : taken != nullptr ? taken : &m_builder.ConstantBool(true));
         }
         block.InsertInstructionBefore(nullptr, &phi);
-        m_edgeSelectors.push_back({&block, edges, &phi});
-        return phi;
+        m_edgeSelectors.push_back({&block, edge, taken, &phi});
+        return &phi;
+    }
+
+    IrValue* PathSelector(const PhiPath& path, IrValue& position) {
+        IrValue* selector = nullptr;
+        for (const auto& choice : path) {
+            IrValue* taken = EdgeSelector(*choice.block, choice.edge, nullptr);
+            for (auto parent = choice.parent; parent >= 0; parent = path[parent].parent) {
+                taken = EdgeSelector(*path[parent].block, path[parent].edge, taken);
+            }
+            const std::array<IrValue*, 2> arguments {selector, taken};
+            selector = selector == nullptr ? taken : EmitBefore(position, IrOpcode::LogicalAnd, IrType::Bool, arguments);
+        }
+        return selector;
     }
 
     void SplitDescriptorPhi(IrValue& inst) {
         const auto info = ImageOpcodeInfoOf(inst.Opcode());
         const std::uint32_t handleCount = info.needsSampler ? 2u : 1u;
-        if (inst.ArgumentCount() < handleCount) {
+        if (inst.ArgumentCount() < handleCount || inst.Parent() == nullptr) {
             return;
         }
         std::array<IrValue*, 2> handles {};
         std::array<bool, 2> split {};
-        std::vector<IrValue*> phis;
+        bool any = false;
         for (std::uint32_t slot = 0; slot < handleCount; slot++) {
             IrValue* handle = inst.Argument(slot)->Resolve();
             const auto expected = slot == 0u ? IrOpcode::GetImageResource : IrOpcode::GetSamplerResource;
@@ -618,59 +753,53 @@ private:
                 CollectDescriptorPhis(handle->Argument(dword), handlePhis, phiSearchDepth);
             }
             split[slot] = !handlePhis.empty();
-            for (IrValue* phi : handlePhis) {
-                if (std::ranges::find(phis, phi) == phis.end()) {
-                    phis.push_back(phi);
-                }
+            any = any || split[slot];
+        }
+        if (!any) {
+            return;
+        }
+        const std::span<IrValue* const> used(handles.data(), handleCount);
+        const auto refuse = [&](const char* reason) {
+            for (IrValue* handle : used) {
+                m_splitRefusals.push_back({handle, reason});
             }
-        }
-        if (phis.empty()) {
+        };
+        std::vector<PhiPath> paths;
+        PhiPath prefix;
+        if (const char* refusal = EnumeratePhiPaths(used, prefix, paths)) {
+            refuse(refusal);
             return;
         }
-        IrBlock* block = phis.front()->Parent();
-        if (block == nullptr || inst.Parent() == nullptr) {
-            return;
-        }
-        const auto& predecessors = block->Predecessors();
-        if (predecessors.size() < 2u) {
-            return;
-        }
-        for (const IrValue* phi : phis) {
-            if (phi->Parent() != block || phi->PhiBlockCount() != predecessors.size()) {
-                return;
-            }
-            for (const IrBlock* predecessor : predecessors) {
-                if (PhiIncoming(*phi, predecessor) == nullptr) {
-                    return;
+        for (const auto& path : paths) {
+            for (std::uint32_t slot = 0; slot < handleCount; slot++) {
+                for (std::size_t dword = 0; split[slot] && dword < handles[slot]->ArgumentCount(); dword++) {
+                    if (SubstitutePath(handles[slot]->Argument(dword), path, inst, false, false, phiSearchDepth) == nullptr) {
+                        refuse("a selected descriptor is not read from the SRT or the user data");
+                        return;
+                    }
                 }
             }
         }
 
-        std::vector<std::uint32_t> edgeArm(predecessors.size());
-        std::vector<const IrBlock*> arms;
-        for (std::size_t edge = 0; edge < predecessors.size(); edge++) {
+        std::vector<std::uint32_t> pathArm(paths.size());
+        std::vector<std::size_t> arms;
+        for (std::size_t path = 0; path < paths.size(); path++) {
             std::uint32_t arm = 0;
             for (; arm < arms.size(); arm++) {
-                const bool same = std::ranges::all_of(phis, [&](const IrValue* phi) {
-                    return EquivalentValue(m_program.Resources(), PhiIncoming(*phi, predecessors[edge]), PhiIncoming(*phi, arms[arm]));
-                });
+                bool same = true;
+                for (std::uint32_t slot = 0; same && slot < handleCount; slot++) {
+                    for (std::size_t dword = 0; same && split[slot] && dword < handles[slot]->ArgumentCount(); dword++) {
+                        same = SameOnPaths(handles[slot]->Argument(dword), paths[path], handles[slot]->Argument(dword), paths[arms[arm]], phiSearchDepth);
+                    }
+                }
                 if (same) {
                     break;
                 }
             }
             if (arm == arms.size()) {
-                arms.push_back(predecessors[edge]);
+                arms.push_back(path);
             }
-            edgeArm[edge] = arm;
-        }
-        for (const IrBlock* arm : arms) {
-            for (std::uint32_t slot = 0; slot < handleCount; slot++) {
-                for (std::size_t dword = 0; split[slot] && dword < handles[slot]->ArgumentCount(); dword++) {
-                    if (SubstituteEdge(handles[slot]->Argument(dword), arm, inst, false, phiSearchDepth) == nullptr) {
-                        return;
-                    }
-                }
-            }
+            pathArm[path] = arm;
         }
 
         std::vector<IrValue*> copies;
@@ -684,7 +813,7 @@ private:
                 }
                 std::vector<IrValue*> dwords;
                 for (std::size_t dword = 0; dword < handles[slot]->ArgumentCount(); dword++) {
-                    dwords.push_back(SubstituteEdge(handles[slot]->Argument(dword), arms[arm], inst, true, phiSearchDepth));
+                    dwords.push_back(SubstitutePath(handles[slot]->Argument(dword), paths[arms[arm]], inst, true, false, phiSearchDepth));
                 }
                 arguments[slot] = EmitCopy(*handles[slot], dwords, inst);
             }
@@ -700,6 +829,15 @@ private:
 
         IrValue* result = copies.back();
         if (copies.size() > 1u) {
+            std::vector<IrValue*> selectors(copies.size() - 1u);
+            for (std::size_t path = 0; path < paths.size(); path++) {
+                if (pathArm[path] == selectors.size()) {
+                    continue;
+                }
+                IrValue*& selector = selectors[pathArm[path]];
+                const std::array<IrValue*, 2> arguments {selector, PathSelector(paths[path], inst)};
+                selector = selector == nullptr ? arguments[1] : EmitBefore(inst, IrOpcode::LogicalOr, IrType::Bool, arguments);
+            }
             std::array<IrValue*, 4> components {};
             for (std::uint32_t component = 0; component < components.size(); component++) {
                 const auto extract = [&](IrValue* vector) {
@@ -708,11 +846,7 @@ private:
                 };
                 IrValue* selected = extract(copies.back());
                 for (std::uint32_t arm = static_cast<std::uint32_t>(copies.size()) - 1u; arm-- > 0u;) {
-                    std::vector<bool> edges(edgeArm.size());
-                    for (std::size_t edge = 0; edge < edgeArm.size(); edge++) {
-                        edges[edge] = edgeArm[edge] == arm;
-                    }
-                    const std::array<IrValue*, 3> arguments {&EdgeSelector(*block, edges), extract(copies[arm]), selected};
+                    const std::array<IrValue*, 3> arguments {selectors[arm], extract(copies[arm]), selected};
                     selected = EmitBefore(inst, IrOpcode::SelectU32, IrType::U32, arguments);
                 }
                 components[component] = selected;
@@ -787,7 +921,8 @@ private:
             badDword = 0;
         }
         if (!ValidateSource(descriptor, badDword)) {
-            fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+            const auto refusal = std::ranges::find(m_splitRefusals, handle, [](const auto& entry) { return entry.first; });
+            fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u) + (refusal == m_splitRefusals.end() ? std::string() : std::string("; its descriptor phis were not split: ") + refusal->second));
         }
         source = InternSource(descriptor);
     }
@@ -1125,10 +1260,12 @@ private:
     std::vector<IndirectImagePlan> m_indirectImages;
     struct EdgeSelectorEntry {
         IrBlock* block = nullptr;
-        std::vector<bool> edges;
+        std::size_t edge = 0;
+        IrValue* taken = nullptr;
         IrValue* value = nullptr;
     };
     std::vector<EdgeSelectorEntry> m_edgeSelectors;
+    std::vector<std::pair<const IrValue*, const char*>> m_splitRefusals;
 };
 
 }
