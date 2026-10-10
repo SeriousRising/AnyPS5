@@ -195,7 +195,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
         case IrOpcode::GetShaderBase: result = _runtime.shaderBase; return true;
         case IrOpcode::Phi: return EvaluatePhi(inst, result);
         case IrOpcode::ReadFirstLane: {
-            Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1), _flattened, _recordedClean);
+            Evaluator active(_program, _runtime, _cleanFlatSlots, _cleanEvaluator, inst.Argument(1), _flattened, _recordedClean, _flatEvaluator != nullptr ? _flatEvaluator : this);
             return active.EvaluateWide(inst.Argument(0), result);
         }
         case IrOpcode::BitCastU32F32:
@@ -216,7 +216,7 @@ bool Evaluator::EvaluateInst(IrValue& inst, std::uint64_t& result) {
             if (slot->ImmediateU32() < _cleanFlatSlots.size() && _cleanFlatSlots[slot->ImmediateU32()] != 0u && _cleanEvaluator != nullptr) {
                 return _cleanEvaluator->EvaluateWide(_program.srtReads[slot->ImmediateU32()].value, result);
             }
-            return EvaluateWide(_program.srtReads[slot->ImmediateU32()].value, result);
+            return (_flatEvaluator != nullptr ? _flatEvaluator : this)->EvaluateWide(_program.srtReads[slot->ImmediateU32()].value, result);
         }
         case IrOpcode::LoadAddressU32:
         case IrOpcode::ReadConstBuffer:
