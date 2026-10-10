@@ -140,17 +140,21 @@ void Run(AgcDriver::VulkanDevice& device) {
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request)); }, "artifact is missing");
 }
 
-void RunInactiveSrtReads(AgcDriver::VulkanDevice& device) {
+void RunInactiveSrtReads(AgcDriver::VulkanDevice& device, bool memorySelector) {
     using namespace ShaderRecompiler;
     alignas(256) std::array<std::uint32_t, 64> output{};
     alignas(4096) std::uint32_t payload = 0u;
+    alignas(4096) std::uint32_t selectorWord = 0u;
     const auto outputAddress = reinterpret_cast<std::uintptr_t>(output.data() + 16u);
     const auto payloadAddress = reinterpret_cast<std::uintptr_t>(&payload);
+    const auto selectorAddress = reinterpret_cast<std::uintptr_t>(&selectorWord);
     std::array<std::uint32_t, 13> users{};
     users[0] = static_cast<std::uint32_t>(outputAddress);
     users[1] = static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu);
     users[2] = 32u;
     users[3] = 0x31016facu;
+    users[6] = static_cast<std::uint32_t>(selectorAddress);
+    users[7] = static_cast<std::uint32_t>(selectorAddress >> 32u);
     const auto dispatch = [&](const RecompileResult& result, std::uint32_t expected, const char* message) {
         output.fill(0xdeadbeefu);
         auto expectedOutput = output;
@@ -163,13 +167,20 @@ void RunInactiveSrtReads(AgcDriver::VulkanDevice& device) {
     };
     for (const std::uint32_t waveSize : {32u, 64u}) {
         for (const bool inverted : {false, true}) {
-            alignas(256) std::array<std::uint32_t, 14> code{
+            alignas(256) std::array<std::uint32_t, 17> code{
                 0xbf06800cu, 0xbf850005u, 0xf4000404u, 0xfa000000u, 0xbf8cc07fu, 0x7e020210u, 0xbf820004u,
                 0xf4000485u, 0xfa000000u, 0xbf8cc07fu, 0x7e020212u, 0xe0700000u, 0x80000100u, 0xbf810000u
             };
             code[1] = inverted ? 0xbf840005u : 0xbf850005u;
+            if (memorySelector) {
+                std::move_backward(code.begin(), code.begin() + 14u, code.end());
+                code[0] = 0xf4000303u;
+                code[1] = 0xfa000000u;
+                code[2] = 0xbf8cc07fu;
+            }
+            const auto shaderCode = std::span(code).first(memorySelector ? 17u : 14u);
             const auto codeAddress = reinterpret_cast<std::uintptr_t>(code.data());
-            AgcDriver::DriverDetail::ShaderSnapshot snapshot{codeAddress, 0u, 0u, {code.begin(), code.end()}, {}};
+            AgcDriver::DriverDetail::ShaderSnapshot snapshot{codeAddress, 0u, 0u, {shaderCode.begin(), shaderCode.end()}, {}};
             const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u, {}};
             RecompileRequest request{{ShaderStage::Compute, codeAddress, snapshot.code, 0u, {}}, {waveSize, 0u, users, compute, {}, {}, {}}, device.ComputeTarget(waveSize), {0u, 0u, 0u, 128u}};
             const auto handle = AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0u, request);
@@ -182,13 +193,17 @@ void RunInactiveSrtReads(AgcDriver::VulkanDevice& device) {
                     users[8] = users[9] = users[10] = users[11] = 0u;
                     users[pointerSlot] = static_cast<std::uint32_t>(payloadAddress);
                     users[pointerSlot + 1u] = static_cast<std::uint32_t>(payloadAddress >> 32u);
-                    users[12] = selector;
+                    users[12] = memorySelector ? selector ^ 1u : selector;
+                    selectorWord = selector;
                     payload = 0x12345678u + selector + (useCache ? 16u : 0u);
                     const auto expected = payload;
                     AgcDriver::ShaderMemory memory({});
                     static_cast<void>(memory.Capture(request));
                     const auto regions = memory.Regions();
-                    Require(regions.size() == 1u && regions.front().guestAddress == payloadAddress && regions.front().bytes.size() == sizeof(payload), "inactive SRT capture recorded an unused pointer");
+                    Require(regions.size() == (memorySelector ? 2u : 1u), "inactive SRT capture recorded an unused pointer");
+                    for (const auto& region : regions) {
+                        Require((region.guestAddress == payloadAddress || (memorySelector && region.guestAddress == selectorAddress)) && region.bytes.size() == sizeof(payload), "inactive SRT capture recorded an unexpected range");
+                    }
                     request.context.memory = regions;
                     const auto ordinary = Recompile(request);
                     Require(useCache || !ordinary.cacheHit, "inactive SRT uncached compilation reused a variant");
@@ -202,11 +217,16 @@ void RunInactiveSrtReads(AgcDriver::VulkanDevice& device) {
                     const auto invocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0u, request);
                     AgcDriver::ShaderMemory preparedMemory({});
                     const auto capture = preparedMemory.Capture(invocation);
-                    dispatch(*invocation.Materialize(*capture), expected, "inactive SRT prepared dispatch changed the selected payload or output padding");
                     const auto serialized = RequestSerializer{}.Serialize(request);
                     payload = 0xbad0bad0u;
                     users[8] = users[9] = users[10] = users[11] = 0u;
                     users[12] ^= 1u;
+                    selectorWord ^= 1u;
+                    const auto materialized = invocation.Materialize(*capture);
+                    dispatch(*materialized, expected, "inactive SRT prepared dispatch changed after live memory changed following capture");
+                    payload = 0xfeedabcdu;
+                    selectorWord ^= 1u;
+                    dispatch(*materialized, expected, "inactive SRT materialized dispatch changed after live memory changed");
                     auto replay = RequestSerializer{}.Deserialize(serialized);
                     dispatch(Recompile(replay.request), expected, "inactive SRT replay changed the selected payload or output padding after live memory changed");
                     dispatch(*invocation.Materialize(*capture), expected, "inactive SRT prepared capture changed after live memory changed");
@@ -215,7 +235,7 @@ void RunInactiveSrtReads(AgcDriver::VulkanDevice& device) {
             }
         }
     }
-    std::cout << "inactive SRT wave32/64 branch, prepared, cache and snapshot replay tests passed\n";
+    std::cout << (memorySelector ? "flat-backed SRT conditions" : "inactive SRT") << " wave32/64 branch, prepared, cache and snapshot replay tests passed\n";
 }
 
 void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
@@ -348,7 +368,8 @@ int main(int argc, char** argv) {
         Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration")), "invalid test arguments");
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        RunInactiveSrtReads(*device);
+        RunInactiveSrtReads(*device, false);
+        RunInactiveSrtReads(*device, true);
         Run(*device);
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
