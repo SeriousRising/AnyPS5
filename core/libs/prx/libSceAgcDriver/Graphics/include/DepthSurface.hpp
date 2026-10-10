@@ -14,7 +14,8 @@ class Texture;
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 void ClearDepthSurfaces(VkDevice device);
-void RetireDepthSurfacesFor(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);
+class StorageTexture;
+void GiveDepthSurfacesTo(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& storage);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
 
 }
