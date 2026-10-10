@@ -15,6 +15,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 namespace ShaderRecompiler {
 namespace {
@@ -791,6 +792,23 @@ private:
         source = InternSource(descriptor);
     }
 
+    bool hasCapturedMemory(IrValue* value, std::unordered_set<IrValue*>& visited) const {
+        value = value->Resolve();
+        if (!visited.insert(value).second) return true;
+        if (value->Opcode() == IrOpcode::ReadConst) {
+            if (value->ArgumentCount() != 2u || value->Argument(0)->Resolve()->Opcode() != IrOpcode::GetSrtResource || value->Argument(0)->Resolve()->ArgumentCount() != 0u) return false;
+            auto* slot = value->Argument(1)->Resolve();
+            if (!slot->HasImmediate() || slot->Type() != IrType::U32 || slot->ImmediateU32() >= m_program.Resources().srtReads.size()) return false;
+            const auto& read = m_program.Resources().srtReads[slot->ImmediateU32()];
+            return read.flatOffset == slot->ImmediateU32() && read.value != nullptr && Detail::IsRawRead(m_program.Resources(), *read.value->Resolve());
+        }
+        if (value->Opcode() == IrOpcode::LoadAddressU32 || value->Opcode() == IrOpcode::ReadConstBuffer) return false;
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+            if (!hasCapturedMemory(value->Argument(index), visited)) return false;
+        }
+        return true;
+    }
+
     bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
         const IrValue* handle = inst.Argument(0)->Resolve();
         if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
@@ -801,7 +819,9 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
-        if (ValidateSource(descriptor, badDword)) {
+        std::unordered_set<IrValue*> visited;
+        const bool captured = std::ranges::all_of(std::span(descriptor.dwords).first(descriptor.dwordCount), [&](IrValue* value) { return hasCapturedMemory(value, visited); });
+        if (ValidateSource(descriptor, badDword) && captured) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");

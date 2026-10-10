@@ -4,6 +4,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ResourceTracker.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
@@ -733,8 +734,10 @@ void verifyInactiveSrtReads() {
             unknown.context.compute->groupIdEnable[0] = true;
             Reads conservative;
             runtime.userContext = &conservative;
-            expectFailure([&] { static_cast<void>(CaptureResources(unknown, runtime)); }, "inaccessible memory", "an unknown SRT branch accepted an invalid pointer");
-            require(std::ranges::find(conservative.addresses, 0u) != conservative.addresses.end(), "an unknown SRT branch was skipped");
+            const auto nativeCapture = CaptureResources(unknown, runtime);
+            require(conservative.addresses.empty(), "a GPU-controlled SRT branch was read on the host");
+            require(nativeCapture->plan->srtReads.empty() && nativeCapture->snapshot.flattenedSrt.empty(), "a GPU-controlled SRT branch retained captured memory");
+            require(nativeCapture->plan->info.usesDma, "a GPU-controlled SRT branch lost its native memory requirement");
             std::vector<std::uint32_t> memoryCondition{0xf4000303u, 0xfa000000u, 0xbf8cc07fu};
             memoryCondition.insert(memoryCondition.end(), code.begin(), code.end());
             auto flatCondition = request;
@@ -1022,6 +1025,249 @@ void verifyFlatBackedSrtConditions() {
         }
     }
     require(failures == 0u, "flat-backed conditions did not preserve their slot snapshots");
+}
+
+void verifyGpuControlledSrtReads() {
+    using namespace ShaderRecompiler;
+    for (const auto selectorKind : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u}) {
+        for (const auto rootKind : {0u, 1u, 2u}) {
+            IrProgram program;
+            program.Resources().stage = IrShaderStage::Compute;
+            program.Resources().userDataCount = 1u;
+            std::array<IrBlock*, 4> blocks{};
+            for (auto& block : blocks) {
+                block = &program.CreateBlock();
+                program.BlockOrder().push_back(block);
+                BlockInfo info;
+                info.id = block->Id();
+                program.Metadata().blockInfo.push_back(info);
+            }
+            program.SetEntryBlock(*blocks[0]);
+            blocks[0]->AddBranch(blocks[1]);
+            blocks[0]->AddBranch(blocks[2]);
+            blocks[1]->AddBranch(blocks[3]);
+            blocks[2]->AddBranch(blocks[3]);
+            const auto constant = [&](std::uint32_t word) -> IrValue& {
+                auto& value = program.CreateValue(IrOpcode::Void, IrType::U32);
+                value.SetImmediateU32(word);
+                return value;
+            };
+            const auto emit = [&](IrBlock& block, IrOpcode op, IrType type, std::initializer_list<IrValue*> args) -> IrValue& {
+                auto& value = program.CreateValue(op, type);
+                for (auto* arg : args) value.AddArgument(arg);
+                block.AppendInstruction(&value);
+                return value;
+            };
+            auto& zero = constant(0u);
+            auto& active = program.CreateValue(IrOpcode::Void, IrType::Bool);
+            active.SetImmediateBool(true);
+            auto& inactive = program.CreateValue(IrOpcode::Void, IrType::Bool);
+            inactive.SetImmediateBool(false);
+            const auto read = [&](IrBlock& block, std::uint32_t address, IrValue* offset = nullptr, bool buffer = false) -> IrValue& {
+                MemoryInfo memory;
+                memory.kind = buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress;
+                memory.dataBits = 32u;
+                memory.dataDwords = 1u;
+                const auto index = static_cast<std::uint32_t>(program.Resources().memoryInfo.size());
+                program.Resources().memoryInfo.push_back(memory);
+                auto& handle = buffer
+                    ? emit(block, IrOpcode::GetBufferResource, IrType::BufferResource, {&constant(address), &zero, &constant(4u), &constant(0x31016facu)})
+                    : emit(block, IrOpcode::GetAddressResource, IrType::AddressResource, {&constant(address), &zero});
+                auto& value = emit(block, buffer ? IrOpcode::ReadConstBuffer : IrOpcode::LoadAddressU32, IrType::U32, {&handle, offset == nullptr ? &zero : offset});
+                value.SetFlags(MemoryFlags{index, index * 4u});
+                return value;
+            };
+            auto& userReg = program.CreateValue(IrOpcode::Void, IrType::ScalarReg);
+            userReg.SetRegister({RegisterBank::Scalar, 0});
+            auto& user = emit(*blocks[0], IrOpcode::GetUserData, IrType::U32, {&userReg});
+            auto& lane = emit(*blocks[0], IrOpcode::LaneId, IrType::U32, {});
+            auto& gpuCondition = emit(*blocks[0], IrOpcode::IEqual32, IrType::Bool, {&lane, &zero});
+            IrValue* selector = &user;
+            if (selectorKind == 1u) selector = &lane;
+            if (selectorKind == 2u || selectorKind == 3u || selectorKind == 7u) selector = &read(*blocks[0], 0x100000u, selectorKind == 3u ? &user : nullptr, selectorKind == 7u);
+            if (selectorKind == 4u || selectorKind == 5u) selector = &emit(*blocks[0], IrOpcode::ReadFirstLane, IrType::U32, {&user, selectorKind == 4u ? &inactive : &gpuCondition});
+            if (selectorKind == 6u) {
+                auto& selected = emit(*blocks[0], IrOpcode::SelectU32, IrType::U32, {&gpuCondition, &user, &lane});
+                selector = &emit(*blocks[0], IrOpcode::ReadFirstLane, IrType::U32, {&selected, &gpuCondition});
+            }
+            if (selectorKind == 9u) {
+                auto& word = read(*blocks[0], 0x100000u);
+                selector = &emit(*blocks[0], IrOpcode::ReadFirstLane, IrType::U32, {&word, &active});
+            }
+            if (selectorKind == 10u) {
+                auto& pointer = read(*blocks[0], 0x200000u);
+                auto& uniformPointer = emit(*blocks[0], IrOpcode::ReadFirstLane, IrType::U32, {&pointer, &active});
+                auto& address = emit(*blocks[0], IrOpcode::GetAddressResource, IrType::AddressResource, {&uniformPointer, &zero});
+                const auto index = static_cast<std::uint32_t>(program.Resources().memoryInfo.size());
+                MemoryInfo memory;
+                memory.kind = ResourceKind::ScalarAddress;
+                program.Resources().memoryInfo.push_back(memory);
+                selector = &emit(*blocks[0], IrOpcode::LoadAddressU32, IrType::U32, {&address, &zero});
+                selector->SetFlags(MemoryFlags{index, index * 4u});
+            }
+            if (selectorKind == 11u) selector = &read(*blocks[0], 0x100000u);
+            auto& snapshot = read(*blocks[0], 0x900000u);
+            auto& condition = emit(*blocks[0], IrOpcode::INotEqual32, IrType::Bool, {selector, &zero});
+            auto& entryInfo = program.Metadata().blockInfo[0];
+            entryInfo.condition = &condition;
+            entryInfo.terminator.kind = TerminatorKind::ConditionalBranch;
+            entryInfo.terminator.trueBlock = blocks[1]->Id();
+            entryInfo.terminator.falseBlock = blocks[2]->Id();
+            if (selectorKind == 8u || selectorKind == 11u) {
+                blocks[1]->AddBranch(blocks[0]);
+                auto& loop = program.Metadata().blockInfo[1];
+                loop.condition = &gpuCondition;
+                loop.terminator.kind = TerminatorKind::ConditionalBranch;
+                loop.terminator.trueBlock = blocks[0]->Id();
+                loop.terminator.falseBlock = blocks[3]->Id();
+                entryInfo.terminator.loopHeader = true;
+            }
+            std::array<IrValue*, 3> payloads{};
+            for (std::uint32_t index = 0; index < payloads.size(); ++index) {
+                auto& block = *blocks[index + 1u];
+                payloads[index] = &read(block, index == 1u ? 0x30u : 0x110000u + index * 0x10000u);
+                if (rootKind != 0u) {
+                    emit(block, rootKind == 1u ? IrOpcode::GetBufferResource : IrOpcode::GetSamplerResource,
+                        rootKind == 1u ? IrType::BufferResource : IrType::SamplerResource,
+                        {payloads[index], &zero, &constant(4u), &constant(0x31016facu)});
+                }
+            }
+            SrtWalker{}.BuildPlan(program);
+            const bool known = selectorKind == 0u || selectorKind == 2u || selectorKind == 9u || selectorKind == 10u;
+            for (const auto* payload : payloads) {
+                require(program.Resources().memoryInfo[payload->Flags<MemoryFlags>().index].planningOnly == (known || rootKind == 2u), "GPU-controlled scalar read was captured or a required host read was lost");
+            }
+            require(program.Resources().memoryInfo[snapshot.Flags<MemoryFlags>().index].planningOnly == (selectorKind != 8u && selectorKind != 11u), "known entry capture or loop-back unknown provenance was lost");
+            if (selectorKind == 2u) require(program.Resources().memoryInfo[0].planningOnly, "a host-known memory selector was not captured");
+            struct Reads { std::vector<std::uint64_t> addresses; } reads;
+            const std::array<std::uint32_t, 1> users{1u};
+            const auto callback = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+                auto& reads = *static_cast<Reads*>(context);
+                reads.addresses.push_back(address);
+                if (address == 0x30u) throw std::runtime_error("required host scalar read is inaccessible");
+                *word = address == 0x900000u ? 0x12345678u : address == 0x200000u ? 0x100000u : 1u;
+                return true;
+            };
+            SrtRuntime runtime{users, 0, callback, &reads, callback};
+            std::vector<std::uint32_t> flat;
+            if (!known && rootKind == 2u && selectorKind != 8u) {
+                expectFailure([&] { SrtWalker{}.Walk(program.Resources(), runtime, flat); }, "required host scalar read", "a mandatory host descriptor silently dropped its inaccessible dependency");
+            } else {
+                SrtWalker{}.Walk(program.Resources(), runtime, flat);
+                require(std::ranges::find(reads.addresses, 0x30u) == reads.addresses.end(), "GPU-only control was speculatively read during capture");
+                require(flat.size() == program.Resources().srtReads.size(), "GPU-controlled capture lost a planned slot");
+                require((std::ranges::find(flat, 0x12345678u) != flat.end()) == (selectorKind != 8u && selectorKind != 11u), "known entry snapshot changed or an unknown loop was captured");
+            }
+        }
+    }
+}
+
+void verifyGpuDescriptorCaptureBoundary() {
+    using namespace ShaderRecompiler;
+    for (const auto sourceKind : {0u, 1u, 2u, 3u, 4u}) {
+        IrProgram program;
+        program.Resources().stage = IrShaderStage::Compute;
+        program.Resources().userDataCount = 1u;
+        auto& block = program.CreateBlock();
+        program.SetEntryBlock(block);
+        program.BlockOrder().push_back(&block);
+        BlockInfo info;
+        info.id = block.Id();
+        program.Metadata().blockInfo.push_back(info);
+        const auto constant = [&](std::uint32_t word) -> IrValue& {
+            auto& value = program.CreateValue(IrOpcode::Void, IrType::U32);
+            value.SetImmediateU32(word);
+            return value;
+        };
+        const auto emit = [&](IrOpcode op, IrType type, std::initializer_list<IrValue*> args) -> IrValue& {
+            auto& value = program.CreateValue(op, type);
+            for (auto* arg : args) value.AddArgument(arg);
+            block.AppendInstruction(&value);
+            return value;
+        };
+        auto& zero = constant(0u);
+        auto& reg = program.CreateValue(IrOpcode::Void, IrType::ScalarReg);
+        reg.SetRegister({RegisterBank::Scalar, 0});
+        auto& offset = emit(IrOpcode::GetUserData, IrType::U32, {&reg});
+        auto& address = sourceKind == 2u
+            ? emit(IrOpcode::GetBufferResource, IrType::BufferResource, {&constant(0x100000u), &zero, &constant(4u), &constant(0x31016facu)})
+            : emit(IrOpcode::GetAddressResource, IrType::AddressResource, {&constant(0x100000u), &zero});
+        MemoryInfo scalar;
+        scalar.kind = sourceKind == 2u ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress;
+        program.Resources().memoryInfo.push_back(scalar);
+        auto& pointer = emit(sourceKind == 2u ? IrOpcode::ReadConstBuffer : IrOpcode::LoadAddressU32, IrType::U32, {&address, sourceKind == 0u || sourceKind > 2u ? &zero : &offset});
+        pointer.SetFlags(MemoryFlags{0, 0});
+        auto& descriptor = emit(IrOpcode::GetBufferResource, IrType::BufferResource, {&pointer, &zero, &constant(4u), &constant(0x31016facu)});
+        MemoryInfo buffer;
+        buffer.kind = ResourceKind::Buffer;
+        program.Resources().memoryInfo.push_back(buffer);
+        auto& payload = emit(IrOpcode::LoadBufferU32, IrType::U32, {&descriptor, &zero});
+        payload.SetFlags(MemoryFlags{1, 4});
+        if (sourceKind > 2u) {
+            std::array<IrBlock*, 3> successors{};
+            for (auto& successor : successors) {
+                successor = &program.CreateBlock();
+                program.BlockOrder().push_back(successor);
+                BlockInfo next;
+                next.id = successor->Id();
+                program.Metadata().blockInfo.push_back(next);
+            }
+            block.AddBranch(successors[0]);
+            block.AddBranch(successors[1]);
+            successors[0]->AddBranch(successors[2]);
+            successors[1]->AddBranch(successors[2]);
+            auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+            auto& condition = emit(IrOpcode::IEqual32, IrType::Bool, {&lane, &zero});
+            auto& entry = program.Metadata().blockInfo[0];
+            entry.condition = &condition;
+            entry.terminator.kind = TerminatorKind::ConditionalBranch;
+            entry.terminator.trueBlock = successors[0]->Id();
+            entry.terminator.falseBlock = successors[1]->Id();
+            program.Resources().memoryInfo.push_back(scalar);
+            auto& conditionalPointer = emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &zero});
+            conditionalPointer.SetFlags(MemoryFlags{2, 8});
+            block.RemoveInstruction(&conditionalPointer);
+            successors[1]->AppendInstruction(&conditionalPointer);
+            require(EquivalentValue(program.Resources(), &pointer, &conditionalPointer), "equivalent phi fixture loads are not equivalent");
+            auto& phi = emit(IrOpcode::Phi, IrType::U32, {});
+            if (sourceKind == 3u) {
+                phi.AddPhiOperand(successors[1], &conditionalPointer);
+                phi.AddPhiOperand(successors[0], &pointer);
+            } else {
+                phi.AddPhiOperand(successors[0], &pointer);
+                phi.AddPhiOperand(successors[1], &conditionalPointer);
+            }
+            descriptor.ReplaceArgument(0, &phi);
+            for (auto* value : {&phi, &descriptor, &payload}) {
+                block.RemoveInstruction(value);
+                successors[2]->AppendInstruction(value);
+            }
+        }
+        SrtWalker{}.BuildPlan(program);
+        ResourceTracker{}.Track(program);
+        const bool native = sourceKind != 0u;
+        require(program.Resources().memoryInfo[1].gpuDescriptor == native, "unflattened scalar memory became a CPU descriptor or a captured descriptor became native");
+        const bool captured = sourceKind == 0u || sourceKind > 2u;
+        require(program.Resources().srtReads.size() == (captured ? 1u : 0u), "native descriptor dependencies were flattened or a required host dependency was lost");
+        require(program.Resources().info.usesDma == native, "native descriptor fallback did not keep its BDA requirement");
+        struct Reads { std::vector<std::uint64_t> addresses; } reads;
+        const std::array<std::uint32_t, 1> users{0u};
+        const auto callback = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+            static_cast<Reads*>(context)->addresses.push_back(address);
+            if (address != 0x100000u) throw std::runtime_error("unexpected descriptor read");
+            *word = 0x110000u;
+            return true;
+        };
+        SrtRuntime runtime{users, 0, callback, &reads, callback};
+        std::vector<std::uint32_t> sources(program.Resources().descriptorSources.size());
+        for (std::uint32_t index = 0; index < sources.size(); ++index) sources[index] = index;
+        std::vector<DescriptorValue> values;
+        std::vector<std::uint32_t> flat;
+        std::vector<std::uint8_t> active;
+        SrtWalker{}.EvaluateRuntimeSources(program.Resources(), sources, runtime, values, flat, {}, active);
+        require(reads.addresses == (captured ? std::vector<std::uint64_t>{0x100000u} : std::vector<std::uint64_t>{}), "CPU descriptor materialization read an unflattened scalar dependency");
+        if (!native) require(values.size() == 1u && values[0].dwords[0] == 0x110000u && flat == std::vector<std::uint32_t>{0x110000u}, "captured descriptor contents differ from its planned word");
+    }
 }
 
 void verifyProgramCounterRelativeData() {
@@ -2373,8 +2619,21 @@ int main(int argc, char** argv) {
             std::cout << "Inactive SRT reads and strict branch validation passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-descriptor-boundary") {
+            verifyGpuDescriptorCaptureBoundary();
+            std::cout << "Native descriptor capture boundaries passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-controlled-srt") {
+            verifyGpuControlledSrtReads();
+            verifyGpuDescriptorCaptureBoundary();
+            std::cout << "GPU-controlled scalar capture boundaries passed\n";
+            return 0;
+        }
         require(argc == 1, "unknown shader memory test arguments");
         verifyLogicalImageSpecialization();
+        verifyGpuControlledSrtReads();
+        verifyGpuDescriptorCaptureBoundary();
         verifyInactiveSrtReads();
         verifyInactiveSrtDependencies();
         verifyRuntimeValidationCache();

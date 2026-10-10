@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <unordered_set>
 
 namespace ShaderRecompiler::Detail {
 
@@ -24,11 +25,14 @@ private:
     void Collect(IrValue* raw, std::uint32_t usePc);
     void PatchReads();
     void buildControlFlow();
+    bool canCapture(IrValue* raw, bool scalarBuffer) const;
+    void classifyControlFlow();
 
     IrProgram& _program;
     std::vector<IrValue*> _visiting;
     std::vector<IrValue*> _visited;
     std::vector<Patch> _patches;
+    std::unordered_set<const IrBlock*> _gpuControlled;
 };
 
 }

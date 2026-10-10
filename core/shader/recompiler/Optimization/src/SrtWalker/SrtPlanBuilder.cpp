@@ -8,12 +8,15 @@
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
+#include <functional>
 
 namespace ShaderRecompiler::Detail {
 
 void PlanBuilder::Run() {
     _program.Resources().srtReads.clear();
     _program.Metadata().dynamicReads.clear();
+    classifyControlFlow();
     for (auto& block : _program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
             const auto op = inst->Opcode();
@@ -27,7 +30,7 @@ void PlanBuilder::Run() {
                     }
                 }
             }
-            if (IsDescriptorHandle(inst->Opcode())) {
+            if (op == IrOpcode::GetImageResource || op == IrOpcode::GetSamplerResource || (op == IrOpcode::GetBufferResource && canCapture(inst, true))) {
                 for (std::size_t index = 0; index < inst->ArgumentCount(); index++) {
                     Collect(inst->Argument(index), 0);
                 }
@@ -36,13 +39,73 @@ void PlanBuilder::Run() {
     }
     for (auto& block : _program.Blocks()) {
         for (IrValue* inst : block->Instructions()) {
-            if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
+            if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && canCapture(inst, false)) {
                 Collect(inst, inst->Flags<MemoryFlags>().pc);
             }
         }
     }
     PatchReads();
     buildControlFlow();
+}
+
+bool PlanBuilder::canCapture(IrValue* raw, bool scalarBuffer) const {
+    if (raw == nullptr) return false;
+    RuntimeValidator validator(_program.Resources(), RuntimeValueType::Any);
+    std::unordered_set<IrValue*> validated;
+    std::unordered_set<IrValue*> visiting;
+    const std::function<bool(IrValue*)> visit = [&](IrValue* value) {
+        value = value->Resolve();
+        if (validated.contains(value)) return true;
+        if (!validator.Run(value)) return false;
+        if (!visiting.insert(value).second) return value->Opcode() == IrOpcode::Phi;
+        const auto finish = [&](bool valid) {
+            visiting.erase(value);
+            if (valid) validated.insert(value);
+            return valid;
+        };
+        const auto op = value->Opcode();
+        if (op == IrOpcode::Void || op == IrOpcode::GetUserData || op == IrOpcode::GetShaderBase || op == IrOpcode::GetSrtResource) return finish(true);
+        if (op == IrOpcode::Phi && ResolveInvariantPhi(_program.Resources(), value) == nullptr) return finish(false);
+        if (op == IrOpcode::ReadFirstLane) {
+            auto* mask = value->Argument(1)->Resolve();
+            if (!mask->HasImmediate() || mask->Type() != IrType::Bool || !mask->ImmediateBool()) return finish(false);
+        } else if (op == IrOpcode::ReadConst) {
+            return finish(false);
+        } else if (op == IrOpcode::LoadAddressU32 || op == IrOpcode::ReadConstBuffer) {
+            if (!IsRawRead(_program.Resources(), *value) || (!scalarBuffer && op == IrOpcode::ReadConstBuffer) || value->Parent() == nullptr || _gpuControlled.contains(value->Parent())) return finish(false);
+            auto* offset = value->Argument(1)->Resolve();
+            if (!offset->HasImmediate() || offset->Type() != IrType::U32) return finish(false);
+        } else if (op != IrOpcode::Phi && !IsDescriptorHandle(op) && !IsRuntimeUniformOp(op)) {
+            return finish(false);
+        }
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) {
+            if (!visit(value->Argument(index))) return finish(false);
+        }
+        return finish(true);
+    };
+    return visit(raw);
+}
+
+void PlanBuilder::classifyControlFlow() {
+    const auto& blocks = _program.BlockOrder();
+    const auto& metadata = _program.Metadata().blockInfo;
+    if (metadata.size() != blocks.size() || blocks.empty()) {
+        for (const auto& block : _program.Blocks()) _gpuControlled.insert(block.get());
+        return;
+    }
+    bool changed;
+    do {
+        changed = false;
+        for (std::size_t index = 0; index < blocks.size(); ++index) {
+            const auto& info = metadata[index];
+            const bool unknown = _gpuControlled.contains(blocks[index]) ||
+                (info.terminator.kind == TerminatorKind::ConditionalBranch && !canCapture(info.condition, false)) ||
+                info.terminator.kind == TerminatorKind::IndirectBranch || info.terminator.kind == TerminatorKind::Unsupported;
+            if (unknown) {
+                for (const auto* successor : blocks[index]->Successors()) changed = _gpuControlled.insert(successor).second || changed;
+            }
+        }
+    } while (changed);
 }
 
 void PlanBuilder::buildControlFlow() {
