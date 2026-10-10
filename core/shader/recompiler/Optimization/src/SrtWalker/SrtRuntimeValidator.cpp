@@ -4,12 +4,22 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
 
+namespace {
+std::atomic<std::uint64_t> cycleAnalyses{0};
+}
+
+std::uint64_t RuntimeValidator::CycleAnalyses() {
+    return cycleAnalyses.load(std::memory_order_relaxed);
+}
+
 void RuntimeValidator::analyzeCycles(IrValue* root) {
+    cycleAnalyses.fetch_add(1, std::memory_order_relaxed);
     std::unordered_map<IrValue*, std::pair<std::size_t, std::size_t>> indices;
     std::unordered_set<IrValue*> onStack;
     std::vector<IrValue*> stack;

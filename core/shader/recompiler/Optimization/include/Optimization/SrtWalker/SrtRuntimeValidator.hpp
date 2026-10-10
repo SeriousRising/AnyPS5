@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
 
+#include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -14,6 +15,7 @@ public:
     RuntimeValidator(const IrResourcePlan& program, RuntimeValueType type) : _program(program), _type(type) {}
 
     bool Run(IrValue* value) { analyzeCycles(value); return Validate(value); }
+    static std::uint64_t CycleAnalyses();
 
 private:
     void analyzeCycles(IrValue* value);
