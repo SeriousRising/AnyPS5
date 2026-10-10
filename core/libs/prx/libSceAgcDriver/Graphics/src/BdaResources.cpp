@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -10,6 +11,8 @@
 #include <list>
 #include <mutex>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -230,6 +233,14 @@ VkDescriptorBufferInfo BdaResources::Fault() const {
 
 namespace {
 std::atomic<bool> loopGuardTripped{false};
+std::mutex loopGuardMutex;
+LoopGuardReport lastLoopGuard;
+std::vector<std::pair<std::uint64_t, std::uint32_t>> reportedLoopGuards;
+}
+
+LoopGuardReport LastLoopGuardReport() {
+    std::lock_guard lock(loopGuardMutex);
+    return lastLoopGuard;
 }
 
 bool LoopGuardTripped() {
@@ -249,7 +260,16 @@ void BdaResources::CheckFault() const {
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
         loopGuardTripped.store(true, std::memory_order_relaxed);
-        std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx ran past %u evaluations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
+        {
+            std::lock_guard lock(loopGuardMutex);
+            lastLoopGuard = {report.address, report.stage, report.instruction, report.bytes};
+            const std::pair key{report.address, report.instruction};
+            if (reportedLoopGuards.size() < 64 && std::find(reportedLoopGuards.begin(), reportedLoopGuards.end(), key) == reportedLoopGuards.end()) {
+                reportedLoopGuards.push_back(key);
+                constexpr std::array<const char*, 9> stages{"unknown", "vertex", "pixel", "fetch", "compute", "mesh", "local", "hull", "domain"};
+                std::fprintf(stderr, "[gpu] loop guard: %s shader 0x%llx loop exit at instruction 0x%x passed %u evaluations (APS5_LOOP_GUARD; the shader left its loops unfinished)\n", report.stage < stages.size() ? stages[report.stage] : "unknown", static_cast<unsigned long long>(report.address), report.instruction, report.bytes);
+            }
+        }
         std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
         return;
     }
