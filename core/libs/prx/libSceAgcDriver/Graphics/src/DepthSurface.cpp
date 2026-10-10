@@ -88,12 +88,9 @@ public:
         key[10] = components.b;
         key[11] = components.a;
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
-        const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
-        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
-        const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
+        const bool stencil = Stencil(resource);
         const auto format = ResolveTextureFormat(resource.format);
-        const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
-        if ((format != expected && !depthBits) || resource.dimension != TextureDimension::k2D || resource.width != target.extent.width || resource.height != target.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0) {
+        if (!Describes(words, resource)) {
             char text[448];
             std::snprintf(text, sizeof(text), "AGC graphics: sampling the %s plane of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), tile mode %u, dimension %d, levels %u-%u, slice %u is not implemented (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
                           stencil ? "stencil" : "depth", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, resource.format, static_cast<int>(format),
@@ -103,6 +100,18 @@ public:
         auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components);
         textures.emplace(key, texture);
         return texture;
+    }
+
+    bool Stencil(const GuestTextureResource& resource) const {
+        return target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
+    }
+
+    bool Describes(std::span<const std::uint32_t> words, const GuestTextureResource& resource) const {
+        const bool stencil = Stencil(resource);
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
+        const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
+        return (ResolveTextureFormat(resource.format) == expected || depthBits) && resource.dimension == TextureDimension::k2D && resource.width == target.extent.width && resource.height == target.extent.height && resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0;
     }
 
     const Context context;
@@ -134,8 +143,13 @@ std::mutex& surfacesMutex() {
     return mutex;
 }
 
-std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
-    static auto* list = new std::vector<std::unique_ptr<DepthSurface>>();
+std::vector<std::shared_ptr<DepthSurface>>& surfaces() {
+    static auto* list = new std::vector<std::shared_ptr<DepthSurface>>();
+    return *list;
+}
+
+std::vector<std::shared_ptr<DepthSurface>>& retired() {
+    static auto* list = new std::vector<std::shared_ptr<DepthSurface>>();
     return *list;
 }
 
@@ -154,13 +168,14 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     for (const auto& surface : surfaces()) {
         if (surface->context.device == context.device && sameSurface(surface->target, target)) return surface->view;
     }
-    surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+    surfaces().push_back(std::make_shared<DepthSurface>(context, target));
     return surfaces().back()->view;
 }
 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
+    std::erase_if(retired(), [&](const auto& surface) { return surface->context.device == device; });
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
@@ -172,9 +187,37 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     return found == list.rend() ? nullptr : (*found)->Sampled(words, resource, components);
 }
 
-bool DepthSurfaceAt(std::uint64_t address) {
-    std::lock_guard lock(surfacesMutex());
-    return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
+void RetireDepthSurfacesFor(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource) {
+    std::vector<std::shared_ptr<DepthSurface>> reused;
+    {
+        std::lock_guard lock(surfacesMutex());
+        auto& list = surfaces();
+        const auto at = [&](const auto& surface) { return surface->context.device == context.device && (surface->target.address == resource.baseAddress || surface->Stencil(resource)); };
+        for (const auto& surface : list) {
+            if (!at(surface) || !surface->Describes(words, resource)) continue;
+            char text[320];
+            std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented: a %ux%u storage image of guest format %u, tile mode %u, describes the %s plane of the %ux%u depth target (vk format %d) that is live at that address",
+                          static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned>(resource.tileMode), surface->Stencil(resource) ? "stencil" : "depth", surface->target.extent.width, surface->target.extent.height, static_cast<int>(surface->target.format));
+            throw std::runtime_error(text);
+        }
+        for (auto it = list.begin(); it != list.end();) {
+            if (!at(*it)) {
+                ++it;
+                continue;
+            }
+            reused.push_back(std::move(*it));
+            it = list.erase(it);
+        }
+        if (Recorder::Active() == nullptr) retired().insert(retired().end(), reused.begin(), reused.end());
+    }
+    for (auto& surface : reused) {
+        static unsigned reported = 0;
+        if (reported < 32) {
+            ++reported;
+            std::fprintf(stderr, "[gpu] depth surface 0x%llx (%ux%u, VkFormat %d) retired: its memory is now a %ux%u storage image of guest format %u\n", static_cast<unsigned long long>(surface->target.address), surface->target.extent.width, surface->target.extent.height, static_cast<int>(surface->target.format), resource.width, resource.height, resource.format);
+        }
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Keep(std::move(surface));
+    }
 }
 
 }
