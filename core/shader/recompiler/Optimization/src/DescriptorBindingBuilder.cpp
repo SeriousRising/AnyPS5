@@ -350,7 +350,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     for (const auto& logical : layout.descriptors) {
         const bool imageHeap = ImageBindingResourceClass(logical.kind) != ImageResourceClass::None;
         const bool samplerHeap = logical.kind == DescriptorBindingKind::Samplers;
-        if ((imageHeap || samplerHeap) && logical.resources.size() > PipelineSpecialization::DescriptorIndexStride) fail("shader logical heap specialization capacity exceeded");
+        if ((imageHeap || samplerHeap) && logical.resources.size() > PipelineSpecialization::DescriptorIndexStride) fail("shader logical heap specialization capacity exceeded: binding kind " + std::to_string(static_cast<std::uint32_t>(logical.kind)) + " has " + std::to_string(logical.resources.size()) + " slots, capacity " + std::to_string(PipelineSpecialization::DescriptorIndexStride));
         IrDescriptorBinding compact{logical.kind, {}};
         std::vector<std::uint32_t> originals;
         std::vector<bool> inactive;
@@ -378,7 +378,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 inactive.push_back(!active);
             }
         }
-        if ((imageHeap || samplerHeap) && compact.resources.size() > RuntimeAbi::HeapCapacity(logical.kind)) fail("shader descriptor heap capacity exceeded");
+        if ((imageHeap || samplerHeap) && compact.resources.size() > RuntimeAbi::HeapCapacity(logical.kind)) fail("shader descriptor heap capacity exceeded: binding kind " + std::to_string(static_cast<std::uint32_t>(logical.kind)) + " needs " + std::to_string(compact.resources.size()) + " descriptors, capacity " + std::to_string(RuntimeAbi::HeapCapacity(logical.kind)));
         if ((imageHeap || samplerHeap) && !registrationModules) plan.specialization.push_back({PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(logical.kind), std::max(1u, static_cast<std::uint32_t>(compact.resources.size()))});
         if ((imageHeap || samplerHeap) && compact.resources.empty()) continue;
         PreparedDescriptorBinding entry{};

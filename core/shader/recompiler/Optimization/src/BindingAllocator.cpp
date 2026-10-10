@@ -102,7 +102,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     next.memoryOffsetDword = static_cast<std::uint32_t>(next.userDataRegisters.size());
     next.memoryOffsetCount = static_cast<std::uint32_t>(info.buffers.size());
     next.dispatchThreadLimit = info.dispatchThreadLimit;
-    if (info.buffers.size() > RuntimeAbi::BufferCapacity || info.images.size() > RuntimeAbi::ImageCapacity || info.samplers.size() > RuntimeAbi::SamplerHeapCapacity) fail("shader binding layout exceeds runtime metadata capacity");
+    if (info.buffers.size() > RuntimeAbi::BufferCapacity || info.images.size() > RuntimeAbi::ImageCapacity || info.samplers.size() > RuntimeAbi::SamplerHeapCapacity) fail("shader binding layout exceeds runtime metadata capacity: " + std::to_string(info.buffers.size()) + " buffers of " + std::to_string(RuntimeAbi::BufferCapacity) + ", " + std::to_string(info.images.size()) + " images of " + std::to_string(RuntimeAbi::ImageCapacity) + ", " + std::to_string(info.samplers.size()) + " samplers of " + std::to_string(RuntimeAbi::SamplerHeapCapacity));
     if (std::ranges::any_of(next.userDataRegisters, [](auto reg) { return reg >= RuntimeAbi::UserDataCapacity; })) fail("shader user data exceeds runtime ABI capacity");
     if (registrationModules || std::ranges::any_of(info.images, [](const auto& image) { return image.indirectRoot != ImageResource::NoIndirectImage; })) next.runtimeImageCount = static_cast<std::uint32_t>(info.images.size());
     if (registrationModules && program.Resources().stage == IrShaderStage::Pixel) next.runtimeStateDwords = RuntimeAbi::StateDwords;
@@ -158,13 +158,13 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     }
     for (std::uint32_t i = 0; i < imageGroups.size(); i++) {
         if (!imageGroups[i].empty()) {
-            if (imageGroups[i].size() > PipelineSpecialization::DescriptorIndexStride) fail("shader logical image heap specialization capacity exceeded");
+            if (imageGroups[i].size() > PipelineSpecialization::DescriptorIndexStride) fail("shader logical image heap specialization capacity exceeded: binding kind " + std::to_string(FirstImageBinding + i) + " has " + std::to_string(imageGroups[i].size()) + " slots, capacity " + std::to_string(PipelineSpecialization::DescriptorIndexStride));
             addBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i), std::move(imageGroups[i]));
         }
     }
 
     if (!info.samplers.empty()) {
-        if (info.samplers.size() > RuntimeAbi::SamplerHeapCapacity / 2u) fail("shader sampler pairs exceed runtime heap capacity");
+        if (info.samplers.size() > RuntimeAbi::SamplerHeapCapacity / 2u) fail("shader sampler pairs exceed runtime heap capacity: " + std::to_string(info.samplers.size()) + " samplers, capacity " + std::to_string(RuntimeAbi::SamplerHeapCapacity / 2u));
         std::vector<std::uint32_t> resources(info.samplers.size() * 2u);
         for (std::uint32_t i = 0; i < resources.size(); i++) {
             resources[i] = i / 2u;

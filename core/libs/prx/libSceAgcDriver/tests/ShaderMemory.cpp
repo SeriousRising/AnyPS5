@@ -3315,6 +3315,8 @@ void verifyLogicalImageSpecialization() {
     userData[1] = static_cast<std::uint32_t>(address >> 32u);
     const std::array memory{MemoryRegion{address, std::as_bytes(std::span{table})}};
     request.context.memory = memory;
+    const auto single = Recompile(request);
+    require(std::ranges::count_if(single.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::GuestImages && binding.count == Count; }) == 1, "sampled images of one format did not share one typed heap");
     constexpr std::array formats{22u, 20u, 21u};
     for (std::uint32_t image = 0u; image < Count; ++image) table[image][1] = (formats[image / PerFormat] << 20u) | (3u << 30u);
     const auto result = Recompile(request);
