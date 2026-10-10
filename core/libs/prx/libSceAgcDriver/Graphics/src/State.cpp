@@ -216,6 +216,9 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     Require(!stencil || stencilReadOnly || base(0x015, 0x01d) == depth.stencilAddress, "stencil read and written at different addresses is unsupported");
     const auto size = read(cx, 0x007);
     depth.extent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
+    depth.slice = view & 0x1fffu;
+    depth.htileAddress = (read(cx, 0x010) & 0x20000000u) != 0 && find(cx, 0x005) != cx.end() ? base(0x005, 0x01e) : 0;
+    depth.htileStencil = stencil && (read(cx, 0x011) & 0x20000000u) == 0;
     if (const auto slice = view & 0x1fffu; slice != 0) {
         if (depth.address != 0) depth.address += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, zFormat == 1 ? 2u : 4u);
         if (depth.stencilAddress != 0) depth.stencilAddress += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, 1u);

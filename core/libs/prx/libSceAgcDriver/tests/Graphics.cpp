@@ -1,5 +1,6 @@
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -701,6 +702,8 @@ void DepthStencilTests() {
     auto queue = makeState();
     queue.context[0x000] = 0;
     queue.context[0x002] = 0;
+    queue.context[0x005] = 0x300;
+    queue.context[0x01e] = 1;
     queue.context[0x007] = (1u << 16u) | 3u;
     queue.context[0x00a] = 7;
     queue.context[0x00b] = 0;
@@ -721,7 +724,8 @@ void DepthStencilTests() {
     queue.context[0x1b4] = 2;
     const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
     Require(rejection.empty(), "precheck rejected a stencil draw with a surface: " + rejection);
-    Require(state.depth && state.depth->address == 0x10000 && state.depth->stencilAddress == 0x20000 && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT && state.depth->clearStencil == 7, "depth surface decode changed");
+    Require(state.depth && state.depth->address == 0x10000 && state.depth->stencilAddress == 0x20000 && state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT && state.depth->clearStencil == 7 && state.depth->htileAddress == 0x10000030000ull && !state.depth->htileStencil && state.depth->slice == 0, "depth surface decode changed");
+    Require(AgcDriver::Graphics::DepthHtileSliceBytes({1920, 1080}) == 0x30000 && AgcDriver::Graphics::DepthHtileSliceBytes({64, 32}) == 0x8000 && AgcDriver::Graphics::DepthHtileSliceBytes({2048, 2048}) == 0x40000, "an HTILE slice does not span whole 1024x512 metablocks");
     Require(state.renderExtent.width == 4 && state.renderExtent.height == 2, "render extent ignores the depth surface");
     Require(!state.depthTest && !state.depthWrite && state.stencilTest, "depth/stencil enables changed");
     const auto& front = state.stencilFront;

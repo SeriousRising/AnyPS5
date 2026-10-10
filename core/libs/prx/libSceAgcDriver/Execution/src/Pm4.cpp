@@ -597,6 +597,11 @@ std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet
     return MemoryCopy{source, destination, bytes};
 }
 
+std::optional<MemoryFill> DecodeMemoryFill(std::span<const std::uint32_t> packet) {
+    if (packet.size() != 7 || ((packet[0] >> 8u) & 0xffu) != 0x50 || dmaSource(packet) != 2 || !memorySelector(dmaDestination(packet))) return std::nullopt;
+    return MemoryFill{address(packet[4], packet[5]), packet[6] & 0x3ffffffu, packet[2]};
+}
+
 bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet) {
     require(!packet.empty() && ((packet[0] >> 8u) & 0xffu) == 0x58, "cache barrier requires ACQUIRE_MEM");
     Validate(packet, 0);

@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -136,6 +137,20 @@ public:
         recorder->Keep(storage);
     }
 
+    void Clear(VkImageAspectFlags aspects, VkClearDepthStencilValue value) const {
+        constexpr VkAccessFlags every = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        auto* recorder = Recorder::Active();
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, every, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, every);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    }
+
     bool Stencil(const GuestTextureResource& resource) const {
         return target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
     }
@@ -158,7 +173,11 @@ public:
     }
 
     const Context context;
-    const DepthTarget target;
+    // The identity (sameSurface) never changes; the HTILE and the clear values are those of the
+    // draw that bound the surface last.
+    DepthTarget target;
+    // The planes a fill of the surface's HTILE marked cleared and that the image does not show yet.
+    VkImageAspectFlags cleared = 0;
     // The depth plane's contents are in the storage image of `storage` (a shader stores to it)
     // until a draw or a sampled read of the surface takes them back.
     bool handedOff = false;
@@ -191,6 +210,19 @@ void takeBack(const std::shared_ptr<DepthSurface>& surface) {
     std::lock_guard lock(surfacesMutex());
     surface->handedOff = false;
     ++surface->version;
+}
+
+// The clear a fill of the HTILE asked for, with the clear values of the registers as they are when
+// the surface is next used: the hardware expands a cleared tile from those, not from the HTILE.
+void settle(const std::shared_ptr<DepthSurface>& surface) {
+    VkImageAspectFlags aspects = 0;
+    VkClearDepthStencilValue value{};
+    {
+        std::lock_guard lock(surfacesMutex());
+        aspects = std::exchange(surface->cleared, 0u);
+        value = {surface->target.clearDepth, surface->target.clearStencil};
+    }
+    if (aspects != 0) surface->Clear(aspects, value);
 }
 
 // A sampled copy of the depth planes that a 2D array T# views: a depth target is one slice of the
@@ -353,6 +385,7 @@ std::shared_ptr<Texture> arrayTexture(const Context& context, std::span<const st
         }
     }
     for (const auto& [slice, surface] : slices) {
+        settle(surface);
         if (surface->handedOff) takeBack(surface);
         std::lock_guard lock(surfacesMutex());
         const auto layer = slice - resource.baseArray;
@@ -402,11 +435,42 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
             surfaces().push_back(std::make_shared<DepthSurface>(context, target));
             return surfaces().back()->view;
         }
+        found->target = target;
         ++found->version;
-        if (!found->handedOff) return found->view;
     }
-    takeBack(found);
+    settle(found);
+    if (found->handedOff) takeBack(found);
     return found->view;
+}
+
+std::uint64_t DepthHtileSliceBytes(VkExtent2D extent) {
+    return static_cast<std::uint64_t>((extent.width + 1023u) / 1024u) * ((extent.height + 511u) / 512u) * 0x8000u;
+}
+
+void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        const auto& target = surface->target;
+        if (target.htileAddress == 0) continue;
+        const auto sliceBytes = DepthHtileSliceBytes(target.extent);
+        const auto first = target.htileAddress + target.slice * sliceBytes;
+        if (address >= first + sliceBytes || first >= address + bytes) continue;
+        const bool uniform = pattern[1] == pattern[0] && pattern[2] == pattern[0] && pattern[3] == pattern[0];
+        const bool whole = address <= first && address + bytes >= first + sliceBytes;
+        if (whole && uniform && (pattern[0] & 0xfu) == 0) {
+            surface->cleared |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (target.htileStencil && target.stencilAddress != 0 && (pattern[0] & 0x300u) == 0) surface->cleared |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            surface->handedOff = false;
+            ++surface->version;
+            continue;
+        }
+        static unsigned reported = 0;
+        if (reported < 16) {
+            ++reported;
+            std::fprintf(stderr, "[gpu] fill 0x%llx+0x%zx with %08x %08x %08x %08x of the HTILE 0x%llx+0x%llx of depth surface 0x%llx (%ux%u, slice %u) is ignored: %s\n", static_cast<unsigned long long>(address), bytes, pattern[0], pattern[1], pattern[2], pattern[3], static_cast<unsigned long long>(first), static_cast<unsigned long long>(sliceBytes),
+                         static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, target.slice, !whole ? "it does not cover the slice's tiles" : !uniform ? "its words differ" : "its ZMASK does not say cleared, so the depth is unchanged");
+        }
+    }
 }
 
 void ClearDepthSurfaces(VkDevice device) {
@@ -436,10 +500,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         }
         if (Recorder::Active() == nullptr) retired().insert(retired().end(), reused.begin(), reused.end());
         const auto found = std::find_if(list.rbegin(), list.rend(), at);
-        if (found != list.rend()) {
-            surface = *found;
-            if (!surface->handedOff || surface->Stencil(resource)) return surface->Sampled(words, resource, components);
-        }
+        if (found != list.rend()) surface = *found;
     }
     for (auto& stale : reused) {
         static unsigned reported = 0;
@@ -450,7 +511,8 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Keep(std::move(stale));
     }
     if (surface == nullptr) return nullptr;
-    takeBack(surface);
+    settle(surface);
+    if (surface->handedOff && !surface->Stencil(resource)) takeBack(surface);
     std::lock_guard lock(surfacesMutex());
     return surface->Sampled(words, resource, components);
 }
@@ -490,6 +552,7 @@ void GiveDepthSurfacesTo(const Context& context, std::span<const std::uint32_t> 
         if (Recorder::Active() == nullptr) retired().insert(retired().end(), reused.begin(), reused.end());
     }
     if (live != nullptr) {
+        settle(live);
         live->CopyDepth(storage, true);
         std::lock_guard lock(surfacesMutex());
         live->handedOff = true;
