@@ -33,6 +33,16 @@ set_target_properties(video_out_flip_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(video_out_flip_tests)
 
 if(BUILD_TESTING)
+    set_target_properties(video_out_flip_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME video_out_frames_in_flight COMMAND video_out_flip_tests inflight)
+    set_tests_properties(video_out_frames_in_flight PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(video_out_frames_in_flight PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
     add_test_executable(pad_sdl_tests tests/PadSdl.cpp)
     target_link_libraries(pad_sdl_tests PRIVATE SDL2-static)
     add_test(NAME pad_sdl COMMAND pad_sdl_tests)

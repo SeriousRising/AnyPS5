@@ -74,6 +74,10 @@ SDL and FreeType settings forced by the root `CMakeLists.txt` cannot be overridd
 
 Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newly created graphics or compute pipeline. This requires `VK_KHR_pipeline_executable_properties` and `pipelineExecutableInfo`; an unsupported device fails with an error. Statistic names and units are driver-specific. Capturing statistics can increase pipeline compilation cost. The setting is disabled by default.
 
+## Frames in flight
+
+A submission that carries a flip waits on the submitting thread while `APS5_FRAMES_IN_FLIGHT` earlier flips (default 1, at most 16) have not completed; a flip completes when the GPU work submitted before it and its presentation are done. This keeps a title from rewriting a frame's memory while the GPU work that reads it is still queued. `sceVideoOutIsFlipPending` therefore reports at most that many flips, and `sceVideoOutSubmitFlip` waits instead of returning `VIDEO_OUT_ERROR_FLIP_QUEUE_FULL` unless the value is 16. A larger value lets the title prepare more frames ahead of the GPU.
+
 ## Shader recompiler
 
 The shader recompilation logic in [core/shader/recompiler](../../core/shader/recompiler) is isolated from the rest of the project and is a pure function of its input data, designed for integration into any other project. The current CMake target also includes cache support and links a supplied runtime target, glslang, and optionally SPIRV-Tools.
