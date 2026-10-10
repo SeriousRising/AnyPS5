@@ -615,7 +615,7 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             volume.dimension = RdnaImageDimension::Dim3D;
             modes.push_back(volume);
         }
-        if (image.dimension == RdnaImageDimension::Dim2D && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u && !image.atomic && (storage || image.fmaskCompatible)) {
+        if (image.dimension == RdnaImageDimension::Dim2D && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u && !image.atomic && !image.depthCompare && image.oneDimensionalCompatible) {
             auto line = mode;
             line.dimension = RdnaImageDimension::Dim1D;
             modes.push_back(line);
