@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -193,7 +194,7 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
 }
 
 void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result) {
-    zero(cx, 0x000, 0x00001f9fu, "depth/stencil clear, copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
+    zero(cx, 0x000, 0x00001f8fu, "depth/stencil clear, copy or decompress draws (DB_RENDER_CONTROL)");
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
     zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
@@ -475,13 +476,17 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
 
 std::string DepthMaintenanceRejection(const QueueState& queue) {
     const auto control = find(queue.context, 0x000);
-    if (control == queue.context.end() || (control->second & ~0x2063u) == 0) return {};
-    return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth copy, resummarize or decompress");
+    if (control == queue.context.end() || (control->second & ~0x2073u) == 0) return {};
+    return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth copy or decompress");
 }
 
 State DecodeState(const QueueState& queue) {
     if (auto reason = DepthMaintenanceRejection(queue); !reason.empty()) throw std::runtime_error(reason);
     const auto& cx = queue.context;
+    if (const auto control = find(cx, 0x000); control != cx.end() && (control->second & 0x10u) != 0) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] DB_RENDER_CONTROL RESUMMARIZE_ENABLE is ignored: no hierarchical depth is kept, and the draw runs with its other state\n");
+    }
     State result{};
     result.conservativeRasterization = decodeConservativeRasterization(queue);
     result.stages = DecodeShaderStages(queue);
