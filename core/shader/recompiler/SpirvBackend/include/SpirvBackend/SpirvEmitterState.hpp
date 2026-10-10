@@ -104,6 +104,7 @@ struct SpirvEmitterState {
     std::vector<std::uint32_t> memoryByteOffsets;
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
+    std::uint32_t bdaLookupFunction = 0;
     std::uint32_t bdaPointerFunction = 0;
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
     // every read takes the byte path.
@@ -113,6 +114,7 @@ struct SpirvEmitterState {
     std::uint32_t bdaNoteWriteFunction = 0;
     std::uint32_t bdaFaultFunction = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
+    std::array<std::array<std::uint32_t, 2>, 2> bdaProbedDwordReadFunctions {};
     std::uint32_t bdaStopValue = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;

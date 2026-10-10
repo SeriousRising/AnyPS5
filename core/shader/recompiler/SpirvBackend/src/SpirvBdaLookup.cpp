@@ -7,37 +7,30 @@ namespace ShaderRecompiler {
 
 namespace {
 
-void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
-    const auto failed = state.module.AllocateId();
-    const auto next = state.module.AllocateId();
-    state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
-    state.module.AddFunction(spv::OpBranchConditional, condition, failed, next);
-    EmitLabel(state, failed);
-    state.module.AddFunction(spv::OpReturnValue, BdaConstant(state, 0u));
-    EmitLabel(state, next);
-}
-
-// (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
-std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
+// (u64 address, u32 bytes, u32 permission) -> (u64 device address of the range holding all the bytes, u64 fault reason);
+// the address is 0 when the reason is not. It records nothing, so that each caller has one fault site.
+std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
+    const auto pair = state.module.Type(spv::OpTypeVector, u64, 2u);
     const auto boolean = TypeBool(state);
     const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
     const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto either = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalOr, boolean, left, right); };
     const auto load = [&](std::uint32_t pointer) {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, u32, value, pointer);
         return value;
     };
     const auto function = state.module.AllocateId();
-    state.module.AddName(function, name);
-    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    state.module.AddName(function, "lookup_bda");
+    state.module.AddFunction(spv::OpFunction, pair, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, pair, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
-    const auto instruction = state.module.AllocateId();
+    const auto permission = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionParameter, u64, address);
     state.module.AddFunction(spv::OpFunctionParameter, u32, bytes);
-    state.module.AddFunction(spv::OpFunctionParameter, u32, instruction);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, permission);
     EmitLabel(state, state.module.AllocateId());
     const auto low = state.module.AllocateId();
     const auto high = state.module.AllocateId();
@@ -45,25 +38,27 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpVariable, pointer, low, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, pointer, high, spv::StorageClassFunction);
     const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
-        if (recordFaults) {
-            ReturnBdaFailureIf(state, condition, address, bytes, instruction, reason);
-        } else {
-            ReturnBdaZeroIf(state, condition);
-        }
+        const auto failed = state.module.AllocateId();
+        const auto next = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, condition, failed, next);
+        EmitLabel(state, failed);
+        state.module.AddFunction(spv::OpReturnValue, state.module.Constant(spv::OpConstantComposite, pair, BdaConstant(state, 0u), BdaConstant(state, static_cast<std::uint32_t>(reason))));
+        EmitLabel(state, next);
     };
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)), BdaAbi::FaultReason::InvalidTable);
     const auto count = BdaLoadWord(state, constant(1));
     const auto available = binary(spv::OpISub, u32, length, constant(4));
-    fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow);
+    auto invalid = binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version));
+    invalid = either(invalid, binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))));
+    invalid = either(invalid, binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)));
+    invalid = either(invalid, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)));
+    invalid = either(invalid, binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))));
+    fail(invalid, BdaAbi::FaultReason::InvalidTable);
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
-    fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
+    fail(either(binary(spv::OpIEqual, boolean, bytes, constant(0)), binary(spv::OpULessThanEqual, boolean, end, address)), BdaAbi::FaultReason::Overflow);
     state.module.AddFunction(spv::OpStore, low, constant(0));
     state.module.AddFunction(spv::OpStore, high, count);
     const auto header = state.module.AllocateId();
@@ -99,21 +94,57 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto finish = BdaLoadAddress(state, at(2));
     const auto base = BdaLoadAddress(state, at(4));
     const auto permissions = BdaLoadWord(state, at(6));
-    fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, at(7)), constant(0)), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpUGreaterThanEqual, boolean, begin, finish), BdaAbi::FaultReason::InvalidTable);
+    fail(either(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, at(7)), constant(0)), binary(spv::OpUGreaterThanEqual, boolean, begin, finish)), BdaAbi::FaultReason::InvalidTable);
     fail(binary(spv::OpUGreaterThan, boolean, end, finish), BdaAbi::FaultReason::Unmapped);
-    fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, constant(permission)), constant(permission)), BdaAbi::FaultReason::Permission);
+    fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, permission), permission), BdaAbi::FaultReason::Permission);
     fail(binary(spv::OpIEqual, boolean, base, BdaConstant(state, 0)), BdaAbi::FaultReason::InvalidTable);
     const auto offset = binary(spv::OpISub, u64, address, begin);
     const auto result = binary(spv::OpIAdd, u64, base, offset);
-    fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
-    fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
-    state.module.AddFunction(spv::OpReturnValue, result);
+    fail(either(binary(spv::OpULessThan, boolean, result, base), binary(spv::OpULessThanEqual, boolean, deviceEnd, result)), BdaAbi::FaultReason::Overflow);
+    const auto found = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, pair, found, result, BdaConstant(state, 0u));
+    state.module.AddFunction(spv::OpReturnValue, found);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
 }
 
+// (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
+std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, name);
+    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    const auto address = state.module.AllocateId();
+    const auto bytes = state.module.AllocateId();
+    const auto instruction = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, u64, address);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, bytes);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, instruction);
+    EmitLabel(state, state.module.AllocateId());
+    const auto looked = BdaLookup(state, address, bytes, permission);
+    if (recordFaults) {
+        EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), looked.reason, ConstantU32(state, 0u)), [&] {
+            state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, looked.reason, address, bytes, instruction);
+        });
+    }
+    state.module.AddFunction(spv::OpReturnValue, looked.address);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
+
+}
+
+BdaLookupResult BdaLookup(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission) {
+    const auto u64 = TypeScalarU64(state);
+    const auto looked = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVector, u64, 2u), looked, state.bdaLookupFunction, address, bytes, ConstantU32(state, permission));
+    const auto device = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, u64, device, looked, 0u);
+    const auto reason = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, u64, reason, looked, 1u);
+    return {device, Unary(state, spv::OpUConvert, TypeU32(state), reason)};
 }
 
 static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
@@ -159,6 +190,7 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (!state.program.Info().usesDma) return;
     DefineBdaFaultFunction(state);
+    state.bdaLookupFunction = DefineBdaLookupCore(state);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);

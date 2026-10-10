@@ -19,6 +19,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <functional>
 #include <map>
 #include <future>
 #include <memory>
@@ -1639,7 +1640,11 @@ void verifyBdaReadFallbackFunctions() {
             const auto five = compile(5u, barrier, coherent);
             std::map<std::uint32_t, std::string> names;
             std::map<std::string, std::uint32_t> definitions;
-            const auto reader = std::string("read_bda_dword_bytes") + (barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
+            const auto suffix = std::string(barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
+            const auto reader = "read_bda_dword_bytes" + suffix;
+            const auto probed = "read_bda_dword" + suffix;
+            std::size_t mainReads = 0;
+            std::array<std::size_t, 2> probedLoads{};
             std::string function;
             std::size_t compareExchanges = 0;
             std::size_t mainLookups = 0;
@@ -1651,24 +1656,101 @@ void verifyBdaReadFallbackFunctions() {
                 if (op == spv::OpName) names[five[cursor + 1]] = reinterpret_cast<const char*>(&five[cursor + 2]);
                 if (op == spv::OpFunction) {
                     function = names[five[cursor + 2]];
-                    if (function == "record_bda_fault" || function.starts_with("read_bda_dword_bytes")) {
+                    if (function == "record_bda_fault" || function.starts_with("read_bda_dword")) {
                         require((five[cursor + 3] & spv::FunctionControlDontInlineMask) != 0u, "BDA read functions: a fault or byte read function may be inlined");
                         ++definitions[function];
                     }
                 }
                 if (op == spv::OpAtomicCompareExchange) ++compareExchanges;
                 if (op == spv::OpFunctionCall && function == "main" && names[five[cursor + 3]] == "get_bda_pointer") ++mainLookups;
-                if (op == spv::OpLoad && function == reader) ++readerLoads[length > 4u && (five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
+                if (op == spv::OpFunctionCall && function == "main" && names[five[cursor + 3]] == probed) ++mainReads;
+                if (op == spv::OpLoad && length > 4u && function == reader) ++readerLoads[(five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
+                if (op == spv::OpLoad && length > 4u && function == probed) ++probedLoads[(five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
                 cursor += length;
             }
-            require(definitions["record_bda_fault"] == 1u && definitions[reader] == 1u, "BDA read functions: the fault and byte read functions are not defined");
+            require(definitions["record_bda_fault"] == 1u && definitions[reader] == 1u && definitions[probed] == 1u, "BDA read functions: the fault and dword read functions are not defined");
             for (const auto& [name, count] : definitions) require(count == 1u, "BDA read functions: a function is defined twice");
             require(compareExchanges == 1u, "BDA read functions: a fault is recorded outside record_bda_fault");
             require(mainLookups == 0u, "BDA read functions: a read site looks up its bytes inline");
-            require(readerLoads[coherent] == 4u && readerLoads[!coherent] == 0u, "BDA read functions: the byte loads do not keep the access's coherence");
+            require(mainReads == 5u, "BDA read functions: a read site does not call the dword read function once");
+            require(readerLoads[coherent] == 1u && readerLoads[!coherent] == 0u && probedLoads[coherent] == 2u && probedLoads[!coherent] == 0u, "BDA read functions: the dword and byte loads do not keep the access's coherence");
             require(five.size() - one.size() < 4u * 300u, "BDA read functions: a read site takes 300 SPIR-V words or more");
         }
     }
+}
+
+void verifyBdaInlinedSize() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Reads = 1000u;
+    constexpr std::uint64_t InlinedBefore = 3379957u;
+    const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const std::array<std::uint32_t, 12> userData{0x10000000u, 0u, 0x20000000u, 0u, 0x30000000u, 0u, 128u, 0x01016facu, 0x40000000u, 0u, 0x50000000u, 0u};
+    constexpr std::array<std::uint32_t, 4> bases{0u, 2u, 8u, 10u};
+    std::vector<std::uint32_t> code{0x7e120280u};
+    for (std::uint32_t base = 0; base < bases.size(); ++base) {
+        code.push_back(0x7e000200u | ((1u + 2u * base) << 17u) | bases[base]);
+        code.push_back(0x7e000200u | ((2u + 2u * base) << 17u) | (bases[base] + 1u));
+    }
+    for (std::uint32_t read = 0; read < Reads; ++read) {
+        const auto base = read % 7u == 0u ? 0u : read % bases.size();
+        const auto offset = read % 5u == 0u ? 48u : 4u * (read % 61u);
+        code.insert(code.end(), {0xdc308000u | offset, 0x0a7d0000u | (1u + 2u * base), 0xbf8c3f70u, 0x4a121509u});
+    }
+    code.insert(code.end(), {0xe0700000u, 0x80010900u, 0xbf810000u});
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x60000u, code, 0, {}};
+    request.context.waveSize = 32;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    const auto words = Recompile(request).spirv;
+    struct Function {
+        std::uint64_t instructions = 0;
+        std::vector<std::uint32_t> calls;
+    };
+    std::map<std::uint32_t, Function> functions;
+    std::map<std::uint32_t, std::string> names;
+    std::uint32_t current = 0u;
+    std::uint32_t entry = 0u;
+    std::size_t readSites = 0;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto length = words[cursor] >> 16u;
+        require(length != 0 && length <= words.size() - cursor, "BDA inlined size: truncated SPIR-V instruction");
+        const auto op = words[cursor] & 0xffffu;
+        if (op == spv::OpName) names[words[cursor + 1]] = reinterpret_cast<const char*>(&words[cursor + 2]);
+        if (op == spv::OpEntryPoint) entry = words[cursor + 2];
+        if (op == spv::OpFunction) current = words[cursor + 2];
+        if (current != 0u) {
+            ++functions[current].instructions;
+            if (op == spv::OpFunctionCall) {
+                functions[current].calls.push_back(words[cursor + 3]);
+                if (current == entry && names[words[cursor + 3]].starts_with("read_bda_dword")) ++readSites;
+            }
+        }
+        if (op == spv::OpFunctionEnd) current = 0u;
+        cursor += length;
+    }
+    std::map<std::uint32_t, std::uint64_t> inlined;
+    const std::function<std::uint64_t(std::uint32_t)> measure = [&](std::uint32_t function) {
+        if (const auto found = inlined.find(function); found != inlined.end()) return found->second;
+        auto total = functions.at(function).instructions;
+        for (const auto callee : functions.at(function).calls) total += measure(callee);
+        inlined[function] = total;
+        return total;
+    };
+    const auto total = measure(entry);
+    require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
+    require(total * 8u <= InlinedBefore, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than an eighth of the " + std::to_string(InlinedBefore) + " they took").c_str());
 }
 
 void verifyFunctionLdsBound() {
@@ -1843,6 +1925,7 @@ int main(int argc, char** argv) {
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();
+        verifyBdaInlinedSize();
         verifyFunctionLdsBound();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
