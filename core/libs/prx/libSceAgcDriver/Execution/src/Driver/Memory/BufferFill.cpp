@@ -2,6 +2,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -160,6 +161,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         }
         phase(FillClearPhase);
         fillClearCount(coverage, bytes, pattern, discarded, cleared, refusal);
+        Graphics::NoteDepthMetadataFill(base, bytes, pattern);
         noteForeignWriter(base, base + bytes, queueId);
 
         if (!cleared) {

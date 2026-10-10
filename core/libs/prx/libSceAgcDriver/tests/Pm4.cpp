@@ -377,6 +377,9 @@ void testMemoryCopyDecode() {
     check(copy.has_value() && copy->source == source && copy->destination == destination && copy->bytes == 0xbdd800, "a memory-to-memory DMA_DATA did not decode as a copy");
     check(DecodeMemoryCopy(packet(0x00000000, source, destination, 64)).has_value(), "a DMA_DATA with memory selectors 0 did not decode as a copy");
     check(!DecodeMemoryCopy(packet(0x40000000, 0x44332211, destination, 64)).has_value(), "an immediate fill decoded as a copy");
+    const auto fill = AgcDriver::Pm4::DecodeMemoryFill(packet(0x40000000, 0xfffffff0, destination, 0x30000));
+    check(fill.has_value() && fill->destination == destination && fill->bytes == 0x30000 && fill->word == 0xfffffff0u, "an immediate DMA_DATA did not decode as a fill");
+    check(!AgcDriver::Pm4::DecodeMemoryFill(packet(0x60000000, source, destination, 64)).has_value() && !AgcDriver::Pm4::DecodeMemoryFill(packet(0x40100000, 0, 0x100, 64)).has_value(), "a copy or a fill of the GDS decoded as a memory fill");
     check(!DecodeMemoryCopy(packet(0x60100000, source, 0x100, 64)).has_value(), "a DMA_DATA to the GDS decoded as a copy");
     check(!DecodeMemoryCopy(packet(0x20000000, 0x100, destination, 64)).has_value(), "a DMA_DATA from the GDS decoded as a copy");
     check(!DecodeMemoryCopy(packet(0x60000000, source, destination, 64 | (1u << 26u))).has_value(), "a register source decoded as a copy");

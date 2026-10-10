@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -95,6 +97,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             ++labelFallbacks[4];
         }
     }
+
+    if (const auto fill = Pm4::DecodeMemoryFill(packet); fill.has_value() && fill->bytes != 0) Graphics::NoteDepthMetadataFill(fill->destination, fill->bytes, std::array<std::uint32_t, 4>{fill->word, fill->word, fill->word, fill->word});
 
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
