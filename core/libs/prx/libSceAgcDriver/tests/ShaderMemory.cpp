@@ -2560,7 +2560,8 @@ void verifyLogicalImageSpecialization() {
         require(ids.contains(PipelineSpecialization::DescriptorIndex(RuntimeAbi::FirstStorageImageBinding + 3u, (count - 1u) * RuntimeAbi::StorageMipSlots)), "logical boundary module lost its last resource");
         require(artifact.runtimeImageCount == 0u, "direct logical slots allocated runtime metadata");
     }
-    constexpr std::uint32_t Count = RuntimeAbi::SampledHeapCapacity * 3u;
+    constexpr std::uint32_t PerFormat = 16u;
+    constexpr std::uint32_t Count = PerFormat * 3u;
     std::vector<std::uint32_t> code{0x7e3c0280u, 0x7e3e0280u};
     for (std::uint32_t image = 0u; image < Count; ++image) code.insert(code.end(), {0xf40c0200u, 0xfa000000u | (image * 32u), 0xf0001108u, 0x00020a1eu, 0xe0700000u | (image * 4u), 0x80010a00u});
     code.push_back(0xbf810000u);
@@ -2577,15 +2578,16 @@ void verifyLogicalImageSpecialization() {
     userData[1] = static_cast<std::uint32_t>(address >> 32u);
     const std::array memory{MemoryRegion{address, std::as_bytes(std::span{table})}};
     request.context.memory = memory;
-    expectFailure([&] { static_cast<void>(Recompile(request)); }, "heap capacity exceeded", "oversized compact sampled heap was accepted");
+    const auto single = Recompile(request);
+    require(std::ranges::count_if(single.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::GuestImages && binding.count == Count; }) == 1, "sampled images of one format did not share one typed heap");
     constexpr std::array formats{22u, 20u, 21u};
-    for (std::uint32_t image = 0u; image < Count; ++image) table[image][1] = (formats[image / RuntimeAbi::SampledHeapCapacity] << 20u) | (3u << 30u);
+    for (std::uint32_t image = 0u; image < Count; ++image) table[image][1] = (formats[image / PerFormat] << 20u) | (3u << 30u);
     const auto result = Recompile(request);
     require(result.cacheHit && result.variantId == artifact.variantId, "runtime sampled formats changed the static artifact");
     std::uint32_t heaps = 0u;
     for (const auto& binding : result.bindings) {
         if (binding.role != DescriptorRole::GuestImages) continue;
-        require(binding.count == RuntimeAbi::SampledHeapCapacity, "runtime sampled formats did not compact into complete typed heaps");
+        require(binding.count == PerFormat, "runtime sampled formats did not compact into complete typed heaps");
         ++heaps;
     }
     require(heaps == 3u, "runtime sampled formats lost a typed heap");

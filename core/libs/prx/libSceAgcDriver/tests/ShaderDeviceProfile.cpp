@@ -287,7 +287,7 @@ void CheckCompact(std::uint32_t count, bool storage, bool array) {
     Require(decoded.bindings.layout == allocation.layout && decoded.info.info == info, "disk cache lost the logical mapping");
 }
 
-void CheckPhysicalRejections() {
+void CheckLargePhysicalHeaps() {
     using namespace ShaderRecompiler;
     for (const bool storage : {false, true}) {
         IrProgram program;
@@ -298,7 +298,8 @@ void CheckPhysicalRejections() {
         ResourceSnapshot snapshot;
         for (std::uint32_t index = 0u; index < info.images.size(); ++index) snapshot.images.push_back(HeapDescriptor(index, false, false, storage ? 4u : 1u));
         const auto allocation = BindingAllocator{}.Allocate(program, {0u, 0u, 0u, 128u});
-        Reject([&] { DescriptorBindingBuilder{}.Prepare(allocation.layout, info, IrShaderStage::Compute, snapshot); }, "heap capacity exceeded");
+        const auto plan = DescriptorBindingBuilder{}.Prepare(allocation.layout, info, IrShaderStage::Compute, snapshot);
+        Require(plan.bindings.size() == 1u && plan.bindings.front().descriptor.count == (storage ? 20u : 17u), "a typed heap past sixteen descriptors was not kept whole");
     }
 }
 
@@ -320,7 +321,7 @@ int main() {
         CheckCompact(17u, false, false);
         CheckCompact(33u, true, true);
         CheckCompact(64u, true, true);
-        CheckPhysicalRejections();
+        CheckLargePhysicalHeaps();
         CheckRanges();
         CheckProfile();
         std::cout << "shader runtime ABI and device profile tests passed\n";
