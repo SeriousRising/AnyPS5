@@ -615,10 +615,10 @@ std::vector<ImageResource> ResourceMaterializer::RuntimeImageModes(const ImageRe
             volume.dimension = RdnaImageDimension::Dim3D;
             modes.push_back(volume);
         }
-        if (image.dimension == RdnaImageDimension::Dim2D && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u && !image.atomic && !image.depthCompare && image.oneDimensionalCompatible) {
-            auto line = mode;
-            line.dimension = RdnaImageDimension::Dim1D;
-            modes.push_back(line);
+        if ((image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim3D) && !depth && packed == IrBufferFormat::Invalid && image.byElements == 0u && !image.atomic && !image.depthCompare && image.narrowViewCompatible) {
+            auto narrow = mode;
+            narrow.dimension = image.dimension == RdnaImageDimension::Dim2D ? RdnaImageDimension::Dim1D : RdnaImageDimension::Dim2D;
+            modes.push_back(narrow);
         }
         if (image.dimension == RdnaImageDimension::Dim1DArray || image.dimension == RdnaImageDimension::Dim2DArray || image.dimension == RdnaImageDimension::Dim2DMsaaArray) {
             auto plain = mode;
@@ -719,6 +719,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
         }
     }
     if (decoded.mipCount > (image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageHeapCapacity : 1u)) throw std::runtime_error("runtime storage image mip capacity exceeded");
+    if (image.dimension == RdnaImageDimension::Dim3D && decoded.dimension == RdnaImageDimension::Dim2D && rawImageType(descriptor) != ImageType::Color2D) throw std::runtime_error("a 3D image address on a 2D array texture is not implemented");
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         const auto& mode = modes[index];
         if (((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u) != emulated) continue;
