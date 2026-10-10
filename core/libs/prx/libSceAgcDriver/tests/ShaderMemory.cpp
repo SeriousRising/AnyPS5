@@ -671,12 +671,14 @@ void verifyInactiveSrtReads() {
         std::vector<std::uint64_t> addresses;
         std::vector<std::uint64_t> cleanAddresses;
         std::uint32_t selector = 0u;
+        bool changeSelector = false;
     };
     const auto read = +[](void* context, std::uint64_t address, std::uint32_t* value) {
         auto& reads = *static_cast<Reads*>(context);
         reads.addresses.push_back(address);
         if (address != PayloadAddress && address != SelectorAddress) throw std::runtime_error("inactive SRT read requested inaccessible memory");
         *value = address == SelectorAddress ? reads.selector : Payload;
+        if (address == SelectorAddress && reads.changeSelector) reads.selector ^= 1u;
         return true;
     };
     std::array<std::uint32_t, 13> users{};
@@ -735,19 +737,49 @@ void verifyInactiveSrtReads() {
             require(std::ranges::find(conservative.addresses, 0u) != conservative.addresses.end(), "an unknown SRT branch was skipped");
             std::vector<std::uint32_t> memoryCondition{0xf4000303u, 0xfa000000u, 0xbf8cc07fu};
             memoryCondition.insert(memoryCondition.end(), code.begin(), code.end());
-            auto dirty = request;
-            dirty.shader.code = memoryCondition;
+            auto flatCondition = request;
+            flatCondition.shader.code = memoryCondition;
             users[6] = static_cast<std::uint32_t>(SelectorAddress);
-            Reads dirtyReads;
-            dirtyReads.selector = selector;
-            runtime.userContext = &dirtyReads;
+            Reads selectorReads;
+            selectorReads.selector = selector;
+            selectorReads.changeSelector = true;
+            runtime.userContext = &selectorReads;
             runtime.readSpecializationMemory = +[](void* context, std::uint64_t address, std::uint32_t*) {
                 static_cast<Reads*>(context)->cleanAddresses.push_back(address);
                 return false;
             };
-            expectFailure([&] { static_cast<void>(CaptureResources(dirty, runtime)); }, "inaccessible memory", "a dirty SRT condition accepted an invalid pointer");
-            require(std::ranges::find(dirtyReads.addresses, 0u) != dirtyReads.addresses.end(), "a dirty SRT condition pruned an unknown branch");
+            try {
+                const auto capture = CaptureResources(flatCondition, runtime);
+                require(selectorReads.addresses == std::vector<std::uint64_t>{SelectorAddress, PayloadAddress}, "a flat-backed guard read inactive or repeated memory");
+                require(selectorReads.cleanAddresses.empty(), "a runtime flat-backed guard used specialization memory");
+                require(capture->snapshot.flattenedSrt.size() == 3u && capture->snapshot.flattenedSrt[0] == selector, "the flat-backed guard lost its captured selector");
+                require(std::ranges::count(capture->snapshot.flattenedSrt, Payload) == 1, "the flat-backed guard lost its selected payload");
+                auto duplicateCode = memoryCondition;
+                duplicateCode[10] = 0xf4000484u;
+                auto duplicate = flatCondition;
+                duplicate.shader.code = duplicateCode;
+                auto duplicateUsers = users;
+                duplicateUsers[8] = static_cast<std::uint32_t>(PayloadAddress);
+                duplicateUsers[10] = 0u;
+                duplicate.context.userData = duplicateUsers;
+                Reads duplicateReads;
+                duplicateReads.selector = selector;
+                runtime.userData = duplicateUsers;
+                runtime.userContext = &duplicateReads;
+                const auto duplicateCapture = CaptureResources(duplicate, runtime);
+                require(duplicateReads.addresses == std::vector<std::uint64_t>{SelectorAddress, PayloadAddress}, "a flat-backed guard lost equivalent read ownership");
+                require(duplicateCapture->snapshot.flattenedSrt == std::vector<std::uint32_t>{selector, Payload}, "a flat-backed guard lost equivalent read values");
+            } catch (const std::runtime_error& error) {
+                ++failures;
+                std::cerr << "flat-backed SRT " << (inverted ? "SCC0" : "SCC1") << " selector " << selector << ": " << error.what() << '\n';
+            }
+            runtime.userData = users;
             users[6] = 0u;
+            Reads invalidSelector;
+            runtime.userContext = &invalidSelector;
+            runtime.readSpecializationMemory = read;
+            expectFailure([&] { static_cast<void>(CaptureResources(flatCondition, runtime)); }, "inaccessible memory", "a required flat-backed selector accepted an invalid pointer");
+            require(invalidSelector.addresses == std::vector<std::uint64_t>{0u}, "a required flat-backed selector was not read first");
             users[8] = 0u;
             users[10] = 0u;
             Reads invalid;
@@ -764,7 +796,7 @@ void verifyInactiveSrtReads() {
     SrtRuntime runtime{users, unconditional.shader.codeAddress, read, &invalid, read};
     expectFailure([&] { static_cast<void>(CaptureResources(unconditional, runtime)); }, "inaccessible memory", "an unconditional SRT load accepted an invalid pointer");
     require(invalid.addresses == std::vector<std::uint64_t>{0u}, "the unconditional invalid pointer was not read");
-    require(failures == 0u, "clean uniform branches dereferenced inactive SRT pointers");
+    require(failures == 0u, "uniform branches dereferenced inactive SRT pointers");
 }
 
 void verifyInactiveSrtDependencies() {
@@ -846,6 +878,150 @@ void verifyInactiveSrtDependencies() {
             }
         }
     }
+}
+
+void verifyFlatBackedSrtConditions() {
+    using namespace ShaderRecompiler;
+    enum class Guard { Flat, FlatLane, ActivePointer, SharedDag, Raw, Unplanned, GpuTail, Cycle, InvalidSlot, FailedRead, GpuMask, FalseMask, MemoryFreeGpuMask, FlatMask, MixedRaw };
+    std::uint32_t failures = 0u;
+    for (const auto mode : {Guard::Flat, Guard::FlatLane, Guard::ActivePointer, Guard::SharedDag, Guard::Raw, Guard::Unplanned, Guard::GpuTail, Guard::Cycle, Guard::InvalidSlot, Guard::FailedRead, Guard::GpuMask, Guard::FalseMask, Guard::MemoryFreeGpuMask, Guard::FlatMask, Guard::MixedRaw}) {
+        for (const auto cleanMask : {0u, 1u, 2u, 3u}) {
+            for (const bool nested : {false, true}) {
+                IrResourcePlan plan;
+                plan.srtPlanComplete = true;
+                MemoryInfo memory;
+                memory.kind = ResourceKind::ScalarAddress;
+                plan.memoryInfo.push_back(memory);
+                std::uint32_t next = 0;
+                const auto make = [&](IrOpcode op, IrType type, std::initializer_list<IrValue*> args = {}) -> IrValue& {
+                    plan.valueStorage.push_back(std::make_unique<IrValue>(op, type, next++));
+                    auto& value = *plan.valueStorage.back();
+                    for (auto* arg : args) value.AddArgument(arg);
+                    return value;
+                };
+                const auto constant = [&](std::uint32_t word) -> IrValue& {
+                    auto& value = make(IrOpcode::Void, IrType::U32);
+                    value.SetImmediateU32(word);
+                    return value;
+                };
+                auto& zero = constant(0u);
+                auto& one = constant(1u);
+                auto& srt = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+                const auto rawRead = [&](IrValue& low) -> IrValue& {
+                    auto& address = make(IrOpcode::GetAddressResource, IrType::AddressResource, {&low, &zero});
+                    auto& raw = make(IrOpcode::LoadAddressU32, IrType::U32, {&address, &zero});
+                    raw.SetFlags(MemoryFlags{0, 0});
+                    return raw;
+                };
+                auto& pointer = rawRead(constant(0x100000u));
+                auto& pointerFlat = make(IrOpcode::ReadConst, IrType::U32, {&srt, &zero});
+                auto& activeLane = make(IrOpcode::Void, IrType::Bool);
+                activeLane.SetImmediateBool(true);
+                IrValue* low = mode == Guard::Unplanned ? &rawRead(constant(0x140000u)) : &pointerFlat;
+                if (nested && mode != Guard::Cycle) low = &make(IrOpcode::ReadFirstLane, IrType::U32, {low, &activeLane});
+                auto& selector = rawRead(*low);
+                auto& selectorFlat = make(IrOpcode::ReadConst, IrType::U32, {&srt, &one});
+                auto& payload = rawRead(constant(0x130000u));
+                auto& invalid = rawRead(zero);
+                plan.srtReads = {{&pointer, 0u}, {&selector, 1u}, {&payload, 2u}, {&invalid, 3u}};
+                IrValue* guard = mode == Guard::Raw || mode == Guard::MixedRaw ? &selector : &selectorFlat;
+                if (mode == Guard::FlatLane) guard = &make(IrOpcode::ReadFirstLane, IrType::U32, {guard, &activeLane});
+                if (mode == Guard::SharedDag) {
+                    for (std::uint32_t depth = 0u; depth < 48u; ++depth) guard = &make(IrOpcode::IAdd32, IrType::U32, {guard, guard});
+                }
+                if (mode == Guard::Cycle) pointer.ReplaceArgument(0, &make(IrOpcode::GetAddressResource, IrType::AddressResource, {&selectorFlat, &zero}));
+                if (mode == Guard::InvalidSlot) selectorFlat.ReplaceArgument(1, &constant(99u));
+                const auto selectorWord = (cleanMask & 2u) != 0u ? 0u : 1u;
+                if (mode >= Guard::GpuMask && mode <= Guard::FlatMask) {
+                    auto& mask = mode == Guard::FalseMask ? make(IrOpcode::Void, IrType::Bool) : mode == Guard::FlatMask ? make(IrOpcode::INotEqual32, IrType::Bool, {&selectorFlat, &zero}) : make(IrOpcode::GetBuiltin, IrType::Bool);
+                    if (mode == Guard::FalseMask) mask.SetImmediateBool(false);
+                    auto& value = mode == Guard::MemoryFreeGpuMask ? one : make(IrOpcode::SelectU32, IrType::U32, {&mask, &selectorFlat, &constant(selectorWord ^ 1u)});
+                    guard = &make(IrOpcode::ReadFirstLane, IrType::U32, {&value, &mask});
+                    require(SrtWalker{}.ValidateRuntimeValue(plan, guard), "the conservative ReadFirstLane control did not reach the permissive validator seam");
+                }
+                auto& expectedSelector = constant(mode == Guard::SharedDag ? 0u : mode == Guard::Raw ? 1u : selectorWord);
+                auto& equal = make(IrOpcode::IEqual32, IrType::Bool, {guard, mode == Guard::MixedRaw ? &one : &expectedSelector});
+                auto& repeated = make(IrOpcode::IEqual32, IrType::Bool, {&selectorFlat, &expectedSelector});
+                auto& condition = make(IrOpcode::LogicalAnd, IrType::Bool, {mode == Guard::MixedRaw ? &repeated : &equal, mode == Guard::GpuTail ? &make(IrOpcode::GetBuiltin, IrType::Bool) : mode == Guard::MixedRaw ? &equal : &repeated});
+                const bool conservative = mode == Guard::Raw || mode == Guard::Unplanned || mode == Guard::GpuTail || mode >= Guard::GpuMask;
+                plan.controlFlow = {{mode == Guard::Raw || mode == Guard::MemoryFreeGpuMask || mode == Guard::FlatLane || mode == Guard::SharedDag ? &equal : &condition, {1u, 2u}, {}, {}}, {nullptr, {}, {}, {2u}}, {nullptr, {}, {}, {0u, 1u, 3u}}};
+                if (mode == Guard::FlatLane) plan.controlFlow[0].reads = {1u};
+                if (mode == Guard::ActivePointer) plan.controlFlow[0].reads = {0u, 1u};
+                if (conservative) {
+                    plan.srtReads = {{&invalid, 0u}, {&payload, 1u}, {&pointer, 2u}, {&selector, 3u}};
+                    pointerFlat.ReplaceArgument(1, &constant(2u));
+                    selectorFlat.ReplaceArgument(1, &constant(3u));
+                    plan.controlFlow[1].reads = {1u};
+                    plan.controlFlow[2].reads = {0u, 2u, 3u};
+                }
+                struct Reads {
+                    std::vector<std::uint64_t> runtime;
+                    std::vector<std::uint64_t> clean;
+                    bool failSelector = false;
+                    bool changingSelector = false;
+                    bool changingPointer = false;
+                } reads;
+                reads.failSelector = mode == Guard::FailedRead;
+                reads.changingSelector = mode == Guard::FlatLane;
+                reads.changingPointer = mode == Guard::ActivePointer;
+                const auto read = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+                    auto& reads = *static_cast<Reads*>(context);
+                    reads.runtime.push_back(address);
+                    if (address == 0x100000u || address == 0x140000u) *word = reads.changingPointer && std::ranges::count(reads.runtime, address) > 1 ? 0x120000u : 0x110000u;
+                    else if (address == 0x110000u || address == 0x120000u) {
+                        if (reads.failSelector) return false;
+                        *word = reads.changingSelector && std::ranges::count(reads.runtime, address) > 1 ? 0u : 1u;
+                    } else if (address == 0x130000u) *word = 0x12345678u;
+                    else throw std::runtime_error("flat-backed guard requested inaccessible memory");
+                    return true;
+                };
+                const auto readClean = +[](void* context, std::uint64_t address, std::uint32_t* word) {
+                    auto& reads = *static_cast<Reads*>(context);
+                    reads.clean.push_back(address);
+                    if (address == 0x100000u || address == 0x140000u) *word = reads.changingPointer && std::ranges::count(reads.clean, address) > 1 ? 0x110000u : 0x120000u;
+                    else if (address == 0x110000u || address == 0x120000u) {
+                        if (reads.failSelector) return false;
+                        *word = reads.changingSelector && std::ranges::count(reads.clean, address) > 1 ? 1u : 0u;
+                    } else throw std::runtime_error("flat-backed guard requested inaccessible clean memory");
+                    return true;
+                };
+                SrtRuntime runtime{{}, 0, read, &reads, readClean};
+                std::vector<DescriptorValue> results;
+                std::vector<std::uint32_t> flat;
+                std::vector<std::uint8_t> active;
+                const auto pointerClean = static_cast<std::uint8_t>(cleanMask & 1u);
+                const auto selectorClean = static_cast<std::uint8_t>(cleanMask & 2u);
+                const auto cleanSlots = conservative ? std::array<std::uint8_t, 4>{0u, 0u, pointerClean, selectorClean} : std::array<std::uint8_t, 4>{pointerClean, selectorClean, 0u, 0u};
+                const auto evaluate = [&] { SrtWalker{}.EvaluateRuntimeSources(plan, {}, runtime, results, flat, cleanSlots, active); };
+                if (mode == Guard::Flat || mode == Guard::FlatLane || mode == Guard::ActivePointer || mode == Guard::SharedDag) {
+                    try {
+                        evaluate();
+                        const auto selectorPointer = cleanMask != 0u ? 0x120000u : 0x110000u;
+                        const bool separatePointer = mode == Guard::ActivePointer && cleanMask == 2u;
+                        const auto expectedPointer = separatePointer ? 0x110000u : selectorPointer;
+                        require(flat == std::vector<std::uint32_t>{expectedPointer, selectorWord, 0x12345678u, 0u}, "a flat-backed condition lost a transitive or selected value");
+                        const auto pointerReads = std::ranges::count(reads.runtime, 0x100000u) + std::ranges::count(reads.clean, 0x100000u);
+                        const auto selectorReads = std::ranges::count(reads.runtime, selectorPointer) + std::ranges::count(reads.clean, selectorPointer);
+                        require(pointerReads == (separatePointer ? 2 : 1) && selectorReads == 1, "a flat-backed condition recaptured a memory dependency");
+                        require(std::ranges::count(reads.clean, 0x100000u) == (cleanMask != 0u ? 1 : 0), "a flat-backed pointer used the wrong source");
+                        require(std::ranges::count(reads.clean, selectorPointer) == ((cleanMask & 2u) != 0u ? 1 : 0), "a flat-backed selector used the wrong source");
+                    } catch (const std::exception& error) {
+                        ++failures;
+                        std::cerr << "flat-backed guard mode=" << static_cast<unsigned>(mode) << " clean=" << cleanMask << " nested=" << nested << ": " << error.what() << '\n';
+                    }
+                } else if (conservative) {
+                    expectFailure(evaluate, "inaccessible memory", "an unplanned or GPU guard pruned an invalid branch");
+                    require(reads.runtime == std::vector<std::uint64_t>{0u} && reads.clean.empty(), "an unplanned or GPU guard speculatively read a selector");
+                } else if (mode == Guard::InvalidSlot) {
+                    expectFailure(evaluate, "inaccessible memory", "an invalid flat slot pruned an invalid branch");
+                } else {
+                    expectFailure(evaluate, "SRT", "an invalid required flat-backed guard was accepted");
+                    if (mode == Guard::FailedRead) require(std::ranges::find(reads.runtime, 0u) == reads.runtime.end(), "a failed required selector read reached an unchosen payload");
+                }
+            }
+        }
+    }
+    require(failures == 0u, "flat-backed conditions did not preserve their slot snapshots");
 }
 
 void verifyProgramCounterRelativeData() {
@@ -2193,6 +2369,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--inactive-srt") {
             verifyInactiveSrtReads();
             verifyInactiveSrtDependencies();
+            verifyFlatBackedSrtConditions();
             std::cout << "Inactive SRT reads and strict branch validation passed\n";
             return 0;
         }
@@ -2201,6 +2378,7 @@ int main(int argc, char** argv) {
         verifyInactiveSrtReads();
         verifyInactiveSrtDependencies();
         verifyRuntimeValidationCache();
+        verifyFlatBackedSrtConditions();
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyPureFlatSlots();

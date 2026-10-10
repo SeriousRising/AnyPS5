@@ -68,7 +68,7 @@ private:
 
 class Evaluator {
 public:
-    Evaluator(const IrResourcePlan& program, const SrtRuntime& runtime, std::span<const std::uint8_t> cleanFlatSlots = {}, Evaluator* cleanEvaluator = nullptr, IrValue* activeMask = nullptr, std::span<std::uint32_t> flattened = {}, std::span<std::uint8_t> recordedClean = {}) : _program(program), _runtime(runtime), _cleanFlatSlots(cleanFlatSlots), _cleanEvaluator(cleanEvaluator), _activeMask(activeMask != nullptr ? activeMask->Resolve() : nullptr), _flattened(flattened), _recordedClean(recordedClean) {}
+    Evaluator(const IrResourcePlan& program, const SrtRuntime& runtime, std::span<const std::uint8_t> cleanFlatSlots = {}, Evaluator* cleanEvaluator = nullptr, IrValue* activeMask = nullptr, std::span<std::uint32_t> flattened = {}, std::span<std::uint8_t> recordedClean = {}, Evaluator* flatEvaluator = nullptr) : _program(program), _runtime(runtime), _cleanFlatSlots(cleanFlatSlots), _cleanEvaluator(cleanEvaluator), _activeMask(activeMask != nullptr ? activeMask->Resolve() : nullptr), _flattened(flattened), _recordedClean(recordedClean), _flatEvaluator(flatEvaluator) {}
 
     bool Evaluate(IrValue* value, std::uint32_t& result);
     bool EvaluateWide(IrValue* raw, std::uint64_t& result);
@@ -90,6 +90,7 @@ private:
     IrValue* _activeMask = nullptr;
     std::span<std::uint32_t> _flattened;
     std::span<std::uint8_t> _recordedClean;
+    Evaluator* _flatEvaluator = nullptr;
     EvaluatedValues _cache;
     std::vector<IrValue*> _visiting;
 };

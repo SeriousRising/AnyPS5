@@ -1,11 +1,14 @@
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
+#include "Optimization/SrtWalker/SrtRuntimeValidator.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 #include <string>
+#include <unordered_set>
 
 namespace ShaderRecompiler::Detail {
 
@@ -33,6 +36,45 @@ std::string DescribeValue(const IrValue* value, std::uint32_t depth) {
 bool Fail(std::string reason) {
     failureReason() = std::move(reason);
     return false;
+}
+
+bool isFlatBackedCondition(const IrResourcePlan& program, IrValue* condition, Evaluator& memoryFreeEvaluator) {
+    RuntimeValidator validator(program, RuntimeValueType::Any);
+    std::unordered_set<IrValue*> visiting;
+    std::unordered_set<IrValue*> validated;
+    const auto validate = [&](auto&& self, IrValue* raw, bool flatTarget = false) -> bool {
+        auto* value = raw->Resolve();
+        const auto op = value->Opcode();
+        if (op == IrOpcode::Void) return value->HasImmediate() && validator.Run(value);
+        if ((op == IrOpcode::LoadAddressU32 || op == IrOpcode::ReadConstBuffer) && (!flatTarget || !IsRawRead(program, *value))) return false;
+        if (validated.contains(value)) return true;
+        if (!validator.Run(value)) return false;
+        if (op == IrOpcode::GetUserData || op == IrOpcode::GetShaderBase) return true;
+        if (!visiting.insert(value).second) return false;
+        bool valid = true;
+        if (op == IrOpcode::ReadConst) {
+            auto* slot = value->ArgumentCount() == 2u ? value->Argument(1)->Resolve() : nullptr;
+            valid = slot != nullptr && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(0)->Resolve()->ArgumentCount() == 0u && slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < program.srtReads.size();
+            if (valid) {
+                const auto index = slot->ImmediateU32();
+                const auto& read = program.srtReads[index];
+                valid = read.value != nullptr && read.flatOffset == index && IsRawRead(program, *read.value->Resolve()) && self(self, read.value, true);
+            }
+        } else if (op == IrOpcode::Phi) {
+            auto* invariant = ResolveInvariantPhi(program, value);
+            valid = invariant != nullptr && self(self, invariant);
+        } else {
+            for (std::size_t index = 0; valid && index < value->ArgumentCount(); ++index) valid = self(self, value->Argument(index));
+        }
+        if (valid && op == IrOpcode::ReadFirstLane) {
+            std::uint32_t mask = 0u;
+            valid = memoryFreeEvaluator.Evaluate(value->Argument(1), mask) && mask != 0u;
+        }
+        visiting.erase(value);
+        if (valid) validated.insert(value);
+        return valid;
+    };
+    return validate(validate, condition);
 }
 
 const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t source) {
@@ -95,8 +137,9 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
             }
             for (const auto read : block.reads) activeReads[read] = 1u;
             std::uint32_t condition = 0;
-            const bool cleanEvaluable = block.condition != nullptr && block.successors.size() == 2u && conditionEvaluator.Evaluate(block.condition, condition);
-            if (cleanEvaluable) {
+            const bool evaluable = block.condition != nullptr && block.successors.size() == 2u && isFlatBackedCondition(program, block.condition, conditionEvaluator);
+            if (evaluable) {
+                if (!evaluator.Evaluate(block.condition, condition)) return Fail("SRT branch condition in block " + std::to_string(index) + ": " + DescribeValue(block.condition, 4));
                 pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
             } else {
                 pending.insert(pending.end(), block.successors.begin(), block.successors.end());
