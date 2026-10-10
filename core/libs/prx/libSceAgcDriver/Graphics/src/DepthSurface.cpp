@@ -148,6 +148,15 @@ public:
         return (ResolveTextureFormat(resource.format) == expected || depthBits) && resource.dimension == TextureDimension::k2D && resource.width == target.extent.width && resource.height == target.extent.height && resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0;
     }
 
+    // Whether the descriptor's format has the plane's one channel of the plane's width, so that it
+    // could be a view of the plane's values even when Describes refuses its shape or numeric type.
+    bool PlaneFormat(const GuestTextureResource& resource) const {
+        const auto format = ResolveTextureFormat(resource.format);
+        if (Stencil(resource)) return format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT || format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_SNORM;
+        if (target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT) return format == VK_FORMAT_R16_UNORM || format == VK_FORMAT_R16_SNORM || format == VK_FORMAT_R16_UINT || format == VK_FORMAT_R16_SINT || format == VK_FORMAT_R16_SFLOAT;
+        return format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT;
+    }
+
     const Context context;
     const DepthTarget target;
     // The depth plane's contents are in the storage image of `storage` (a shader stores to it)
@@ -410,16 +419,37 @@ void ClearDepthSurfaces(VkDevice device) {
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
     if (auto array = arrayTexture(context, words, resource, components)) return array;
     std::shared_ptr<DepthSurface> surface;
+    std::vector<std::shared_ptr<DepthSurface>> reused;
     {
         std::lock_guard lock(surfacesMutex());
-        const auto& list = surfaces();
-        const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& candidate) {
+        auto& list = surfaces();
+        const auto at = [&](const auto& candidate) {
             return candidate->context.device == context.device && (candidate->target.address == resource.baseAddress || (candidate->target.stencilAddress != 0 && candidate->target.stencilAddress == resource.baseAddress));
-        });
-        if (found == list.rend()) return nullptr;
-        surface = *found;
-        if (!surface->handedOff || surface->Stencil(resource)) return surface->Sampled(words, resource, components);
+        };
+        for (auto it = list.begin(); it != list.end();) {
+            if (!at(*it) || (*it)->Describes(words, resource) || (*it)->PlaneFormat(resource)) {
+                ++it;
+                continue;
+            }
+            reused.push_back(std::move(*it));
+            it = list.erase(it);
+        }
+        if (Recorder::Active() == nullptr) retired().insert(retired().end(), reused.begin(), reused.end());
+        const auto found = std::find_if(list.rbegin(), list.rend(), at);
+        if (found != list.rend()) {
+            surface = *found;
+            if (!surface->handedOff || surface->Stencil(resource)) return surface->Sampled(words, resource, components);
+        }
     }
+    for (auto& stale : reused) {
+        static unsigned reported = 0;
+        if (reported < 32) {
+            ++reported;
+            std::fprintf(stderr, "[gpu] depth surface 0x%llx (%ux%u, VkFormat %d) retired: its memory is now sampled as a %ux%u texture of guest format %u\n", static_cast<unsigned long long>(stale->target.address), stale->target.extent.width, stale->target.extent.height, static_cast<int>(stale->target.format), resource.width, resource.height, resource.format);
+        }
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Keep(std::move(stale));
+    }
+    if (surface == nullptr) return nullptr;
     takeBack(surface);
     std::lock_guard lock(surfacesMutex());
     return surface->Sampled(words, resource, components);
