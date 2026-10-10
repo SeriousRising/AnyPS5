@@ -843,15 +843,16 @@ void EmitVoid(SpirvValueEmitContext&) {
 
 void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
-    if (state.program.Resources().stage == IrShaderStage::Vertex) {
+    const auto stage = state.program.Resources().stage;
+    const bool tessellation = stage == IrShaderStage::TessellationControl;
+    if (!tessellation && stage != IrShaderStage::Compute && stage != IrShaderStage::Mesh) {
         for (const auto* block : state.program.BlockOrder()) {
             for (const auto* instruction : block->Instructions()) {
-                if (CommunicatesThroughMemory(instruction->Opcode())) ctx.Fail(inst, "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented");
+                if (CommunicatesThroughMemory(instruction->Opcode())) ctx.Fail(inst, stage == IrShaderStage::Vertex ? "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented" : "s_barrier in a program without a thread group that accesses LDS or GDS or writes memory is not implemented");
             }
         }
         return;
     }
-    const bool tessellation = state.program.Resources().stage == IrShaderStage::TessellationControl;
     const auto memoryScope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
     const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state);
     state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, memoryScope), ConstantU32(state, semantics));
