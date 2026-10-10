@@ -3,7 +3,59 @@
 
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
+#include <algorithm>
+#include <utility>
+#include <vector>
+
 namespace ShaderRecompiler::Detail {
+
+void RuntimeValidator::analyzeCycles(IrValue* root) {
+    std::unordered_map<IrValue*, std::pair<std::size_t, std::size_t>> indices;
+    std::unordered_set<IrValue*> onStack;
+    std::vector<IrValue*> stack;
+    const auto visit = [&](auto&& self, IrValue* value) -> void {
+        if (_analyzedValues.contains(value)) return;
+        const auto index = indices.size();
+        indices.emplace(value, std::pair{index, index});
+        stack.push_back(value);
+        onStack.insert(value);
+        const auto follow = [&](IrValue* child) {
+            if (child == value) _cyclicValues.insert(value);
+            if (_analyzedValues.contains(child)) return;
+            if (!indices.contains(child)) {
+                self(self, child);
+                indices.at(value).second = std::min(indices.at(value).second, indices.at(child).second);
+            } else if (onStack.contains(child)) {
+                indices.at(value).second = std::min(indices.at(value).second, indices.at(child).first);
+            }
+        };
+        for (auto* argument : value->Arguments()) if (argument != nullptr) follow(argument);
+        if (_type == RuntimeValueType::Integer && value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() == 2u) {
+            auto* slot = value->Argument(1);
+            std::unordered_set<IrValue*> identities;
+            while (slot != nullptr && slot->IsIdentity()) {
+                if (!identities.insert(slot).second || slot->ArgumentCount() == 0u) {
+                    slot = nullptr;
+                    break;
+                }
+                slot = slot->Argument(0);
+            }
+            if (slot != nullptr && slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < _program.srtReads.size()) {
+                auto* read = _program.srtReads[slot->ImmediateU32()].value;
+                if (read != nullptr) follow(read);
+            }
+        }
+        if (indices.at(value).second != index) return;
+        const auto component = std::find(stack.rbegin(), stack.rend(), value).base() - 1;
+        if (stack.end() - component > 1) _cyclicValues.insert(component, stack.end());
+        for (auto member = component; member != stack.end(); ++member) {
+            onStack.erase(*member);
+            _analyzedValues.insert(*member);
+        }
+        stack.erase(component, stack.end());
+    };
+    visit(visit, root);
+}
 
 bool RuntimeValidator::ValidateArguments(IrValue& inst, bool requireUniform) {
     for (std::size_t index = 0; index < inst.ArgumentCount(); index++) {
@@ -31,12 +83,21 @@ bool RuntimeValidator::Validate(IrValue* raw, bool requireUniform) {
     }
     IrValue& inst = *value;
     if (!requireUniform && _validatedDependencies.contains(&inst)) return true;
+    const auto activeMask = _activeMask;
+    if (requireUniform && !_cyclicValues.contains(&inst)) {
+        const auto context = _validatedUniform.find(activeMask);
+        if (context != _validatedUniform.end() && context->second.contains(&inst)) return true;
+    }
     if (!_visiting.insert(&inst).second) {
         return !requireUniform;
     }
     const auto finish = [&](bool valid) {
         _visiting.erase(&inst);
-        if (valid && !requireUniform) _validatedDependencies.insert(&inst);
+        if (valid) {
+            if (requireUniform) {
+                if (!_cyclicValues.contains(&inst)) _validatedUniform[activeMask].insert(&inst);
+            } else _validatedDependencies.insert(&inst);
+        }
         return valid;
     };
     const auto op = inst.Opcode();

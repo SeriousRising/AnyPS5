@@ -339,6 +339,111 @@ void verifyFrontendPair() {
     }
 }
 
+void verifyRuntimeValidationCache() {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    std::uint32_t next = 0u;
+    const auto make = [&](IrOpcode op, IrType type, std::initializer_list<IrValue*> args = {}) -> IrValue& {
+        plan.valueStorage.push_back(std::make_unique<IrValue>(op, type, next++));
+        auto& value = *plan.valueStorage.back();
+        for (auto* arg : args) value.AddArgument(arg);
+        return value;
+    };
+    auto& zero = make(IrOpcode::Void, IrType::U32);
+    zero.SetImmediateU32(0u);
+    auto& one = make(IrOpcode::Void, IrType::U32);
+    one.SetImmediateU32(1u);
+    plan.userDataCount = 1u;
+    auto& reg = make(IrOpcode::Void, IrType::ScalarReg);
+    reg.SetRegister({RegisterBank::Scalar, 0u});
+    IrValue* shared = &make(IrOpcode::GetUserData, IrType::U32, {&reg});
+    for (std::uint32_t depth = 0u; depth < 48u; ++depth) shared = &make(IrOpcode::IAdd32, IrType::U32, {shared, shared});
+    auto& condition = make(IrOpcode::IEqual32, IrType::Bool, {shared, &zero});
+    for (const auto type : {RuntimeValueType::Any, RuntimeValueType::Integer}) {
+        require(SrtWalker{}.ValidateRuntimeValue(plan, &condition, type), "runtime validation rejected a shared uniform graph");
+    }
+    auto& gpu = make(IrOpcode::GetBuiltin, IrType::U32, {&zero, &zero});
+    auto& firstMask = make(IrOpcode::IEqual32, IrType::Bool, {&gpu, &zero});
+    auto& secondMask = make(IrOpcode::INotEqual32, IrType::Bool, {&gpu, &zero});
+    auto& select = make(IrOpcode::SelectU32, IrType::U32, {&firstMask, &one, &gpu});
+    auto& matching = make(IrOpcode::ReadFirstLane, IrType::U32, {&select, &firstMask});
+    auto& different = make(IrOpcode::ReadFirstLane, IrType::U32, {&select, &secondMask});
+    auto& matchingBool = make(IrOpcode::IEqual32, IrType::Bool, {&matching, &one});
+    auto& differentBool = make(IrOpcode::IEqual32, IrType::Bool, {&different, &one});
+    auto& unmaskedBool = make(IrOpcode::IEqual32, IrType::Bool, {&select, &one});
+    for (const auto type : {RuntimeValueType::Any, RuntimeValueType::Integer}) {
+        require(SrtWalker{}.ValidateRuntimeValue(plan, &matching, type), "runtime validation lost a matching active-mask select");
+        for (auto* invalid : {&differentBool, &unmaskedBool}) {
+            for (const bool validFirst : {false, true}) {
+                auto& combined = make(IrOpcode::LogicalAnd, IrType::Bool, validFirst ? std::initializer_list<IrValue*>{&matchingBool, invalid} : std::initializer_list<IrValue*>{invalid, &matchingBool});
+                require(!SrtWalker{}.ValidateRuntimeValue(plan, &combined, type), "runtime validation reused a uniform result across active-mask contexts");
+            }
+        }
+    }
+    auto& dependencyMask = make(IrOpcode::IEqual32, IrType::Bool, {&gpu, &zero});
+    auto& dependent = make(IrOpcode::ReadFirstLane, IrType::U32, {&gpu, &dependencyMask});
+    require(!SrtWalker{}.ValidateRuntimeValue(plan, &dependent, RuntimeValueType::Integer), "runtime dependency validation leaked into uniform validation");
+    auto& floating = make(IrOpcode::Void, IrType::F32);
+    floating.SetImmediateF32(1.0f);
+    auto& bits = make(IrOpcode::BitCastU32F32, IrType::U32, {&floating});
+    auto& floatSelect = make(IrOpcode::SelectU32, IrType::U32, {&firstMask, &one, &bits});
+    auto& floatLane = make(IrOpcode::ReadFirstLane, IrType::U32, {&floatSelect, &firstMask});
+    require(SrtWalker{}.ValidateRuntimeValue(plan, &floatLane), "runtime Any validation lost an inactive floating dependency");
+    require(!SrtWalker{}.ValidateRuntimeValue(plan, &floatLane, RuntimeValueType::Integer), "runtime Integer validation accepted a floating dependency");
+    auto& active = make(IrOpcode::Void, IrType::Bool);
+    active.SetImmediateBool(true);
+    auto& malformed = make(IrOpcode::Identity, IrType::U32);
+    auto& inactiveMalformed = make(IrOpcode::SelectU32, IrType::U32, {&active, &one, &malformed});
+    auto& malformedLane = make(IrOpcode::ReadFirstLane, IrType::U32, {&inactiveMalformed, &active});
+    require(SrtWalker{}.ValidateRuntimeValue(plan, &malformedLane), "runtime validation resolved an inactive malformed value");
+    auto& malformedFloat = make(IrOpcode::Identity, IrType::F32);
+    auto& rejectedFloat = make(IrOpcode::FPMul32, IrType::F32, {&floating, &malformedFloat});
+    require(!SrtWalker{}.ValidateRuntimeValue(plan, &rejectedFloat, RuntimeValueType::Integer), "runtime validation lost early floating-type rejection");
+    expectFailure([&] { static_cast<void>(SrtWalker{}.ValidateRuntimeValue(plan, &malformed)); }, "malformed Identity", "runtime validation accepted a required malformed value");
+    auto& identityCycle = make(IrOpcode::Identity, IrType::U32);
+    identityCycle.AddArgument(&identityCycle);
+    auto& inactiveIdentityCycle = make(IrOpcode::SelectU32, IrType::U32, {&active, &one, &identityCycle});
+    auto& identityLane = make(IrOpcode::ReadFirstLane, IrType::U32, {&inactiveIdentityCycle, &active});
+    require(SrtWalker{}.ValidateRuntimeValue(plan, &identityLane), "runtime validation followed an inactive Identity cycle");
+    auto& resource = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+    auto& slotAlias = make(IrOpcode::Identity, IrType::U32, {&zero});
+    auto& flat = make(IrOpcode::ReadConst, IrType::U32, {&resource, &slotAlias});
+    auto& flatSelect = make(IrOpcode::SelectU32, IrType::U32, {&active, &one, &flat});
+    auto& flatLane = make(IrOpcode::ReadFirstLane, IrType::U32, {&flatSelect, &active});
+    auto& address = make(IrOpcode::GetAddressResource, IrType::AddressResource, {&flatLane, &zero});
+    auto& rawRead = make(IrOpcode::LoadAddressU32, IrType::U32, {&address, &zero});
+    rawRead.SetFlags(MemoryFlags{0u, 0u});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    plan.memoryInfo.push_back(memory);
+    plan.srtReads.push_back({&rawRead, 0u});
+    auto& warmedFlat = make(IrOpcode::IAdd32, IrType::U32, {&flat, &flatSelect});
+    require(SrtWalker{}.ValidateRuntimeValue(plan, &flat, RuntimeValueType::Integer), "runtime validation rejected a masked canonical-read cycle");
+    require(!SrtWalker{}.ValidateRuntimeValue(plan, &warmedFlat, RuntimeValueType::Integer), "runtime validation cached a cyclic canonical read through a slot alias");
+    require(SrtWalker{}.ValidateRuntimeValue(plan, &warmedFlat), "runtime Any validation followed an unneeded canonical read");
+    auto& cyclicSlot = make(IrOpcode::ReadConst, IrType::U32, {&resource, &identityCycle});
+    auto& rejectedSlot = make(IrOpcode::ConvertF32U32, IrType::F32, {&cyclicSlot});
+    require(!SrtWalker{}.ValidateRuntimeValue(plan, &rejectedSlot, RuntimeValueType::Integer), "runtime validation followed an inactive cyclic slot alias");
+    auto& cyclicSelect = make(IrOpcode::SelectU32, IrType::U32, {&active, &one, &one});
+    auto& maskedCycle = make(IrOpcode::ReadFirstLane, IrType::U32, {&cyclicSelect, &active});
+    cyclicSelect.ReplaceArgument(2u, &maskedCycle);
+    auto& warmedCycle = make(IrOpcode::IAdd32, IrType::U32, {&maskedCycle, &cyclicSelect});
+    auto& invariant = make(IrOpcode::Phi, IrType::U32, {&one});
+    invariant.AddArgument(&invariant);
+    IrValue* abovePhi = &invariant;
+    for (std::uint32_t depth = 0u; depth < 48u; ++depth) abovePhi = &make(IrOpcode::IAdd32, IrType::U32, {abovePhi, abovePhi});
+    for (const auto type : {RuntimeValueType::Any, RuntimeValueType::Integer}) {
+        require(SrtWalker{}.ValidateRuntimeValue(plan, &maskedCycle, type), "runtime validation rejected an inactive masked cycle");
+        require(!SrtWalker{}.ValidateRuntimeValue(plan, &warmedCycle, type), "runtime validation hid a visiting ancestor behind a cached masked proof");
+        require(SrtWalker{}.ValidateRuntimeValue(plan, abovePhi, type), "runtime validation rejected a shared graph above an invariant cyclic phi");
+    }
+    auto& cycle = make(IrOpcode::IAdd32, IrType::U32, {&one, &one});
+    cycle.ReplaceArgument(0u, &cycle);
+    for (const auto type : {RuntimeValueType::Any, RuntimeValueType::Integer}) {
+        require(!SrtWalker{}.ValidateRuntimeValue(plan, &cycle, type), "runtime validation accepted a uniform cycle");
+    }
+}
+
 void verifyRegisterSources() {
     using namespace ShaderRecompiler;
     IrResourcePlan plan;
@@ -3249,8 +3354,14 @@ int main(int argc, char** argv) {
             std::cout << "SRT read patching replaces repeated and multiple uses\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--runtime-validation") {
+            verifyRuntimeValidationCache();
+            std::cout << "Runtime validation shared graphs and mask contexts passed\n";
+            return 0;
+        }
         require(argc == 1, "unknown shader memory test arguments");
         verifyLogicalImageSpecialization();
+        verifyRuntimeValidationCache();
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyFrontendPair();
