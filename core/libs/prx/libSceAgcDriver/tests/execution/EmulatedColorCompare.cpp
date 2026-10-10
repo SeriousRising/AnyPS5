@@ -46,10 +46,19 @@ alignas(256) std::array<float, Threads * 3> Input{};
 alignas(256) std::array<float, Threads> Output{};
 alignas(256) std::array<std::uint32_t, Threads * 3> Extra{};
 alignas(4096) std::array<std::uint8_t, 4096> Texels{};
+alignas(4096) std::array<std::uint8_t, 4096> Single{};
+constexpr std::uint8_t SingleRed = 128;
+const std::uint8_t* Bound = Texels.data();
+std::uint32_t BoundSide = Side;
 
 alignas(256) constexpr std::array<std::uint32_t, 13> Code{
     0x1614008c, 0xe03c1000, 0x8000010a, 0xbf8c3f70, 0xf0bc0108, 0x00820401, 0xbf8c3f70,
     0x34160082, 0xe0701000, 0x8001040b, 0xbf810000, 0xbf810000, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 13> ArrayCode{
+    0x1614008c, 0xe03c1000, 0x8000010a, 0xbf8c3f70, 0x7e0802ff, 0x40400000, 0xf0bc0128, 0x00820401,
+    0xbf8c3f70, 0x34160082, 0xe0701000, 0x8001040b, 0xbf810000,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 16> OffsetCode{
@@ -71,11 +80,11 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
 }
 
 std::array<std::uint32_t, 8> TextureDescriptor(std::uint32_t format) {
-    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Texels.data()));
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(Bound));
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((Side - 1u) & 3u) << 30u),
-        ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((BoundSide - 1u) & 3u) << 30u),
+        ((BoundSide - 1u) >> 2u) | ((BoundSide - 1u) << 14u),
         0xfacu | (Type2D << 28u),
         0u, 0u, 0u, 0u,
     };
@@ -191,9 +200,9 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::
     return ShaderRecompiler::Recompile(request);
 }
 
-void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* name, bool offsets = false, bool useCache = false) {
+void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* name, bool offsets = false, bool useCache = false, std::span<const std::uint32_t> plain = Code) {
     Output.fill(-1.0f);
-    const std::span<const std::uint32_t> code = offsets ? std::span<const std::uint32_t>(OffsetCode) : std::span<const std::uint32_t>(Code);
+    const std::span<const std::uint32_t> code = offsets ? std::span<const std::uint32_t>(OffsetCode) : plain;
     const auto result = Compile(device, Format8888UNorm, sampler, code, useCache);
     for (const auto& binding : result.bindings) {
         Require(binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers, "emulated comparison retained a sampler binding");
@@ -205,6 +214,23 @@ void Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* na
         const float expected = Expected(tid, sampler, offsets);
         const float tolerance = sampler.filter == FilterPoint ? 0.0f : 1e-4f;
         Require(std::fabs(Output[tid] - expected) <= tolerance, std::string(name) + ": thread " + std::to_string(tid) + " compared to " + std::to_string(Output[tid]) + ", expected " + std::to_string(expected));
+    }
+}
+
+void RunSingle(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char* name) {
+    Single.fill(0);
+    Bound = Single.data();
+    BoundSide = 1u;
+    Single[AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(Format8888UNorm))).mips.at(0).tiledOffset] = SingleRed;
+    Output.fill(-1.0f);
+    const auto result = Compile(device, Format8888UNorm, sampler, ArrayCode);
+    Bound = Texels.data();
+    BoundSide = Side;
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(ArrayCode.data()));
+    device.WaitIdle();
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        const float expected = std::clamp(Input[tid * 3u], 0.0f, 1.0f) <= static_cast<float>(SingleRed) / 255.0f ? 1.0f : 0.0f;
+        Require(Output[tid] == expected, std::string(name) + ": thread " + std::to_string(tid) + " compared to " + std::to_string(Output[tid]) + ", expected " + std::to_string(expected));
     }
 }
 
@@ -245,6 +271,11 @@ int main() {
         Run(*device, {ClampEdge, FilterPoint}, "point, clamp to edge, offsets, bias and LOD clamp", true);
         Run(*device, {ClampWrap, FilterBilinear}, "bilinear, wrap, offsets, bias and LOD clamp", true);
         Run(*device, {ClampBorder, FilterBilinear, BorderWhite, 0u, 0x3f00u}, "bilinear, white border, offsets, bias and LOD clamp", true);
+        Run(*device, {ClampEdge, FilterPoint}, "2D array address on a 2D texture, point, clamp to edge", false, false, ArrayCode);
+        Run(*device, {ClampWrap, FilterBilinear}, "2D array address on a 2D texture, bilinear, wrap", false, false, ArrayCode);
+        RunSingle(*device, {ClampEdge, FilterPoint}, "2D array address on a 1x1 2D texture, point");
+        RunSingle(*device, {ClampEdge, FilterBilinear}, "2D array address on a 1x1 2D texture, bilinear");
+        Require(BindsDepthCompare(Compile(*device, Format32Float, {ClampEdge, FilterBilinear}, ArrayCode)), "an R32 float texture under a 2D array address left the native comparison path");
         for (unsigned iteration = 0; iteration < 2; ++iteration) {
             Run(*device, {ClampEdge, FilterPoint}, "cached point comparison", false, true);
             Run(*device, {ClampWrap, FilterBilinear}, "cached bilinear comparison with offsets", true, true);
