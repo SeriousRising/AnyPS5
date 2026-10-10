@@ -6,7 +6,6 @@
 namespace AgcDriver::Graphics {
 
 bool LoopGuardTripped();
-// APS5_LOOP_GUARD: the last loop a shader was cut out of (zeros before any was).
 struct LoopGuardReport {
     std::uint64_t shader = 0;
     std::uint32_t stage = 0;
