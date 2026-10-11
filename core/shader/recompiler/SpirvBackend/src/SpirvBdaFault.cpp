@@ -165,7 +165,6 @@ bool BdaStopCanBeDeferred(const SpirvEmitterState& state) {
             if (!traced && !reasons.empty()) return false;
             const auto opcode = instruction->Opcode();
             switch (opcode) {
-                case IrOpcode::ReadFirstLane:
                 case IrOpcode::ReadLane:
                 case IrOpcode::WriteLane:
                 case IrOpcode::Permlane16U32:

@@ -2382,6 +2382,8 @@ void faultStopFormTests() {
     // The same with fetch-inactive, and bound_ctrl.
     check("a fetch-inactive DPP move", {0x7e0c02fau, 0xff04b104u, 0x4a080d04u}, true);
     check("a bound DPP move", {0x7e0c02fau, 0xff08b104u, 0x4a080d04u}, true);
+    // v_readfirstlane_b32 s4, v4; v_mov_b32 v6, s4; v_add_nc_u32 v4, v4, v6
+    check("v_readfirstlane_b32", {0x7e080504u, 0x7e0c0204u, 0x4a080d04u}, true);
     // v_readlane_b32 s4, v4, 1; v_mov_b32 v6, s4; v_add_nc_u32 v4, v4, v6
     check("v_readlane_b32", {0xd7600004u, 0x00010304u, 0x7e0c0204u, 0x4a080d04u}, false);
 }
