@@ -90,6 +90,14 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
 
+// Cumulative: the render passes recorded draws began, and the recorded draws that continued the
+// pass the draw before them left open.
+struct DrawPassStats {
+    std::uint64_t begun = 0;
+    std::uint64_t continued = 0;
+};
+DrawPassStats DrawPassCounters();
+
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,
 // either decided by the driver before the draw (its patched-SGPR fold rules, the shader path, the
