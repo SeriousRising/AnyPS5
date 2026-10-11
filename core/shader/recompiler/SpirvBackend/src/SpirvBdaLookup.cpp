@@ -109,7 +109,13 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
-    state.module.AddFunction(spv::OpReturnValue, result);
+    auto found = result;
+    if (state.bdaStopped != 0u && (permission & BdaAbi::Write) != 0u) {
+        const auto stopped = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, boolean, stopped, state.bdaStopped);
+        found = Select(state, u64, stopped, BdaConstant(state, 0u), found);
+    }
+    state.module.AddFunction(spv::OpReturnValue, found);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
 }
@@ -200,6 +206,7 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
+    if (state.bdaStopDeferred) state.bdaStopped = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);

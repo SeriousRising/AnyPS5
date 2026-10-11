@@ -25,6 +25,21 @@ void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& targe
 bool BdaInvocationsMayStop(const IrProgram& program);
 void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition);
 std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst);
+// Whether the program's faulting reads may set a flag instead of ending the invocation where they
+// are: the driver's compile time grows much faster than the program with one return per read site.
+// A flagged invocation must leave no trace, so this holds only for one-lane pixel and compute
+// programs whose effects are all suppressed for it (address-based stores and atomics, void buffer
+// and image stores) or discarded with it (pixel exports), and whose only view of other invocations
+// is a ballot, where a flagged invocation counts as absent.
+// APS5_BDA_STOP_PER_SITE=1 ends every faulting invocation at the read, as before.
+bool BdaStopCanBeDeferred(const SpirvEmitterState& state);
+// Ends the invocation here when a deferred stop is pending (before a guest loop, which a flagged
+// invocation could spin in, and where a pixel program returns).
+void EndStoppedBdaInvocation(SpirvEmitterState& state);
+// `condition`, false for an invocation with a pending stop.
+std::uint32_t UnlessBdaStopped(SpirvEmitterState& state, std::uint32_t condition);
+// Emits an effect that an invocation with a pending stop must not have.
+void EmitUnlessBdaStopped(SpirvEmitterState& state, const std::function<void()>& emit);
 std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bits);
 void EmitBdaWrite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u);
 void EmitBdaStore(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t value, std::uint32_t bits);

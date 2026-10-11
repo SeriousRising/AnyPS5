@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvEmitter.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
@@ -33,6 +34,7 @@ namespace ShaderRecompiler
     }
 
     void EmitSubgroupBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
+        predicate = UnlessBdaStopped(state, predicate);
         if (HostSubgroupSingleLane(state)) {
             const auto zero = ConstantU32(state, 0u);
             const auto own = Select(state, TypeU32(state), predicate, ConstantU32(state, 1u), zero);
