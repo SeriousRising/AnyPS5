@@ -1762,6 +1762,25 @@ void verifyBdaInlinedSize() {
     const auto entries = std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : entriesText != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entriesText, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
     const bool checked = std::getenv("APS5_BDA_RANGE_CACHE_CHECK") != nullptr;
     require(keptByLookup.size() == 1u + entries * (checked ? 6u : 5u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
+    // The module a draw specializes is optimized again (Recompiler's prepared programs): the same
+    // variables must survive that pass.
+    {
+        const auto specialized = ValidateAndOptimizeSpirv(words, request.target.vulkanVersion, request.target.spirvVersion, false, true, true);
+        std::set<std::uint32_t> privates;
+        std::set<std::uint32_t> read;
+        std::map<std::uint32_t, std::string> named;
+        std::uint32_t inside = 0u;
+        for (std::size_t cursor = 5; cursor < specialized.size(); cursor += specialized[cursor] >> 16u) {
+            require((specialized[cursor] >> 16u) != 0u, "BDA range cache: truncated specialized SPIR-V instruction");
+            const auto op = specialized[cursor] & 0xffffu;
+            if (op == spv::OpName) named[specialized[cursor + 1]] = reinterpret_cast<const char*>(&specialized[cursor + 2]);
+            if (op == spv::OpFunction) inside = specialized[cursor + 2];
+            if (op == spv::OpFunctionEnd) inside = 0u;
+            if (op == spv::OpVariable && inside == 0u && specialized[cursor + 3] == spv::StorageClassPrivate) privates.insert(specialized[cursor + 2]);
+            if (op == spv::OpLoad && named[inside] == "lookup_bda" && privates.contains(specialized[cursor + 3])) read.insert(specialized[cursor + 3]);
+        }
+        require(read.size() == keptByLookup.size(), ("BDA range cache: lookup_bda reads " + std::to_string(read.size()) + " per-invocation variables after the specializing optimization").c_str());
+    }
     std::cout << "BDA inlined size: " << Reads << " address-based dword reads inline to " << total << " instructions\n";
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
     // 316 instructions a read without the cache, 47 more with one kept range, 22 for each further one
