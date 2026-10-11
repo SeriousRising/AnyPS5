@@ -1711,6 +1711,7 @@ struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t byte
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 std::map<Recorder::DrawTimingDetail, Recorder::DrawTimingRow> timingDraws;
+std::map<std::uint64_t, Recorder::AddressSites> timingSites;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -1909,6 +1910,16 @@ void Recorder::NoteTimedDraw(std::uint32_t timing, const DrawTimingDetail& detai
     else draws.push_back({index, detail, 1});
 }
 
+bool Recorder::HasAddressSites(std::uint64_t key) {
+    std::lock_guard lock(timingMutex);
+    return timingSites.contains(key);
+}
+
+void Recorder::NoteAddressSites(std::uint64_t key, const AddressSites& sites) {
+    std::lock_guard lock(timingMutex);
+    timingSites.emplace(key, sites);
+}
+
 std::vector<Recorder::DrawTimingRow> Recorder::DrawGpuTimes() {
     std::lock_guard lock(timingMutex);
     std::vector<DrawTimingRow> rows;
@@ -1956,15 +1967,15 @@ void reportDrawTimes(double perPresent) {
         std::snprintf(text, sizeof(text), "%ux%u color %dx%u depth %d", detail.width, detail.height, static_cast<int>(detail.color), detail.colors, static_cast<int>(detail.depth));
         return std::string(text);
     });
-    const auto programs = table([](const Detail& detail) { return Detail{0, 0, VK_FORMAT_UNDEFINED, 0, VK_FORMAT_UNDEFINED, detail.pixelProgram, detail.pixelWords, detail.pixelTraits}; }, 16, [](const Detail& detail) {
-        char text[96];
+    const auto programs = table([](const Detail& detail) { return Detail{0, 0, VK_FORMAT_UNDEFINED, 0, VK_FORMAT_UNDEFINED, detail.pixelProgram, detail.pixelWords, detail.pixelTraits, detail.pixelSites}; }, 16, [](const Detail& detail) {
+        char text[128];
         std::string traits;
-        for (std::size_t bit = 0; bit < 6; ++bit) traits += (detail.pixelTraits >> bit & 1u) != 0 ? "EWKZTD"[bit] : '-';
-        std::snprintf(text, sizeof(text), "0x%llx %uw %s", static_cast<unsigned long long>(detail.pixelProgram), detail.pixelWords, traits.c_str());
+        for (std::size_t bit = 0; bit < 7; ++bit) traits += (detail.pixelTraits >> bit & 1u) != 0 ? "EWKZTDR"[bit] : '-';
+        std::snprintf(text, sizeof(text), "0x%llx %uw %s a%u/%u/%u", static_cast<unsigned long long>(detail.pixelProgram), detail.pixelWords, traits.c_str(), detail.pixelSites.reads, detail.pixelSites.byteReads, detail.pixelSites.stores);
         return std::string(text);
     });
     AgcDriver::ProfilePrint_nid_no_patch("[gputime-draws] the draw class by pass (each loads and stores its attachments in the general layout), as [key xpasses/draws ms (ms per present)]; by render extent, first color VkFormat x color count and depth VkFormat:%s", targets.c_str());
-    AgcDriver::ProfilePrint_nid_no_patch("; by the pixel program of the pass's first draw (variant id, SPIR-V words, E declares early fragment tests, W stores to memory, K kills, Z exports depth, T the draw tests depth, D it writes depth):%s\n", programs.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("; by the pixel program of the pass's first draw (variant id, SPIR-V words, E declares early fragment tests, W stores to memory, K kills, Z exports depth, T the draw tests depth, D it writes depth, R its only stores are the address fault recorder's, a address-based read sites/byte-path read sites/store sites):%s\n", programs.c_str());
 }
 
 }
@@ -2247,6 +2258,15 @@ void Recorder::readGpuTiming(Batch& batch) {
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    std::string addressed;
+    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) {
+        const auto found = timingSites.find(hot[i].first);
+        if (found == timingSites.end() || found->second == AddressSites{}) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " 0x%llx a%u/%u/%u", static_cast<unsigned long long>(hot[i].first), found->second.reads, found->second.byteReads, found->second.stores);
+        addressed += text;
+    }
+    if (!addressed.empty()) AgcDriver::ProfilePrint_nid_no_patch("[gputime-address] the programs above that access memory by address, as address-based read sites/byte-path read sites/store sites:%s\n", addressed.c_str());
     reportDrawTimes(perPresent);
     timingDraws.clear();
     timingByKey.clear();

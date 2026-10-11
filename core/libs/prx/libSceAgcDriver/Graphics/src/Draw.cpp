@@ -24,6 +24,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -637,10 +639,53 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
 
 }
 
+namespace {
+
+std::string_view moduleName(const std::uint32_t* words, std::uint32_t count) {
+    const auto* text = reinterpret_cast<const char*>(words + 2);
+    return std::string_view(text, strnlen(text, (count - 2u) * sizeof(std::uint32_t)));
+}
+
+bool addressHelper(std::string_view name) {
+    return name.starts_with("read_bda_dword") || name.starts_with("get_bda_") || name == "probe_bda_pointer" || name == "lookup_bda" || name == "record_bda_fault" || name == "note_bda_write";
+}
+
+}
+
+Recorder::AddressSites ProgramAddressSites(std::span<const std::uint32_t> spirv) {
+    Recorder::AddressSites sites;
+    std::unordered_map<std::uint32_t, std::string_view> names;
+    const auto name = [&](std::uint32_t id) {
+        const auto found = names.find(id);
+        return found != names.end() ? found->second : std::string_view();
+    };
+    bool helper = false;
+    for (std::size_t at = 5; at < spirv.size();) {
+        const auto* words = &spirv[at];
+        const auto count = words[0] >> 16u;
+        const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (count == 0 || at + count > spirv.size()) break;
+        at += count;
+        if (op == spv::OpName && count >= 3) {
+            names[words[1]] = moduleName(words, count);
+        } else if (op == spv::OpFunction && count >= 3) {
+            helper = addressHelper(name(words[2]));
+        } else if (op == spv::OpFunctionCall && count >= 4 && !helper) {
+            const auto callee = name(words[3]);
+            if (callee.starts_with("read_bda_dword_bytes") || callee == "get_bda_pointer") ++sites.byteReads;
+            else if (callee.starts_with("read_bda_dword") || callee == "probe_bda_pointer") ++sites.reads;
+            else if (callee == "get_bda_write_pointer" || callee == "get_bda_atomic_pointer") ++sites.stores;
+        }
+    }
+    return sites;
+}
+
 std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv) {
     using Detail = Recorder::DrawTimingDetail;
+    constexpr std::uint8_t GuestStores = 128;
     std::uint8_t modes = 0;
     std::uint32_t function = 0;
+    bool recorder = false;
     std::unordered_map<std::uint32_t, std::uint8_t> inFunction;
     std::vector<std::uint32_t> reached;
     std::unordered_map<std::uint32_t, std::uint32_t> storageClass;
@@ -648,8 +693,9 @@ std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv) {
         const auto found = storageClass.find(pointer);
         if (found == storageClass.end()) return;
         const auto storage = found->second;
-        if (storage == spv::StorageClassStorageBuffer || storage == spv::StorageClassPhysicalStorageBuffer || storage == spv::StorageClassUniform || storage == spv::StorageClassImage) inFunction[function] |= Detail::WritesMemory;
+        if (storage == spv::StorageClassStorageBuffer || storage == spv::StorageClassPhysicalStorageBuffer || storage == spv::StorageClassUniform || storage == spv::StorageClassImage) inFunction[function] |= Detail::WritesMemory | (recorder ? 0 : GuestStores);
     };
+    std::unordered_map<std::uint32_t, std::string_view> names;
     for (std::size_t at = 5; at < spirv.size();) {
         const auto* words = &spirv[at];
         const auto count = words[0] >> 16u;
@@ -663,14 +709,18 @@ std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv) {
             if (words[2] == spv::ExecutionModeDepthReplacing) modes |= Detail::ExportsDepth;
         } else if (op == spv::OpTypePointer && count >= 3) {
             storageClass[words[1]] = words[2];
+        } else if (op == spv::OpName && count >= 3) {
+            names[words[1]] = moduleName(words, count);
         } else if (op == spv::OpFunction && count >= 3) {
             function = words[2];
+            const auto found = names.find(function);
+            recorder = found != names.end() && (found->second == "record_bda_fault" || found->second == "note_bda_write");
         } else if (op == spv::OpFunctionCall && count >= 4) {
             reached.push_back(words[3]);
         } else if (op == spv::OpKill || op == spv::OpTerminateInvocation || op == spv::OpDemoteToHelperInvocation) {
             inFunction[function] |= Detail::Kills;
         } else if (op == spv::OpImageWrite) {
-            inFunction[function] |= Detail::WritesMemory;
+            inFunction[function] |= Detail::WritesMemory | GuestStores;
         } else if ((op == spv::OpStore || op == spv::OpAtomicStore || op == spv::OpCopyMemory) && count >= 2) {
             written(words[1]);
         } else if (op >= spv::OpAtomicExchange && op <= spv::OpAtomicXor && count >= 4) {
@@ -682,7 +732,8 @@ std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv) {
     for (const auto id : reached) {
         if (const auto found = inFunction.find(id); found != inFunction.end()) modes |= found->second;
     }
-    return modes;
+    if ((modes & (Detail::WritesMemory | GuestStores)) == Detail::WritesMemory) modes |= Detail::RecorderStoresOnly;
+    return modes & static_cast<std::uint8_t>(~GuestStores);
 }
 
 namespace {
@@ -700,14 +751,15 @@ Recorder::DrawTimingDetail drawTimingDetail(const State& state, std::span<const 
         detail.pixelProgram = shader.program->PipelineVariantId();
         detail.pixelWords = static_cast<std::uint32_t>(words.size());
         static std::mutex mutex;
-        static std::unordered_map<std::uint64_t, std::uint8_t> known;
+        static std::unordered_map<std::uint64_t, std::pair<std::uint8_t, Recorder::AddressSites>> known;
         std::lock_guard lock(mutex);
         const auto found = detail.pixelProgram != 0 ? known.find(detail.pixelProgram) : known.end();
         if (found != known.end()) {
-            detail.pixelTraits = found->second;
+            std::tie(detail.pixelTraits, detail.pixelSites) = found->second;
         } else {
             detail.pixelTraits = PixelProgramTraits(words);
-            if (detail.pixelProgram != 0) known.emplace(detail.pixelProgram, detail.pixelTraits);
+            detail.pixelSites = ProgramAddressSites(words);
+            if (detail.pixelProgram != 0) known.emplace(detail.pixelProgram, std::pair{detail.pixelTraits, detail.pixelSites});
         }
     }
     if (state.depth && state.depthTest) detail.pixelTraits |= Recorder::DrawTimingDetail::TestsDepth;
