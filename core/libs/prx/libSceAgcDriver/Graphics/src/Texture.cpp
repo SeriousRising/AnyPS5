@@ -1510,6 +1510,21 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
+    // The units a shadow holds are published with one copy per run of layers read, not one per
+    // layer: each layer's read below would publish its own and wait for it.
+    std::uint64_t runBegin = 0, runEnd = 0;
+    const auto publishRun = [&] {
+        if (runEnd > runBegin) PublishShadowsOnly(runBegin, static_cast<std::size_t>(runEnd - runBegin), PublishScope::Whole);
+    };
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (layers != nullptr && !(*layers)[layer]) continue;
+        if (layerBegin(layer) != runEnd) {
+            publishRun();
+            runBegin = layerBegin(layer);
+        }
+        runEnd = layerBegin(layer) + layerBytes(layer);
+    }
+    publishRun();
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
         const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
