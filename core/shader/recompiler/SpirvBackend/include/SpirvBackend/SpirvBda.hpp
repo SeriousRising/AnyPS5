@@ -35,8 +35,8 @@ void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition);
 // Whether the program's faulting reads may set a flag instead of ending the invocation where they
 // are: the driver's compile time grows much faster than the program with one return per read site.
 // A flagged invocation must leave no trace, so this holds only for one-lane pixel and compute
-// programs whose effects are all suppressed for it (address-based stores and atomics, void buffer
-// and image stores) or discarded with it (pixel exports), and whose only views of other invocations
+// programs whose effects are all suppressed for it (address-based stores and atomics, void buffer,
+// image, LDS and GDS stores) or discarded with it (pixel exports), and whose only views of other invocations
 // are a ballot, where a flagged invocation counts as absent, v_readfirstlane_b32, which takes its
 // lane from such a ballot, and a DPP operand: one that skips
 // inactive lanes reads zero from a flagged lane, as it did from one that had ended, and a
@@ -44,6 +44,9 @@ void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition);
 // defined.
 // APS5_BDA_STOP_PER_SITE=1 ends every faulting invocation at the read, as before.
 bool BdaStopCanBeDeferred(const SpirvEmitterState& state);
+// Whether `instruction` is a store that the flow emitter skips for an invocation with a pending stop:
+// a bound-buffer, image, LDS or GDS store. Address-based stores are refused by their lookup instead.
+bool BdaStoppedInvocationSkips(const IrValue& instruction);
 // Ends the invocation here when a deferred stop is pending (before a guest loop, which a flagged
 // invocation could spin in, and where a pixel program returns).
 void EndStoppedBdaInvocation(SpirvEmitterState& state);
