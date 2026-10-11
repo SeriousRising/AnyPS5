@@ -13,6 +13,7 @@
 #include "Optimization/SrtWalker/SrtRuntimeValidator.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
+#include "SpirvBackend/SpirvEmitterState.hpp"
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "CacheKey.hpp"
@@ -2546,12 +2547,21 @@ void verifyBdaInlinedSize() {
         return total;
     };
     const auto total = measure(entry);
-    // The range cache is six per-invocation variables; the optimizer must leave them Private (as
-    // locals of lookup_bda they would be lost between calls and the cache would never hit).
-    require(keptByLookup.size() == (std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : 6u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
+    // The range cache is five per-invocation variables a kept range and one more; the optimizer must
+    // leave them Private (as locals of lookup_bda they would be lost between calls and the cache
+    // would never hit).
+    const char* entriesText = std::getenv("APS5_BDA_RANGE_CACHE_ENTRIES");
+    const auto entries = std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : entriesText != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entriesText, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
+    require(keptByLookup.size() == (entries == 0u ? 0u : entries * 5u + 1u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
     std::cout << "BDA inlined size: " << Reads << " address-based dword reads inline to " << total << " instructions\n";
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
-    require(total * 8u <= InlinedBefore, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than an eighth of the " + std::to_string(InlinedBefore) + " they took").c_str());
+    // An eighth of what the reads took before they shared one lookup, for one kept range, and 22
+    // instructions a read for each further one. RADV's compile time and memory follow the count:
+    // 200 such reads took 26 s and 1.01 GiB without the cache (344,957 here), 28 s and 1.31 GiB with
+    // one kept range (413,963), 30 s and 1.37 GiB with two (435,968), 33 s and 1.48 GiB with four
+    // (479,978), on Mesa 26.1.6.
+    const std::uint64_t limit = InlinedBefore / 8u + (entries > 1u ? (entries - 1u) * 22u * Reads : 0u);
+    require(total <= limit, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than " + std::to_string(limit)).c_str());
 }
 
 void verifyFunctionLdsBound() {

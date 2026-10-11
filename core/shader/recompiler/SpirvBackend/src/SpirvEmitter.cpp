@@ -264,9 +264,14 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
-    // Debug aid: APS5_NO_BDA_RANGE_CACHE=1 searches the page table at every address lookup, as before.
-    static const bool bdaRangeCache = std::getenv("APS5_NO_BDA_RANGE_CACHE") == nullptr;
-    state.bdaRangeCache = bdaRangeCache;
+    // Debug aids: APS5_NO_BDA_RANGE_CACHE=1 searches the page table at every address lookup;
+    // APS5_BDA_RANGE_CACHE_ENTRIES=<1 to 4> sets how many ranges a lookup keeps.
+    static const std::uint32_t bdaRangeCacheEntries = [] {
+        if (std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr) return 0u;
+        const char* entries = std::getenv("APS5_BDA_RANGE_CACHE_ENTRIES");
+        return entries != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entries, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
+    }();
+    state.bdaRangeCacheEntries = bdaRangeCacheEntries;
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;

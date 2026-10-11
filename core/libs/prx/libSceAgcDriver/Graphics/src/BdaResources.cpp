@@ -21,7 +21,7 @@ namespace {
 // The page tables built per device, reused by a build whose ranges (guest ranges, device
 // addresses, permissions) equal one of them: consecutive address-based builds map the same registered
 // set through the same imports and mirrors, so the ~1200-entry table repeats. The shader only reads
-// the table (its lookup keeps its state in function variables and, for the range it found last,
+// the table (its lookup keeps its state in function variables and, for the ranges it found last,
 // in per-invocation Private ones), and a batch in flight keeps its BdaResources, so sharing the
 // buffer is safe. A table is written once, below, before it is bound or shared: the lookup's range
 // cache (DefineBdaLookupCore) relies on it never changing afterwards. The cache holds the tables weakly: they never outlive

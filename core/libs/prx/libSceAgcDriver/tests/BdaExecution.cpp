@@ -89,9 +89,10 @@ private:
 
 }
 
-// Each sequence runs with the range cache and without it (APS5_NO_BDA_RANGE_CACHE=1 in the
-// recompiler), with and without stopping invocations: the output words, the whole fault buffer
-// (fault record and noted pages) and the data must be equal, and the cached run must give the
+// Each sequence runs with the range cache keeping one, two and four ranges and without it
+// (APS5_BDA_RANGE_CACHE_ENTRIES and APS5_NO_BDA_RANGE_CACHE=1 in the recompiler), with and without
+// stopping invocations: the output words, the whole fault buffer
+// (fault record and noted pages) and the data must be equal, and the cached runs must give the
 // stated values and fault.
 static void RunBdaRangeCacheTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
@@ -134,19 +135,20 @@ static void RunBdaRangeCacheTests(const Context& context) {
         Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         Buffer output(context, steps.size() * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         for (const bool stops : {true, false}) {
-            const auto run = [&](bool rangeCache) {
+            const auto run = [&](std::uint32_t rangeCacheEntries) {
                 fill();
                 std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
                 for (std::size_t word = 0; word < steps.size(); ++word) std::memcpy(output.Bytes().data() + word * 4u, &Sentinel, 4u);
-                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCache, stops), {&table, &fault, &output});
+                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCacheEntries, stops), {&table, &fault, &output});
                 pipeline.Run(1);
                 Outcome outcome{std::vector<std::uint32_t>(steps.size()), {fault.Bytes().begin(), fault.Bytes().end()}, {writable.Bytes().begin(), writable.Bytes().end()}};
                 std::memcpy(outcome.values.data(), output.Bytes().data(), steps.size() * 4u);
                 outcome.data.insert(outcome.data.end(), readOnly.Bytes().begin(), readOnly.Bytes().end());
                 return outcome;
             };
-            const auto cached = run(true);
-            Require(cached == run(false), "BDA range cache: " + name + (stops ? " (stopping)" : " (continuing)") + " differs from the searched lookup");
+            const auto cached = run(1);
+            const auto searched = run(0);
+            for (const auto entries : {1u, 2u, 4u}) Require((entries == 1u ? cached : run(entries)) == searched, "BDA range cache: " + name + (stops ? " (stopping)" : " (continuing)") + " with " + std::to_string(entries) + " kept ranges differs from the searched lookup");
             if (expected == nullptr) continue;
             Abi::Fault report{};
             std::memcpy(&report, cached.fault.data(), sizeof(report));
@@ -181,6 +183,26 @@ static void RunBdaRangeCacheTests(const Context& context) {
     check("reads below the first range", sorted, 3, {{Step::Read, guest - 4}, {Step::Read, guest}}, &expected);
     expected = {{0, 0}, Abi::FaultReason::InvalidTable, guest, 1, 0};
     check("an invalid table", sorted, 2, {{Step::Read, guest}, {Step::Read, guest + 4}}, &expected);
+    // More ranges than any cache keeps, each read twice in turn, then a store and reads behind it.
+    {
+        std::vector<Abi::Range> many;
+        for (std::uint32_t range = 0; range < 6u; ++range) many.push_back({guest + range * 8u, guest + range * 8u + 4u, writable.DeviceAddress() + range * 4u, Abi::Read | Abi::Write, 0});
+        std::vector<Step> steps;
+        expected = {};
+        for (const auto range : {0u, 1u, 2u, 3u, 4u, 5u, 0u, 1u, 0u, 5u, 3u, 2u, 2u, 4u, 1u}) {
+            steps.push_back({Step::Read, guest + range * 8u});
+            expected.values.push_back(low(range * 4u));
+        }
+        steps.push_back({Step::Store, guest + 24, 0x11223344u});
+        expected.values.push_back(0x11223344u);
+        for (const auto range : {0u, 3u, 5u, 3u}) {
+            steps.push_back({Step::Read, guest + range * 8u});
+            expected.values.push_back(range == 3u ? 0x11223344u : low(range * 4u));
+        }
+        check("reads over six ranges", many, 6, steps, &expected);
+        expected = {{low(0), low(4), low(8), 0, low(0), low(4)}, Abi::FaultReason::Unmapped, guest + 4, 1, 3};
+        check("a read in the gap behind a kept range", many, 6, {{Step::Read, guest}, {Step::Read, guest + 8}, {Step::Read, guest + 16}, {Step::Read, guest + 4}, {Step::Read, guest}, {Step::Read, guest + 8}}, &expected);
+    }
     // Ranges the cache does not keep, because the checks a kept range skips could fail in them: a
     // device address of zero, and device addresses that wrap.
     {
