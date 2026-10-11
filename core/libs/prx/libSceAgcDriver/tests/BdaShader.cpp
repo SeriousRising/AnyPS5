@@ -6,7 +6,7 @@
 namespace {
 
 template<typename TEmit>
-std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t rangeCacheEntries = ShaderRecompiler::BdaRangeCacheDefaultEntries, bool writes = false, bool rangeCacheCheck = false) {
+std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, bool deferred, std::uint32_t rangeCacheEntries = ShaderRecompiler::BdaRangeCacheDefaultEntries, bool writes = false, bool rangeCacheCheck = false) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -34,6 +34,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
         state.module.AddAnnotation(spv::OpDecorate, interfaceVariables[0], spv::DecorationBuiltIn, spv::BuiltInLocalInvocationIndex);
     }
     state.bdaStopsInvocations = stops;
+    state.bdaStopDeferred = stops && deferred;
     state.bdaRangeCacheEntries = rangeCacheEntries;
     state.bdaRangeCacheCheck = rangeCacheCheck;
     DefineGetBdaPointer(state);
@@ -53,7 +54,9 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
         base = Binary(state, spv::OpIAdd, TypeScalarU64(state), base, Unary(state, spv::OpUConvert, TypeScalarU64(state), index));
     }
     const auto values = emit(ctx, instruction, base);
-    for (std::uint32_t index = 0; index < values.size(); ++index) state.module.AddFunction(spv::OpStore, BdaWord(state, output, ConstantU32(state, index)), values[index]);
+    EmitUnlessBdaStopped(state, [&] {
+        for (std::uint32_t index = 0; index < values.size(); ++index) state.module.AddFunction(spv::OpStore, BdaWord(state, output, ConstantU32(state, index)), values[index]);
+    });
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
@@ -63,23 +66,23 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
 
 }
 
-std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset) {
+std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset, bool deferred) {
     using namespace ShaderRecompiler;
     return MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         if (offset != 0) base = AddBdaAddress(ctx, instruction, base, BdaConstant(ctx.state, offset < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(offset) : static_cast<std::uint64_t>(offset)), offset < 0);
         return std::vector<std::uint32_t>{EmitBdaRead(ctx, instruction, base, bits)};
-    });
+    }, deferred);
 }
 
-std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops) {
+std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, bool deferred) {
     using namespace ShaderRecompiler;
     return MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         const auto values = EmitBdaDwordReads(ctx, instruction, base, 0u, dwords, true);
         return std::vector<std::uint32_t>(values.begin(), values.begin() + dwords);
-    });
+    }, deferred);
 }
 
-std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck) {
+std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck, bool deferred) {
     using namespace ShaderRecompiler;
     return MakeShader(0, false, stops, [&](SpirvValueEmitContext& ctx, IrValue& instruction, std::uint32_t) {
         auto& state = ctx.state;
@@ -106,5 +109,5 @@ std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep
             }
         }
         return values;
-    }, rangeCacheEntries, true, rangeCacheCheck);
+    }, deferred, rangeCacheEntries, true, rangeCacheCheck);
 }

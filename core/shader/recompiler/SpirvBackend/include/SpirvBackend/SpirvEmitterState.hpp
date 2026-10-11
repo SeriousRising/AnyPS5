@@ -133,6 +133,12 @@ struct SpirvEmitterState {
     std::uint32_t bdaStopValue = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
+    // A faulting read sets bdaStopped and its invocation runs on without effects instead of ending at
+    // the read (see BdaStopCanBeDeferred). The flow emitter clears it for the blocks of guest loops,
+    // where a faulting read still ends the invocation at once.
+    bool bdaStopDeferred = false;
+    // Private bool, true once the invocation met a fault that ends it; 0 in programs that defer no stop.
+    std::uint32_t bdaStopped = 0;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.
     std::uint32_t waveLdsScope = 0;

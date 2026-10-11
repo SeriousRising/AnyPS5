@@ -2389,7 +2389,10 @@ void orderedPixelShaderTests() {
     faulting.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
     std::size_t kills = 0;
     const auto exits = interlockExits(ShaderRecompiler::Recompile(faulting).spirv.Words(), kills);
-    Require(exits.empty() && kills == 6u, "a primitive-ordered pixel shader with BDA reads: " + (exits.empty() ? std::to_string(kills) + " OpKill, not the valid-mask kill and 5 BDA fault kills" : exits));
+    // One kill where the program returns for a pixel a faulting read flagged, or one at each of the
+    // five places a read can fault with APS5_BDA_STOP_PER_SITE=1.
+    const std::size_t faultKills = std::getenv("APS5_BDA_STOP_PER_SITE") != nullptr ? 5u : 1u;
+    Require(exits.empty() && kills == 1u + faultKills, "a primitive-ordered pixel shader with BDA reads: " + (exits.empty() ? std::to_string(kills) + " OpKill, not the valid-mask kill and " + std::to_string(faultKills) + " for BDA faults" : exits));
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(orderedPixelRequest(0x30600u, plain))); }, "fragmentShaderPixelInterlock");
 }
 

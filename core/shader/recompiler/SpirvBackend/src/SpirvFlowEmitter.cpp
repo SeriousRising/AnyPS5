@@ -9,6 +9,9 @@
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <utility>
 
 namespace ShaderRecompiler {
@@ -81,6 +84,8 @@ const BlockInfo* BlockInfoFor(const IrProgram& program, const IrBlock* block) {
 
 void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
     auto& state = ctx.state;
+    // A pixel with a pending stop is discarded with its exports; other stages have had no effects.
+    if (state.program.Resources().stage == IrShaderStage::Pixel) EndStoppedBdaInvocation(state);
     if (state.loopGuardLimit != 0 && state.faultBufferVariable != 0) {
         const auto pc = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), pc, state.loopGuardPc);
@@ -122,6 +127,43 @@ bool IsLoopMerge(const IrProgram& program, std::uint32_t block) {
     return false;
 }
 
+// The ids of the blocks a loop header reaches without passing its merge block: the loop's blocks.
+std::unordered_set<std::uint32_t> LoopBlocks(const IrProgram& program) {
+    const auto& infos = program.Metadata().blockInfo;
+    std::unordered_map<std::uint32_t, const BlockInfo*> byId;
+    for (const auto& info : infos) byId.emplace(info.id, &info);
+    std::unordered_set<std::uint32_t> looped;
+    for (const auto& header : infos) {
+        if (!header.terminator.loopHeader) continue;
+        std::unordered_set<std::uint32_t> seen;
+        std::vector<std::uint32_t> pending{header.id};
+        while (!pending.empty()) {
+            const auto id = pending.back();
+            pending.pop_back();
+            const auto found = byId.find(id);
+            if (id == header.terminator.mergeBlock || found == byId.end() || !seen.insert(id).second) continue;
+            const auto& terminator = found->second->terminator;
+            if (terminator.kind == TerminatorKind::Branch || terminator.kind == TerminatorKind::ConditionalBranch) pending.push_back(terminator.trueBlock);
+            if (terminator.kind == TerminatorKind::ConditionalBranch) pending.push_back(terminator.falseBlock);
+            if (terminator.loopHeader) pending.push_back(terminator.continueBlock);
+        }
+        looped.insert(seen.begin(), seen.end());
+    }
+    return looped;
+}
+
+bool EntersLoop(const IrProgram& program, const BlockInfo& info) {
+    const auto header = [&](std::uint32_t id) {
+        for (const auto& target : program.Metadata().blockInfo) {
+            if (target.id == id) return target.terminator.loopHeader;
+        }
+        return false;
+    };
+    const auto& terminator = info.terminator;
+    if (terminator.kind == TerminatorKind::Branch) return header(terminator.trueBlock);
+    return terminator.kind == TerminatorKind::ConditionalBranch && (header(terminator.trueBlock) || header(terminator.falseBlock));
+}
+
 bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
     for (const auto& info : program.Metadata().blockInfo) {
         if (info.terminator.loopHeader && info.terminator.continueBlock == block) return true;
@@ -131,7 +173,7 @@ bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
 
 std::uint32_t EmitWaveAny(SpirvEmitterState& state, std::uint32_t predicate) {
     const auto ballot = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), ballot, ConstantU32(state, spv::ScopeSubgroup), predicate);
+    state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), ballot, ConstantU32(state, spv::ScopeSubgroup), UnlessBdaStopped(state, predicate));
     const auto wave = EmitWaveBallot(state, ballot);
     const auto low = state.module.AllocateId();
     const auto high = state.module.AllocateId();
@@ -751,7 +793,11 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
-                EmitStructuredInstruction(lane, functionState, *inst);
+                // The stores BdaStopCanBeDeferred counts on being skipped; address-based ones are
+                // refused by their lookup.
+                const bool stores = inst->Type() == IrType::Void && (BufferAccessOf(inst->Opcode()) == BufferAccess::Write || ImageOpcodeInfoOf(inst->Opcode()).access == ImageAccess::Write);
+                if (stores) EmitUnlessBdaStopped(state, [&] { EmitStructuredInstruction(lane, functionState, *inst); });
+                else EmitStructuredInstruction(lane, functionState, *inst);
             }
         }
         state.laneHalf = 0;
@@ -802,6 +848,8 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
                          byId ? static_cast<int>(byId->terminator.kind) : -1, byId ? byId->terminator.trueBlock : 0u, byId ? byId->terminator.falseBlock : 0u);
         }
     }
+    const bool deferred = state.bdaStopDeferred;
+    const auto looped = deferred ? LoopBlocks(program) : std::unordered_set<std::uint32_t>{};
     for (const IrBlock* block : blocks) {
         if (block == nullptr) {
             context.Fail("structured control flow contains a null block");
@@ -812,10 +860,15 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         }
         const bool stops = state.bdaStopsInvocations;
         state.bdaStopsInvocations = stops && !IsContinueTarget(program, info->id);
+        // An invocation with a pending stop never enters a guest loop, where the zeros it reads
+        // could keep it, and one that faults inside a loop ends there.
+        state.bdaStopDeferred = deferred && !looped.contains(info->id);
         EmitStructuredBlock(context, functionState, block);
+        if (EntersLoop(program, *info)) EndStoppedBdaInvocation(state);
         functionState.blockExitLabels.emplace(block, state.currentLabel);
         EmitStructuredTerminator(context, program, *info);
         state.bdaStopsInvocations = stops;
+        state.bdaStopDeferred = deferred;
     }
     PatchStructuredPhis(context, functionState);
 }

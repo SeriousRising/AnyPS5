@@ -118,7 +118,8 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto ballotType = TypeU32Vector(state, 4u);
     const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, low, scope, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
+    // An invocation with a pending stop is absent from the wave, as one that ended is.
+    state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, low, scope, UnlessBdaStopped(state, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate)));
     if (otherHalf == nullptr) {
         return EmitWaveBallot(state, low);
     }
@@ -279,6 +280,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+    state.bdaStopDeferred = BdaStopCanBeDeferred(state);
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
