@@ -53,15 +53,17 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
         std::uint64_t bytes = 0;
         double ms = 0, resolveMs = 0, flushMs = 0, storeMs = 0;
         std::array<std::uint64_t, 6> outcomes{};
+        std::array<std::uint64_t, 4> sizes{};
+        std::array<std::uint64_t, 3> sources{};
     };
     struct Slow {
         double ms = 0;
         std::string text;
     };
-    static constexpr std::array<const char*, 5> formNames{"fill <=64K", "fill >64K", "copy <=64K", "copy >64K", "GDS"};
+    static constexpr std::array<const char*, 6> formNames{"fill <=64K", "fill >64K", "copy <=64K", "copy >64K", "to GDS", "from GDS"};
     static constexpr std::array<const char*, 8> coverNames{"none", "exact", "inside", "around", "straddle", "several", "keys", "layer"};
     static std::mutex mutex;
-    static std::array<Form, 5> forms{};
+    static std::array<Form, 6> forms{};
     static std::array<Slow, 6> slowest{};
     static std::chrono::steady_clock::time_point lastReport{};
     if (packet.size() < 7) return;
@@ -70,11 +72,22 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
     const std::size_t bytes = packet[6] & 0x3ffffffu;
     const bool gds = source == 1 || destination == 1;
     const bool fill = source == 2;
-    const std::size_t form = gds ? 4u : (fill ? 0u : 2u) + (bytes > 65536 ? 1u : 0u);
+    const std::size_t form = destination == 1 ? 4u : source == 1 ? 5u : (fill ? 0u : 2u) + (bytes > 65536 ? 1u : 0u);
     const auto from = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
     const auto to = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
     std::string slowText;
-    if (totalMs >= 1.0 && !gds && bytes != 0) {
+    if (totalMs >= 1.0 && gds) {
+        char text[320];
+        char origin[48];
+        if (fill) std::snprintf(origin, sizeof(origin), "fill %08x", packet[2]);
+        else if (source == 1) std::snprintf(origin, sizeof(origin), "GDS+0x%x", packet[2]);
+        else std::snprintf(origin, sizeof(origin), "0x%llx", static_cast<unsigned long long>(from));
+        char target[48];
+        if (destination == 1) std::snprintf(target, sizeof(target), "GDS+0x%x", packet[4]);
+        else std::snprintf(target, sizeof(target), "0x%llx", static_cast<unsigned long long>(to));
+        std::snprintf(text, sizeof(text), " [%.1f ms: 0x%zx bytes %s -> %s, resolve %.1f flush %.1f store %.1f, %s reason %d]", totalMs, bytes, origin, target, times.resolveMs, times.flushMs, times.storeMs, DmaOutcomeNames[times.outcome], times.reason);
+        slowText = text;
+    } else if (totalMs >= 1.0 && bytes != 0) {
         const auto cover = [](std::uint64_t address, std::size_t size) {
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             return coverNames[static_cast<std::size_t>(Graphics::StorageTexture::ClassifyFill(address, size).cover) % coverNames.size()];
@@ -95,6 +108,8 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
         entry.flushMs += times.flushMs;
         entry.storeMs += times.storeMs;
         ++entry.outcomes[times.outcome];
+        ++entry.sizes[bytes <= 4 ? 0u : bytes <= 8 ? 1u : bytes <= 64 ? 2u : 3u];
+        ++entry.sources[fill ? 0u : source == 1 ? 2u : 1u];
         if (!slowText.empty()) {
             const auto least = std::min_element(slowest.begin(), slowest.end(), [](const Slow& left, const Slow& right) { return left.ms < right.ms; });
             if (totalMs > least->ms) *least = {totalMs, std::move(slowText)};
@@ -109,6 +124,11 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
             std::snprintf(text, sizeof(text), " %s x%llu %.1f MiB %.0f ms (resolve %.0f, flush %.0f, store %.0f; gpu %llu, completion %llu, cpu %llu, gpu copy %llu, empty %llu, drained %llu);", formNames[i], static_cast<unsigned long long>(each.packets), static_cast<double>(each.bytes) / 1048576.0, each.ms, each.resolveMs, each.flushMs, each.storeMs,
                           static_cast<unsigned long long>(each.outcomes[0]), static_cast<unsigned long long>(each.outcomes[1]), static_cast<unsigned long long>(each.outcomes[2]), static_cast<unsigned long long>(each.outcomes[3]), static_cast<unsigned long long>(each.outcomes[4]), static_cast<unsigned long long>(each.outcomes[5]));
             line += text;
+            if (i >= 4) {
+                std::snprintf(text, sizeof(text), " (bytes <=4 %llu, <=8 %llu, <=64 %llu, more %llu; source fill %llu, memory %llu, GDS %llu);", static_cast<unsigned long long>(each.sizes[0]), static_cast<unsigned long long>(each.sizes[1]), static_cast<unsigned long long>(each.sizes[2]), static_cast<unsigned long long>(each.sizes[3]),
+                              static_cast<unsigned long long>(each.sources[0]), static_cast<unsigned long long>(each.sources[1]), static_cast<unsigned long long>(each.sources[2]));
+                line += text;
+            }
         }
         line += " slowest:";
         std::sort(slowest.begin(), slowest.end(), [](const Slow& left, const Slow& right) { return left.ms > right.ms; });

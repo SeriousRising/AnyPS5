@@ -425,7 +425,9 @@ void testCopies() {
     std::size_t flexibleBefore = 0;
     check(sceKernelAvailableFlexibleMemorySize(&flexibleBefore) == 0, "cannot query flexible memory");
     const auto toGds = makePacket(0x50, {0x60100000 | cachePolicies, low(source.data()), high(source.data()), 0x100, 0, 16});
-    check(!AgcDriver::Pm4::ResolveStore(toGds, state, 64).has_value(), "DMA_DATA to GDS resolved as a memory store");
+    const auto gdsStore = AgcDriver::Pm4::ResolveStore(toGds, state, 64);
+    check(gdsStore.has_value() && gdsStore->address == AgcDriver::Pm4::GdsAddress() + 0x100 && gdsStore->Bytes().size() == 16 && std::memcmp(gdsStore->Bytes().data(), source.data(), 16) == 0, "DMA_DATA to the GDS did not resolve as a store of its source bytes at the GDS offset");
+    check(!AgcDriver::Pm4::ResolveStore(makePacket(0x50, {0x60100000, low(source.data()), high(source.data()), 0x102, 0, 16}), state, 64).has_value() && !AgcDriver::Pm4::ResolveStore(toGds, state, 8).has_value(), "an unaligned or oversized DMA_DATA to the GDS resolved as a GPU store");
     execute(state, toGds);
     std::size_t flexibleAfter = 0;
     check(sceKernelAvailableFlexibleMemorySize(&flexibleAfter) == 0 && flexibleAfter == flexibleBefore, "the GDS was charged to the flexible memory budget");

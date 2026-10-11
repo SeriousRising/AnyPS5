@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "execution/VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -204,6 +205,16 @@ void testDmaData() {
         submit({0xc0055000u, 0x60000000u, low(source.data()), high(source.data()), low(destination.data()), high(destination.data()), bytes});
         check(std::equal(source.begin(), source.begin() + words, destination.begin()) && destination[words] == 0xdeadbeefu, "a DMA_DATA copy stored other bytes than its source over its range");
     }
+    const auto* gds = reinterpret_cast<const std::uint32_t*>(AgcDriver::Pm4::GdsAddress());
+    submit({0xc0055000u, 0x40100000u, 0u, 0u, 0x200u, 0u, 0x20u});
+    source[0] = 0x01234567u;
+    source[1] = 0x89abcdefu;
+    submit({0xc0055000u, 0x60100000u, low(source.data()), high(source.data()), 0x208u, 0u, 8u});
+    submit({0xc0055000u, 0x40100000u, 0x55667788u, 0u, 0x214u, 0u, 4u});
+    check(gds[0x200 / 4] == 0 && gds[0x204 / 4] == 0 && gds[0x208 / 4] == 0x01234567u && gds[0x20c / 4] == 0x89abcdefu && gds[0x210 / 4] == 0 && gds[0x214 / 4] == 0x55667788u && gds[0x218 / 4] == 0, "DMA_DATA stores to the GDS left other bytes than their sources");
+    destination.fill(0xdeadbeefu);
+    submit({0xc0055000u, 0x20000000u, 0x208u, 0u, low(destination.data()), high(destination.data()), 16u});
+    check(destination[0] == 0x01234567u && destination[1] == 0x89abcdefu && destination[2] == 0 && destination[3] == 0x55667788u && destination[4] == 0xdeadbeefu, "a DMA_DATA copy from the GDS stored other bytes than the GDS holds");
 }
 
 void testEndOfPipeInterrupts() {
