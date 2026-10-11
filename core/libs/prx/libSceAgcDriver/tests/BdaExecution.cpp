@@ -135,11 +135,11 @@ static void RunBdaRangeCacheTests(const Context& context) {
         Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         Buffer output(context, steps.size() * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         for (const bool stops : {true, false}) {
-            const auto run = [&](std::uint32_t rangeCacheEntries, bool rangeCacheCheck = false) {
+            const auto run = [&](std::uint32_t rangeCacheEntries, bool rangeCacheCheck = false, bool deferred = true) {
                 fill();
                 std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
                 for (std::size_t word = 0; word < steps.size(); ++word) std::memcpy(output.Bytes().data() + word * 4u, &Sentinel, 4u);
-                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCacheEntries, stops, rangeCacheCheck), {&table, &fault, &output});
+                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCacheEntries, stops, rangeCacheCheck, deferred), {&table, &fault, &output});
                 pipeline.Run(1);
                 Outcome outcome{std::vector<std::uint32_t>(steps.size()), {fault.Bytes().begin(), fault.Bytes().end()}, {writable.Bytes().begin(), writable.Bytes().end()}};
                 std::memcpy(outcome.values.data(), output.Bytes().data(), steps.size() * 4u);
@@ -150,6 +150,9 @@ static void RunBdaRangeCacheTests(const Context& context) {
             const auto searched = run(0);
             for (const auto entries : {1u, 2u, 4u}) {
                 for (const bool checked : {false, true}) Require((entries == 1u && !checked ? cached : run(entries, checked)) == searched, "BDA range cache: " + name + (stops ? " (stopping)" : " (continuing)") + " with " + std::to_string(entries) + " kept ranges" + (checked ? " and the check" : "") + " differs from the searched lookup");
+            }
+            if (stops) {
+                for (const auto entries : {0u, 1u, 2u, 4u}) Require(run(entries, false, false) == searched, "BDA range cache: " + name + " with " + std::to_string(entries) + " kept ranges and the invocation ended at the faulting read differs from the deferred stop");
             }
             if (expected == nullptr) continue;
             Abi::Fault report{};
@@ -241,14 +244,14 @@ void RunBdaExecutionTests(const Context& context) {
     Buffer table(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    const auto run = [&](std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason, std::uint32_t count = 2, std::uint32_t groups = 1, std::int64_t offset = 0) {
+    const auto runWith = [&](bool deferred, std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason, std::uint32_t count, std::uint32_t groups, std::int64_t offset) {
         const Abi::Header header{Abi::Version, count, sizeof(Abi::Range), 0};
         std::memcpy(table.Bytes().data(), &header, sizeof(header));
         std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::uint32_t sentinel = 0xdeadbeef;
         std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
-        Pipeline pipeline(context, MakeBdaTestShader(address, bits, offset), {&table, &fault, &output});
+        Pipeline pipeline(context, MakeBdaTestShader(address, bits, offset, deferred), {&table, &fault, &output});
         pipeline.Run(groups);
         Abi::Fault report{};
         std::uint32_t result = 0;
@@ -261,6 +264,9 @@ void RunBdaExecutionTests(const Context& context) {
             Require(result == sentinel, "faulting BDA shader continued to output a substitute value");
         }
     };
+    const auto run = [&](std::uint64_t address, std::uint32_t bits, std::uint32_t expected, Abi::FaultReason reason, std::uint32_t count = 2, std::uint32_t groups = 1, std::int64_t offset = 0) {
+        for (const bool deferred : {true, false}) runWith(deferred, address, bits, expected, reason, count, groups, offset);
+    };
     run(guest, 8, 0x11, static_cast<Abi::FaultReason>(0));
     run(guest + 1, 16, 0x3322, static_cast<Abi::FaultReason>(0));
     run(guest + 1, 32, 0x55443322, static_cast<Abi::FaultReason>(0));
@@ -271,14 +277,14 @@ void RunBdaExecutionTests(const Context& context) {
     run(std::numeric_limits<std::uint64_t>::max() - 2, 8, 0, Abi::FaultReason::Overflow, 2, 1, 4);
     run(1, 8, 0, Abi::FaultReason::Overflow, 2, 1, -4);
     Buffer words(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    const auto read = [&](std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, std::uint32_t value, bool faults) {
+    const auto read = [&](std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, std::uint32_t value, bool faults, bool deferred) {
         const Abi::Header header{Abi::Version, 2, sizeof(Abi::Range), 0};
         std::memcpy(table.Bytes().data(), &header, sizeof(header));
         std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
         std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
         const std::array<std::uint32_t, 4> sentinel{0xdeadbeef, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
         std::memcpy(words.Bytes().data(), sentinel.data(), sizeof(sentinel));
-        Pipeline pipeline(context, MakeBdaDwordReadTestShader(address, dwords, coherent, stops), {&table, &fault, &words});
+        Pipeline pipeline(context, MakeBdaDwordReadTestShader(address, dwords, coherent, stops, deferred), {&table, &fault, &words});
         pipeline.Run(1);
         Abi::Fault report{};
         std::array<std::uint32_t, 4> result{};
@@ -298,9 +304,12 @@ void RunBdaExecutionTests(const Context& context) {
     };
     for (const bool stops : {true, false}) {
         for (const bool coherent : {false, true}) {
-            read(guest + 1, 1, coherent, stops, 0x55443322, false);
-            read(guest + 3, 1, coherent, stops, 0x5544, true);
-            read(guest + 1, 4, coherent, stops, 0x55443322, true);
+            for (const bool deferred : {true, false}) {
+                if (deferred && !stops) continue;
+                read(guest + 1, 1, coherent, stops, 0x55443322, false, deferred);
+                read(guest + 3, 1, coherent, stops, 0x5544, true, deferred);
+                read(guest + 1, 4, coherent, stops, 0x55443322, true, deferred);
+            }
         }
     }
     ranges[0].permissions = 0;

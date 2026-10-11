@@ -36,7 +36,7 @@ std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::ui
     const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);
     const auto physical = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaPointerFunction, guest, ConstantU32(state, 1u), instruction);
-    if (state.bdaStopsInvocations) {
+    if (state.bdaStopsInvocations && !state.bdaStopDeferred) {
         StopBdaInvocationIf(state, Binary(state, spv::OpIEqual, TypeBool(state), physical, BdaConstant(state, 0u)));
         const auto pointer = state.module.AllocateId();
         state.module.AddFunction(spv::OpConvertUToPtr, bytePointer, pointer, physical);
@@ -45,7 +45,7 @@ std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::ui
         return Unary(state, spv::OpUConvert, TypeU32(state), loaded);
     }
     // Unmapped bytes read as zero; the fault is recorded and every invocation reaches the
-    // program's barriers.
+    // program's barriers, or runs on with its stop pending.
     const auto mapped = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
     const auto before = state.currentLabel;
     const auto loadLabel = state.module.AllocateId();
@@ -62,6 +62,7 @@ std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::ui
     EmitLabel(state, merge);
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpPhi, TypeU32(state), value, widened, loadLabel, ConstantU32(state, 0u), before);
+    StopBdaInvocationIf(state, Unary(state, spv::OpLogicalNot, TypeBool(state), mapped));
     return value;
 }
 

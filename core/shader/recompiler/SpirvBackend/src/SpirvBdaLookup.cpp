@@ -270,7 +270,14 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
             state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, looked.reason, address, bytes, instruction);
         });
     }
-    state.module.AddFunction(spv::OpReturnValue, looked.address);
+    auto found = looked.address;
+    if (state.bdaStopped != 0u && (permission & BdaAbi::Write) != 0u) {
+        // An invocation with a pending stop stores nothing (see BdaStopCanBeDeferred).
+        const auto stopped = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeBool(state), stopped, state.bdaStopped);
+        found = Select(state, u64, stopped, BdaConstant(state, 0u), found);
+    }
+    state.module.AddFunction(spv::OpReturnValue, found);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
 }
@@ -336,6 +343,7 @@ void PrepareBdaLookups(SpirvEmitterState& state) {
     const auto differs = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpINotEqual, boolean, left, right); };
     const auto either = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpLogicalOr, boolean, left, right); };
     // The header words are read only when the buffer holds them.
+    if (state.bdaStopped != 0u) state.module.AddFunction(spv::OpStore, state.bdaStopped, ConstantBool(state, false));
     state.module.AddFunction(spv::OpStore, state.bdaTableInvalid, constant(1));
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
@@ -356,6 +364,7 @@ void PrepareBdaLookups(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (!state.program.Info().usesDma) return;
     DefineBdaFaultFunction(state);
+    if (state.bdaStopDeferred) state.bdaStopped = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
     state.bdaLookupFunction = DefineBdaLookupCore(state);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);

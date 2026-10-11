@@ -1785,9 +1785,10 @@ void verifyBdaInlinedSize() {
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
     // 316 instructions a read without the cache, 47 more with one kept range, 22 for each further one
     // and 20 for the check, with some room. RADV's compile time and memory follow the count only
-    // loosely (an invocation that stops at a faulting read costs most of both): 200 such reads took
-    // 24 s and 1.03 GiB without the cache (315,987 here), 25 s and 1.23 GiB with one kept range
-    // (362,992), 25 s and 1.28 GiB with two (384,997), on Mesa 26.1.6.
+    // loosely: what costs most of both is an invocation ending at each read (APS5_BDA_STOP_PER_SITE=1),
+    // not the count. 200 such reads took 4.0 s and 0.53 GiB without the cache (310,034 here; 23 s and
+    // 1.03 GiB, 315,987, ending at each read) and 4.6 s and 0.55 GiB with one kept range (357,039;
+    // 25 s and 1.23 GiB, 362,992), on Mesa 26.1.6.
     const std::uint64_t limit = 320000u + (entries != 0u ? 25000u + entries * 22000u : 0u) + (checked ? 20000u : 0u);
     require(total <= limit, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than " + std::to_string(limit)).c_str());
 }

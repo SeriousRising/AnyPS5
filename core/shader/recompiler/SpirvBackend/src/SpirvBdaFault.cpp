@@ -1,7 +1,10 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -83,8 +86,15 @@ void ReturnBdaFailureIf(SpirvEmitterState& state, std::uint32_t condition, std::
     EmitLabel(state, next);
 }
 
-void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
-    if (!state.bdaStopsInvocations) return;
+namespace {
+
+std::uint32_t LoadBdaStopped(SpirvEmitterState& state) {
+    const auto stopped = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeBool(state), stopped, state.bdaStopped);
+    return stopped;
+}
+
+void EndBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
     const auto failed = state.module.AllocateId();
     const auto next = state.module.AllocateId();
     state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
@@ -99,6 +109,105 @@ void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
         state.module.AddFunction(state.program.Resources().stage == IrShaderStage::Pixel ? spv::OpKill : spv::OpReturn);
     }
     EmitLabel(state, next);
+}
+
+}
+
+void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
+    if (!state.bdaStopsInvocations) return;
+    if (!state.bdaStopDeferred) {
+        EndBdaInvocationIf(state, condition);
+        return;
+    }
+    state.module.AddFunction(spv::OpStore, state.bdaStopped, Binary(state, spv::OpLogicalOr, TypeBool(state), LoadBdaStopped(state), condition));
+}
+
+void EndStoppedBdaInvocation(SpirvEmitterState& state) {
+    if (state.bdaStopsInvocations && state.bdaStopDeferred) EndBdaInvocationIf(state, LoadBdaStopped(state));
+}
+
+std::uint32_t UnlessBdaStopped(SpirvEmitterState& state, std::uint32_t condition) {
+    if (!state.bdaStopDeferred) return condition;
+    return Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, Unary(state, spv::OpLogicalNot, TypeBool(state), LoadBdaStopped(state)));
+}
+
+void EmitUnlessBdaStopped(SpirvEmitterState& state, const std::function<void()>& emit) {
+    if (!state.bdaStopDeferred) {
+        emit();
+        return;
+    }
+    EmitIfCondition(state, UnlessBdaStopped(state, ConstantBool(state, true)), emit);
+}
+
+bool BdaStopCanBeDeferred(const SpirvEmitterState& state) {
+    static const bool perSite = std::getenv("APS5_BDA_STOP_PER_SITE") != nullptr;
+    const auto& program = state.program;
+    const auto stage = program.Resources().stage;
+    if (perSite || !program.Info().usesDma || !state.bdaStopsInvocations || (stage != IrShaderStage::Pixel && stage != IrShaderStage::Compute)) return false;
+    // APS5_TRACE_BDA=1 names what keeps a program on one stop per read site.
+    static const bool traced = std::getenv("APS5_TRACE_BDA") != nullptr;
+    const auto refuse = [&](const char* reason) {
+        if (traced) std::fprintf(stderr, "[gpu] shader 0x%llx stage %u ends a faulting invocation at each address read: %s\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(stage), reason);
+        return false;
+    };
+    if (state.laneCount != 1u) return refuse("two lanes per invocation");
+    for (const auto* block : program.BlockOrder()) {
+        for (const auto* instruction : block->Instructions()) {
+            const auto opcode = instruction->Opcode();
+            switch (opcode) {
+                case IrOpcode::DppMoveU32:
+                case IrOpcode::DppUpdateU32:
+                case IrOpcode::ReadFirstLane:
+                case IrOpcode::ReadLane:
+                case IrOpcode::WriteLane:
+                case IrOpcode::Permlane16U32:
+                case IrOpcode::SwizzleU32:
+                case IrOpcode::PermuteU32:
+                case IrOpcode::BpermuteU32:
+                    return refuse(std::string(IrOpcodeName(opcode)).c_str());
+                default:
+                    break;
+            }
+            if (!IrOpcodeHasSideEffects(opcode) || AddressOpcodeInfoOf(opcode).access != AddressAccess::None) continue;
+            if (instruction->Type() == IrType::Void && (BufferAccessOf(opcode) == BufferAccess::Write || ImageOpcodeInfoOf(opcode).access == ImageAccess::Write)) continue;
+            switch (opcode) {
+                case IrOpcode::SetRegister:
+                case IrOpcode::Branch:
+                case IrOpcode::BranchConditional:
+                case IrOpcode::Loop:
+                case IrOpcode::LoopMerge:
+                case IrOpcode::Return:
+                case IrOpcode::Unreachable:
+                case IrOpcode::Reference:
+                case IrOpcode::ReferenceU32:
+                case IrOpcode::SetThreadBitScalarRegister:
+                case IrOpcode::SetScalarMaskTag:
+                case IrOpcode::SetScalarRegister:
+                case IrOpcode::SetVectorRegister:
+                case IrOpcode::SetGotoVariable:
+                case IrOpcode::SetScc:
+                case IrOpcode::SetExec:
+                case IrOpcode::SetExecLo:
+                case IrOpcode::SetExecHi:
+                case IrOpcode::SetVcc:
+                case IrOpcode::SetVccLo:
+                case IrOpcode::SetVccHi:
+                case IrOpcode::SetM0:
+                case IrOpcode::Waitcnt:
+                case IrOpcode::Sendmsg:
+                case IrOpcode::TtraceData:
+                case IrOpcode::InstPrefetch:
+                    continue;
+                case IrOpcode::Discard:
+                case IrOpcode::SetAttribute:
+                    if (stage == IrShaderStage::Pixel) continue;
+                    return refuse(std::string(IrOpcodeName(opcode)).c_str());
+                default:
+                    return refuse(std::string(IrOpcodeName(opcode)).c_str());
+            }
+        }
+    }
+    return true;
 }
 
 }
