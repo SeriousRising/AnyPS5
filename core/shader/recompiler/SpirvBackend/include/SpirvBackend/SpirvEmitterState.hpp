@@ -7,8 +7,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -111,6 +113,27 @@ struct BdaSharedRead {
     bool tries = false;
 };
 
+// A leaf of the direct table walked where a block first reads a base address that it reads more
+// than once: the leaf of that base plus `immediate`, the address's `offset` in the leaf's unit and
+// `limit`, the leaf's bytes less 3 (0 for fewer). A dword `distance` bytes from the walked address
+// lies in the leaf's mapping when offset + distance, unsigned, is below the limit, and is then read
+// with no walk of its own. `reads` counts the block's dword reads of the base; no leaf is walked
+// ahead for one.
+struct BdaDirectHint {
+    std::uint32_t reads = 0;
+    bool walked = false;
+    std::uint32_t delta = 0;
+    std::uint32_t bytes = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t limit = 0;
+    std::uint32_t offset = 0;
+    std::int32_t immediate = 0;
+};
+
+// The values a read's base address is computed from (the address pair or the handle's, and the low
+// dword), and whether the low dword is rounded down to a multiple of 4.
+using BdaDirectKey = std::tuple<const IrValue*, const IrValue*, const IrValue*, bool>;
+
 struct SpirvEmitterState {
     const ImageResource* runtimeImage = nullptr;
     std::uint32_t runtimeImageMetadata = 0u;
@@ -147,6 +170,15 @@ struct SpirvEmitterState {
     std::uint32_t bdaLookupFunction = 0;
     // Private: not zero when the page table's header is invalid (set by PrepareBdaLookups).
     std::uint32_t bdaTableInvalid = 0;
+    // The program is made for the direct table (BdaAbi::DirectVersion): a lookup walks it instead of
+    // searching the ranges, and neither keeps ranges nor shares base addresses.
+    bool bdaDirect = false;
+    // Private, set by PrepareBdaLookups from the direct table's header: its base (u64), root shift,
+    // (1 << root shift) - 1 and root count, the count 0 when the header is invalid.
+    std::uint32_t bdaDirectBase = 0;
+    std::uint32_t bdaDirectShift = 0;
+    std::uint32_t bdaDirectMask = 0;
+    std::uint32_t bdaDirectCount = 0;
     // How many ranges lookup_bda keeps for its invocation (see DefineBdaLookupCore); 0 searches at
     // every lookup. APS5_BDA_RANGE_CACHE_ENTRIES=<1 to 4> sets it, APS5_NO_BDA_RANGE_CACHE=1 clears it.
     std::uint32_t bdaRangeCacheEntries = BdaRangeCacheDefaultEntries;
@@ -164,8 +196,18 @@ struct SpirvEmitterState {
     std::uint32_t bdaAtomicPointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
     std::uint32_t bdaFaultFunction = 0;
+    // In a program for the direct table record_bda_fault keeps the invocation's first fault in these
+    // Private variables (reason, address, bytes, instruction; no fault: reason 0), and
+    // publish_bda_fault writes it to the fault buffer where the invocation ends.
+    std::array<std::uint32_t, 4> bdaPendingFault {};
+    std::uint32_t bdaPublishFunction = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaProbedDwordReadFunctions {};
+    // The direct table's dword reads, by what a faulting one does (nothing, returns a flag, sets the
+    // pending stop) and by coherence; see DefineBdaDirectDwordRead.
+    std::array<std::array<std::uint32_t, 2>, 3> bdaDirectDwordReadFunctions {};
+    // The leaves walked ahead in the block being emitted, by base (see BdaDirectHint).
+    std::map<BdaDirectKey, BdaDirectHint> bdaDirectHints;
     // Set when reads share translations (FindBdaSharedBases, off with APS5_NO_BDA_SHARED_BASE=1):
     // lookup_bda_span and the two functions below, which try a hull before the read's own bytes,
     // are then defined.
