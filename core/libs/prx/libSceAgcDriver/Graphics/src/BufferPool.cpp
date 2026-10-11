@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -181,7 +182,10 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
         return PutSlot(allocation.memory, allocation.offset);
     }
     // Device-local allocations (see DeviceBuffer) are never mapped.
-    if (allocation.mapping != nullptr) unmap(device, allocation.memory);
+    if (allocation.mapping != nullptr) {
+        unmap(device, allocation.memory);
+        NoteBufferUnmapped(allocation.allocationBytes);
+    }
     destroyBuffer(device, allocation.buffer, nullptr);
     freeMemory(device, allocation.memory, nullptr);
     return allocation.allocationBytes;

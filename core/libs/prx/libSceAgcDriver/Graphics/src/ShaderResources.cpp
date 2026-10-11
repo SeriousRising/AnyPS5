@@ -133,6 +133,10 @@ struct TextureCache {
         std::uint64_t stale = 0;
     } counts;
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
+    std::uint64_t hostBytes = 0;
+    std::uint64_t snapshotsMade = 0;
+    std::uint64_t snapshotBytesMade = 0;
+    std::chrono::steady_clock::time_point hostReported{};
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
     std::chrono::steady_clock::time_point budgetRead{};
     std::uint64_t budget = 0;
@@ -187,6 +191,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
+    cache.hostBytes -= it->bytes.size();
     if (it->source != nullptr) {
         for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
             if (view->second == it) {
@@ -223,7 +228,7 @@ void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
 }
 
 bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t budget) {
-    if (cache.bytes + incoming <= budget) return true;
+    if (cache.bytes + cache.hostBytes + incoming <= budget) return true;
     if (const auto now = std::chrono::steady_clock::now(); now - cache.passedSince >= std::chrono::seconds(1)) {
         cache.passed = 0;
         cache.passedSince = now;
@@ -235,14 +240,14 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     }
     const bool firstUse = incoming != 0 && present != 0 && !cache.firstUses.contains(key);
     const auto ceiling = budget + budget / 4u;
-    while (!cache.entries.empty() && cache.bytes + incoming > budget) {
+    while (!cache.entries.empty() && cache.bytes + cache.hostBytes + incoming > budget) {
         const auto back = std::prev(cache.entries.end());
         if (firstUse && back->present + 1u >= present) {
             cache.firstUses.insert(key);
             ++cache.counts.uncached;
             return false;
         }
-        const bool over = cache.bytes + incoming > ceiling;
+        const bool over = cache.bytes + cache.hostBytes + incoming > ceiling;
         const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1);
         if (keep && cache.passed < cache.entries.size()) {
             cache.entries.splice(cache.entries.begin(), cache.entries, back);
@@ -697,7 +702,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
-    if (!admitTexture(cache, key, entry.accounted, budget)) {
+    if (!admitTexture(cache, key, entry.accounted + entry.bytes.size(), budget)) {
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
@@ -705,10 +710,21 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return texture;
     }
     cache.bytes += entry.accounted;
+    cache.hostBytes += entry.bytes.size();
+    if (!entry.bytes.empty()) {
+        ++cache.snapshotsMade;
+        cache.snapshotBytesMade += entry.bytes.size();
+    }
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));
+    if (const auto now = std::chrono::steady_clock::now(); now - cache.hostReported >= std::chrono::seconds(30)) {
+        cache.hostReported = now;
+        const auto mapped = MappedBufferUsage();
+        std::fprintf(stderr, "[gpu] sampled texture cache host memory: %zu entries keep %llu MiB of snapshots beside %llu MiB of device memory (budget %llu MiB for both); %llu snapshots of %llu MiB made so far; %llu mapped buffers of %llu MiB are live\n", cache.entries.size(), static_cast<unsigned long long>(cache.hostBytes >> 20u), static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(budget >> 20u),
+                     static_cast<unsigned long long>(cache.snapshotsMade), static_cast<unsigned long long>(cache.snapshotBytesMade >> 20u), static_cast<unsigned long long>(mapped.count), static_cast<unsigned long long>(mapped.bytes >> 20u));
+    }
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
     reportCacheCounts(cache, budget);
@@ -938,6 +954,7 @@ TextureCacheUse TextureCacheUsage() {
         dropUncachedViews(sampled);
         use.sampledEntries = sampled.entries.size();
         use.sampledBytes = sampled.bytes;
+        use.sampledHostBytes = sampled.hostBytes;
     }
     use.storageBytes = storageCacheBytes();
     return use;
