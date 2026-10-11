@@ -1761,7 +1761,9 @@ void verifyBdaInlinedSize() {
     // would never hit).
     const char* entriesText = std::getenv("APS5_BDA_RANGE_CACHE_ENTRIES");
     const auto entries = std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : entriesText != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entriesText, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
-    require(keptByLookup.size() == (entries == 0u ? 0u : entries * 5u + 1u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
+    // With the check each kept range has its begin too, and the header is validated every time.
+    const bool checked = std::getenv("APS5_BDA_RANGE_CACHE_CHECK") != nullptr;
+    require(keptByLookup.size() == (entries == 0u ? 0u : checked ? entries * 6u : entries * 5u + 1u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
     std::cout << "BDA inlined size: " << Reads << " address-based dword reads inline to " << total << " instructions\n";
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
     // An eighth of what the reads took before they shared one lookup, for one kept range, and 22

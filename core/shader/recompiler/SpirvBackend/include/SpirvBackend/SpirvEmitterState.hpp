@@ -111,6 +111,9 @@ struct SpirvEmitterState {
     // How many ranges lookup_bda keeps for its invocation (see DefineBdaLookupCore); 0 searches at
     // every lookup. APS5_BDA_RANGE_CACHE_ENTRIES sets it, APS5_NO_BDA_RANGE_CACHE=1 clears it.
     std::uint32_t bdaRangeCacheEntries = BdaRangeCacheDefaultEntries;
+    // Debug aid (APS5_BDA_RANGE_CACHE_CHECK=1): lookup_bda searches at every lookup as well and reports
+    // a kept range that differs from the one the search selects (BdaAbi::FaultReason::RangeCacheMismatch).
+    bool bdaRangeCacheCheck = false;
     // The cache's Private variables (64-bit, then 32-bit); empty without the cache.
     std::vector<std::uint32_t> bdaRangeCache64;
     std::vector<std::uint32_t> bdaRangeCache32;

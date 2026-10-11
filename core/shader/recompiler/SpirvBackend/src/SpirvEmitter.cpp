@@ -272,6 +272,10 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         return entries != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entries, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
     }();
     state.bdaRangeCacheEntries = bdaRangeCacheEntries;
+    // Debug aid: APS5_BDA_RANGE_CACHE_CHECK=1 has every lookup search too and report a kept range the
+    // search contradicts.
+    static const bool bdaRangeCacheCheck = std::getenv("APS5_BDA_RANGE_CACHE_CHECK") != nullptr;
+    state.bdaRangeCacheCheck = bdaRangeCacheCheck;
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
