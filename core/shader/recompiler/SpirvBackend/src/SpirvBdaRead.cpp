@@ -1,6 +1,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include <algorithm>
 #include <compare>
 #include <cstdio>
@@ -758,14 +759,29 @@ void FindBdaSharedBases(SpirvEmitterState& state) {
         }
     }
     state.bdaSharedBase = !state.bdaSharedBases.empty();
-    // APS5_TRACE_BDA=1 prints how a program's address-based dword reads share base addresses.
+    // APS5_TRACE_BDA=1 prints how a program's address-based dword reads share base addresses, and
+    // how many shared bases are computed only from values that are the same for the whole draw or
+    // dispatch (user data, constants and what the resource walk reads): the bases the CPU could
+    // translate once per draw. Nothing uses that count yet.
     static const bool traced = std::getenv("APS5_TRACE_BDA") != nullptr;
     if (traced && reads != 0u) {
         std::map<std::size_t, std::size_t> sizes;
         for (const auto& key : order) ++sizes[found.at(key).reads.size()];
         std::string text;
         for (const auto& [size, count] : sizes) text += (text.empty() ? "" : ", ") + std::to_string(count) + " of " + std::to_string(size);
-        std::fprintf(stderr, "[gpu] shader 0x%llx stage %u: %zu of %zu address-based dword reads share %zu base addresses (bases by reads: %s)\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(program.Resources().stage), sharing, reads, state.bdaSharedBases.size(), text.c_str());
+        std::size_t uniformBases = 0;
+        std::size_t uniformReads = 0;
+        const SrtWalker walker;
+        for (const auto& key : order) {
+            const auto& group = found.at(key);
+            if (group.reads.size() < 2u) continue;
+            bool uniform = true;
+            for (const IrValue* value : {key.pairLow, key.pairHigh, key.low}) uniform = uniform && (value == nullptr || walker.ValidateRuntimeValue(program.Resources(), value, RuntimeValueType::Integer));
+            if (!uniform) continue;
+            ++uniformBases;
+            uniformReads += group.reads.size();
+        }
+        std::fprintf(stderr, "[gpu] shader 0x%llx stage %u: %zu of %zu address-based dword reads share %zu base addresses (bases by reads: %s); %zu bases with %zu reads are the same for the whole draw or dispatch\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(program.Resources().stage), sharing, reads, state.bdaSharedBases.size(), text.c_str(), uniformBases, uniformReads);
     }
 }
 
