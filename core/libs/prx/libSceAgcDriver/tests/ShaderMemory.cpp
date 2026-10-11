@@ -1685,7 +1685,6 @@ void verifyBdaReadFallbackFunctions() {
 void verifyBdaInlinedSize() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Reads = 1000u;
-    constexpr std::uint64_t InlinedBefore = 3379957u;
     const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
     const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     const std::array<std::uint32_t, 12> userData{0x10000000u, 0u, 0x20000000u, 0u, 0x30000000u, 0u, 128u, 0x01016facu, 0x40000000u, 0u, 0x50000000u, 0u};
@@ -1756,22 +1755,21 @@ void verifyBdaInlinedSize() {
         return total;
     };
     const auto total = measure(entry);
-    // The range cache is five per-invocation variables a kept range and one more; the optimizer must
-    // leave them Private (as locals of lookup_bda they would be lost between calls and the cache
-    // would never hit).
+    // The lookup reads one per-invocation variable for the header's validity and five for each kept
+    // range (six with the check); the optimizer must leave them Private (as locals of lookup_bda they
+    // would be lost between calls: the header would never be valid and the cache would never hit).
     const char* entriesText = std::getenv("APS5_BDA_RANGE_CACHE_ENTRIES");
     const auto entries = std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : entriesText != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entriesText, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
-    // With the check each kept range has its begin too, and the header is validated every time.
     const bool checked = std::getenv("APS5_BDA_RANGE_CACHE_CHECK") != nullptr;
-    require(keptByLookup.size() == (entries == 0u ? 0u : checked ? entries * 6u : entries * 5u + 1u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
+    require(keptByLookup.size() == 1u + entries * (checked ? 6u : 5u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
     std::cout << "BDA inlined size: " << Reads << " address-based dword reads inline to " << total << " instructions\n";
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
-    // An eighth of what the reads took before they shared one lookup, for one kept range, and 22
-    // instructions a read for each further one. RADV's compile time and memory follow the count:
-    // 200 such reads took 26 s and 1.01 GiB without the cache (344,957 here), 28 s and 1.31 GiB with
-    // one kept range (413,963), 30 s and 1.37 GiB with two (435,968), 33 s and 1.48 GiB with four
-    // (479,978), on Mesa 26.1.6.
-    const std::uint64_t limit = InlinedBefore / 8u + (entries > 1u ? (entries - 1u) * 22u * Reads : 0u);
+    // 316 instructions a read without the cache, 47 more with one kept range, 22 for each further one
+    // and 20 for the check, with some room. RADV's compile time and memory follow the count only
+    // loosely (an invocation that stops at a faulting read costs most of both): 200 such reads took
+    // 24 s and 1.03 GiB without the cache (315,987 here), 25 s and 1.23 GiB with one kept range
+    // (362,992), 25 s and 1.28 GiB with two (384,997), on Mesa 26.1.6.
+    const std::uint64_t limit = 320000u + (entries != 0u ? 25000u + entries * 22000u : 0u) + (checked ? 20000u : 0u);
     require(total <= limit, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than " + std::to_string(limit)).c_str());
 }
 

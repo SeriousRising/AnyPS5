@@ -108,6 +108,8 @@ struct SpirvEmitterState {
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaLookupFunction = 0;
+    // Private: not zero when the page table's header is invalid (set by PrepareBdaLookups).
+    std::uint32_t bdaTableInvalid = 0;
     // How many ranges lookup_bda keeps for its invocation (see DefineBdaLookupCore); 0 searches at
     // every lookup. APS5_BDA_RANGE_CACHE_ENTRIES sets it, APS5_NO_BDA_RANGE_CACHE=1 clears it.
     std::uint32_t bdaRangeCacheEntries = BdaRangeCacheDefaultEntries;
