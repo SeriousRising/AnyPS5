@@ -23,9 +23,11 @@ namespace {
 //
 // With `span` the function is lookup_bda_span, for the reads that try a shared base's hull: a lookup
 // may ask it (BdaLookupSpan) whether the whole access takes the search its first byte takes. It then
-// searches whatever is kept, and fails unless the access ends at or below every begin the search
-// stopped short of: every byte of such an access, looked up by itself, is found in the same range,
-// sorted table or not. It shares the per-invocation variables of lookup_bda, defined first.
+// fails unless the access ends at or below every begin the search stopped short of: every byte of
+// such an access, looked up by itself, is found in the same range, sorted table or not. A kept range
+// that holds the address answers without a search, as for any lookup: its ceiling is the lowest
+// begin the search that kept it stopped short of, and the search of this address stops short of
+// the same begins. It shares the per-invocation variables of lookup_bda, defined first.
 std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state, bool span = false) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
@@ -111,7 +113,6 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state, bool span = false) {
     const auto ceiling = cache || shared ? local(u64) : 0u;
     const auto spanning = shared ? binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permission, constant(BdaLookupSpan)), constant(0)) : 0u;
     const auto wanted = shared ? binary(spv::OpBitwiseAnd, u32, permission, constant(BdaAbi::Read | BdaAbi::Write)) : permission;
-    if (shared) state.module.AddFunction(spv::OpStore, ceiling, BdaConstant(state, 0u));
     const auto invalidTable = binary(spv::OpINotEqual, boolean, load(state.bdaTableInvalid), constant(0));
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
     const auto overflowed = either(binary(spv::OpIEqual, boolean, bytes, constant(0)), binary(spv::OpULessThanEqual, boolean, end, address));
@@ -121,8 +122,13 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state, bool span = false) {
     };
     Taken taken{zero, zero, zero, constant(0), zero};
     std::uint32_t within = no;
+    // The ceiling of the kept range that holds the address; the check searches, and uses the search's.
+    std::uint32_t heldCeiling = zero;
     for (const auto& entry : kept) {
-        const auto holds = both(binary(spv::OpULessThanEqual, boolean, loadWide(entry.floor), address), binary(spv::OpULessThan, boolean, address, loadWide(entry.ceiling)));
+        const auto bottom = loadWide(entry.floor);
+        const auto top = loadWide(entry.ceiling);
+        const auto holds = both(binary(spv::OpULessThanEqual, boolean, bottom, address), binary(spv::OpULessThan, boolean, address, top));
+        if (!check) heldCeiling = within == no ? top : Select(state, u64, holds, top, heldCeiling);
         const Taken values{loadWide(entry.finish), loadWide(entry.delta), zero, load(entry.permissions), check ? loadWide(entry.begin) : zero};
         if (within == no) {
             within = holds;
@@ -133,8 +139,9 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state, bool span = false) {
         }
     }
     const Taken held = taken;
+    if (shared) state.module.AddFunction(spv::OpStore, ceiling, heldCeiling);
     auto searches = negate(either(invalidTable, overflowed));
-    if (cache && !check) searches = both(searches, shared ? either(negate(within), spanning) : negate(within));
+    if (cache && !check) searches = both(searches, negate(within));
     const auto phi = [&](std::uint32_t type, std::uint32_t value, std::uint32_t from, std::uint32_t otherwise, std::uint32_t before) {
         const auto merged = state.module.AllocateId();
         state.module.AddFunction(spv::OpPhi, type, merged, value, from, otherwise, before);
