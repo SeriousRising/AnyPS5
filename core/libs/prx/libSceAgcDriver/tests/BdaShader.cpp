@@ -10,7 +10,7 @@
 namespace {
 
 template<typename TEmit>
-std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, bool deferred, std::uint32_t rangeCacheEntries = ShaderRecompiler::BdaRangeCacheDefaultEntries, bool writes = false, bool rangeCacheCheck = false, const std::function<void(ShaderRecompiler::SpirvEmitterState&)>& shareBases = {}) {
+std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, bool deferred, std::uint32_t rangeCacheEntries = ShaderRecompiler::BdaRangeCacheDefaultEntries, bool writes = false, bool rangeCacheCheck = false, const std::function<void(ShaderRecompiler::SpirvEmitterState&)>& shareBases = {}, bool direct = false) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -39,6 +39,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     }
     state.bdaStopsInvocations = stops;
     state.bdaStopDeferred = stops && deferred;
+    state.bdaDirect = direct;
     state.bdaRangeCacheEntries = rangeCacheEntries;
     state.bdaRangeCacheCheck = rangeCacheCheck;
     state.bdaSharedBase = static_cast<bool>(shareBases);
@@ -63,6 +64,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     EmitUnlessBdaStopped(state, [&] {
         for (std::uint32_t index = 0; index < values.size(); ++index) state.module.AddFunction(spv::OpStore, BdaWord(state, output, ConstantU32(state, index)), values[index]);
     });
+    PublishBdaFault(state);
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
@@ -72,24 +74,32 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
 
 }
 
-std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset, bool deferred) {
+std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset, bool deferred, bool direct) {
     using namespace ShaderRecompiler;
     return MakeShader(address, false, true, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
+        // A direct dword read takes the offset as its immediate, as the emitter gives it one.
+        if (direct && bits == 32u && BdaDirectImmediate(static_cast<std::int32_t>(offset))) return std::vector<std::uint32_t>{EmitBdaDwordReads(ctx, instruction, base, static_cast<std::uint32_t>(offset), 1u, true)[0]};
         if (offset != 0) base = AddBdaAddress(ctx, instruction, base, BdaConstant(ctx.state, offset < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(offset) : static_cast<std::uint64_t>(offset)), offset < 0);
         return std::vector<std::uint32_t>{EmitBdaRead(ctx, instruction, base, bits)};
-    }, deferred);
+    }, deferred, BdaRangeCacheDefaultEntries, false, false, {}, direct);
 }
 
-std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, bool deferred) {
+std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, bool deferred, bool direct) {
     using namespace ShaderRecompiler;
     return MakeShader(address, coherent, stops, [&](SpirvValueEmitContext& ctx, const IrValue& instruction, std::uint32_t base) {
         const auto values = EmitBdaDwordReads(ctx, instruction, base, 0u, dwords, true);
         return std::vector<std::uint32_t>(values.begin(), values.begin() + dwords);
-    }, deferred);
+    }, deferred, BdaRangeCacheDefaultEntries, false, false, {}, direct);
 }
 
-std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck, bool deferred, std::uint64_t sharedBytes) {
+std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck, bool deferred, std::uint64_t sharedBytes, bool direct) {
     using namespace ShaderRecompiler;
+    // For the direct table: the leaf walked ahead for each block of `sharedBytes` bytes that two
+    // reads or more lie in, at its first read.
+    std::map<std::uint64_t, BdaDirectHint> hints;
+    for (const auto& step : steps) {
+        if (direct && sharedBytes != 0u && step.kind == BdaTestStep::Read) hints[step.address & ~(sharedBytes - 1u)].reads += step.dwords;
+    }
     // The hull of each base, by block and residue: [first address, end), and the reads in it.
     struct Hull {
         std::uint64_t first = ~std::uint64_t{0};
@@ -100,7 +110,7 @@ std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep
     };
     std::map<std::pair<std::uint64_t, std::uint64_t>, Hull> hulls;
     const auto hullOf = [&](const BdaTestStep& step) -> Hull* {
-        if (sharedBytes == 0u || step.kind != BdaTestStep::Read) return nullptr;
+        if (direct || sharedBytes == 0u || step.kind != BdaTestStep::Read) return nullptr;
         return &hulls[{step.address & ~(sharedBytes - 1u), step.address & 3u}];
     };
     for (const auto& step : steps) {
@@ -129,6 +139,17 @@ std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep
                     auto* hull = hullOf(steps[index]);
                     const auto dwords = steps[index].dwords;
                     std::array<std::uint32_t, 4> read{};
+                    if (direct && sharedBytes != 0u) {
+                        // The block's start is the base and the rest of the address the immediate.
+                        const auto block = steps[index].address & ~(sharedBytes - 1u);
+                        const auto immediate = static_cast<std::int32_t>(steps[index].address - block);
+                        auto& hint = hints[block];
+                        if (hint.reads >= 2u && !hint.walked) WalkBdaDirectHint(state, hint, BdaConstant(state, block), immediate);
+                        read = EmitBdaDwordReads(ctx, instruction, BdaConstant(state, block), static_cast<std::uint32_t>(immediate), dwords, true, nullptr, hint.walked ? &hint : nullptr);
+                        for (std::uint32_t dword = 1; dword < dwords; ++dword) read[0] = Binary(state, spv::OpIAdd, TypeU32(state), read[0], Binary(state, spv::OpIMul, TypeU32(state), read[dword], ConstantU32(state, 2u * dword + 1u)));
+                        values.push_back(read[0]);
+                        break;
+                    }
                     // The first read of a base tries its hull, and every third one after it (as a read under another condition would).
                     if (hull != nullptr && hull->reads >= 2u) read = EmitBdaSharedDwordReads(ctx, instruction, state.bdaSharedBases[hull->base], static_cast<std::int64_t>(steps[index].address - hull->first), hull->emitted++ % 3u == 0u, address, 0u, dwords, true);
                     else if (dwords == 1u) read[0] = EmitBdaRead(ctx, instruction, address, 32u);
@@ -151,5 +172,5 @@ std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep
             }
         }
         return values;
-    }, deferred, rangeCacheEntries, true, rangeCacheCheck, sharedBytes != 0u ? std::function<void(SpirvEmitterState&)>(shareBases) : std::function<void(SpirvEmitterState&)>{});
+    }, deferred, rangeCacheEntries, true, rangeCacheCheck, sharedBytes != 0u && !direct ? std::function<void(SpirvEmitterState&)>(shareBases) : std::function<void(SpirvEmitterState&)>{}, direct);
 }
