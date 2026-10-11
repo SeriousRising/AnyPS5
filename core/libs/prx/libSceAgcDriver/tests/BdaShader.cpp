@@ -40,7 +40,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
-    ResetBdaRangeCache(state);
+    PrepareBdaLookups(state);
     SpirvValueEmitContext ctx(state);
     auto& instruction = program.CreateValue(IrOpcode::LoadAddressU32, IrType::U32);
     MemoryFlags flags{};

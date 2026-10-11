@@ -963,7 +963,7 @@ void EmitProgram(SpirvEmitterState& state) {
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }
-    ResetBdaRangeCache(state);
+    PrepareBdaLookups(state);
     EmitMemoryOffsets(state);
     if (program.BlockOrder().empty()) {
         if (OrderedPixelShader(state)) {

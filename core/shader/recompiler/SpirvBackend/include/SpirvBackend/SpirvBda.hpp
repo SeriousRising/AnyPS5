@@ -20,8 +20,9 @@ struct BdaLookupResult {
 // Calls lookup_bda, which searches the page table unless one of the ranges the invocation found last
 // holds the address (APS5_NO_BDA_RANGE_CACHE=1 always searches); see DefineBdaLookupCore.
 BdaLookupResult BdaLookup(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission);
-// Empties lookup_bda's range cache; emitted at the start of the program's function.
-void ResetBdaRangeCache(SpirvEmitterState& state);
+// Validates the page table's header for lookup_bda and empties its range cache; emitted at the start
+// of the program's function.
+void PrepareBdaLookups(SpirvEmitterState& state);
 void DefineBdaFaultFunction(SpirvEmitterState& state);
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state);
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);
