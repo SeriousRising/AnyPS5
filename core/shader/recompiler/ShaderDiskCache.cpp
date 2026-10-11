@@ -380,6 +380,7 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
         out.Value(base.bytes);
     });
     writer.Value(invocation.bdaBaseStage);
+    writer.Value(invocation.bdaWrites);
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -406,6 +407,7 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
         in.Value(base.bytes);
     });
     reader.Value(invocation.bdaBaseStage);
+    reader.Value(invocation.bdaWrites);
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
