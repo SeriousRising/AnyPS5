@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include <source_location>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -403,11 +404,12 @@ public:
     // its own return address, so the table names the driver site, not the wrapper; without it the
     // return address of the Sync/SyncThrough call itself is taken, so an unannounced sync still
     // names its real caller.
-    static void CountSync(int source, const void* site = nullptr);
+    // `caller` is the calling function, printed with the site.
+    static void CountSync(int source, const void* site = nullptr, const char* caller = std::source_location::current().function_name());
     // Names only the site for the sync or drain this thread makes next (its source stays as
     // announced, or as the drain counts it): for a wrapper (VulkanDevice::ReapRecorded) whose
     // FinishUpTo counts the drain itself, so a CountSync there would count it twice.
-    static void AnnounceSyncSite(const void* site);
+    static void AnnounceSyncSite(const void* site, const char* caller = std::source_location::current().function_name());
     // APS5_PROFILE_DRAW: the calling thread's fence and timeline waits so far, in milliseconds (0
     // when not profiling): a caller reads it around a span of its own work to learn how much of
     // that span waited for the GPU (a resource build's nested flush-hook waits, a draw's).
