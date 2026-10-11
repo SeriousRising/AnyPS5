@@ -871,6 +871,42 @@ Recorder::AddressSites ProgramAddressSites(std::span<const std::uint32_t> spirv)
     return sites;
 }
 
+Recorder::ComputeShape ProgramComputeShape(std::span<const std::uint32_t> spirv) {
+    Recorder::ComputeShape shape;
+    std::unordered_map<std::uint32_t, std::string_view> names;
+    bool helper = false;
+    for (std::size_t at = 5; at < spirv.size();) {
+        const auto* words = &spirv[at];
+        const auto count = words[0] >> 16u;
+        const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (count == 0 || at + count > spirv.size()) break;
+        at += count;
+        if (op == spv::OpName && count >= 3) {
+            names[words[1]] = moduleName(words, count);
+        } else if (op == spv::OpExecutionMode && count >= 6 && words[2] == spv::ExecutionModeLocalSize) {
+            shape.localSize = {words[3], words[4], words[5]};
+        } else if (op == spv::OpFunction && count >= 3) {
+            const auto found = names.find(words[2]);
+            helper = found != names.end() && addressHelper(found->second);
+        } else if (helper) {
+            continue;
+        } else if (op == spv::OpLoopMerge) {
+            ++shape.loops;
+        } else if (op == spv::OpImageFetch) {
+            ++shape.fetches;
+        } else if (op >= spv::OpImageSampleImplicitLod && op <= spv::OpImageDrefGather && op != spv::OpImageFetch) {
+            ++shape.samples;
+        } else if (op == spv::OpImageRead) {
+            ++shape.imageReads;
+        } else if (op == spv::OpImageWrite) {
+            ++shape.imageWrites;
+        } else if (op >= spv::OpAtomicLoad && op <= spv::OpAtomicXor) {
+            ++shape.atomics;
+        }
+    }
+    return shape;
+}
+
 std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv) {
     using Detail = Recorder::DrawTimingDetail;
     constexpr std::uint8_t GuestStores = 128;

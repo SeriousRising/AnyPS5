@@ -51,6 +51,9 @@ std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv);
 // as reads, get_bda_pointer and read_bda_dword_bytes* as byte-path reads, get_bda_write_pointer and
 // get_bda_atomic_pointer as stores. Zero for a module without those names.
 Recorder::AddressSites ProgramAddressSites(std::span<const std::uint32_t> spirv);
+// APS5_PROFILE_GPU: a compute module's local size and what its code outside the address-based
+// access helpers holds (loops, texel fetches, samples, storage image reads and writes, atomics).
+Recorder::ComputeShape ProgramComputeShape(std::span<const std::uint32_t> spirv);
 
 struct MeshArguments {
     std::uint32_t groups;
