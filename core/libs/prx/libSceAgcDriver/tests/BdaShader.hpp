@@ -8,8 +8,10 @@
 
 // A stopping shader made with `deferred` flags a faulting read and runs on without effects (see
 // BdaStopCanBeDeferred); without it the invocation ends at the read. Both must give the same results.
-std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset = 0, bool deferred = true);
-std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, bool deferred = true);
+// With `direct` the shader is made for the direct table (BdaAbi::DirectVersion), and a 32-bit read
+// takes `offset` as its immediate.
+std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset = 0, bool deferred = true, bool direct = false);
+std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std::uint32_t dwords, bool coherent, bool stops, bool deferred = true, bool direct = false);
 struct BdaTestStep {
     enum Kind { Read, Store, AtomicAdd } kind;
     std::uint64_t address;
@@ -24,7 +26,10 @@ inline constexpr std::uint32_t BdaTestStepPc = 0x2000;
 // with a search at every lookup. With `sharedBytes` (a power of two, 0 for none) the reads whose
 // addresses lie in the same block of that many bytes and agree modulo 4 share one base address when
 // they are two or more (see EmitBdaSharedDwordReads); every other read looks its own bytes up.
-std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck = false, bool deferred = true, std::uint64_t sharedBytes = 0);
+// With `direct` the shader is made for the direct table: the lookup keeps and shares nothing, and
+// `sharedBytes` instead has the reads in one block of that many bytes take the block's start as
+// their base and the leaf walked ahead at the block's first read (see BdaDirectHint).
+std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck = false, bool deferred = true, std::uint64_t sharedBytes = 0, bool direct = false);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaContractTests();
 

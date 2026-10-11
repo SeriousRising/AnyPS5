@@ -2485,7 +2485,9 @@ void verifyBdaReadFallbackFunctions() {
     }
 }
 
-void verifyBdaInlinedSize() {
+// With `direct` the program is made for the direct table: its reads walk the table instead of
+// searching the ranges, and none of the switches below changes them.
+void verifyBdaInlinedSize(bool direct) {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Reads = 1000u;
     const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
@@ -2512,13 +2514,14 @@ void verifyBdaInlinedSize() {
     request.target.vulkanVersion = 0x00401000u;
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 32;
-    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.bdaAbiVersion = direct ? BdaAbi::DirectVersion : BdaAbi::Version;
     request.target.supportedCapabilities = capabilities;
     request.target.supportedExtensions = extensions;
     request.target.fragmentShaderBarycentricEnabled = false;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
-    const auto words = Recompile(request).spirv;
+    const auto result = Recompile(request);
+    const auto& words = result.spirv;
     struct Function {
         std::uint64_t instructions = 0;
         std::vector<std::uint32_t> calls;
@@ -2561,10 +2564,12 @@ void verifyBdaInlinedSize() {
     // The lookup reads one per-invocation variable for the header's validity and five for each kept
     // range (six with the check); the optimizer must leave them Private (as locals of lookup_bda they
     // would be lost between calls: the header would never be valid and the cache would never hit).
+    // The direct table's lookup reads five instead, whatever the switches: the header's validity,
+    // base, root shift, mask and count.
     const char* entriesText = std::getenv("APS5_BDA_RANGE_CACHE_ENTRIES");
-    const auto entries = std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : entriesText != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entriesText, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
-    const bool checked = std::getenv("APS5_BDA_RANGE_CACHE_CHECK") != nullptr;
-    require(keptByLookup.size() == 1u + entries * (checked ? 6u : 5u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
+    const auto entries = direct || std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : entriesText != nullptr ? std::clamp(static_cast<std::uint32_t>(std::strtoul(entriesText, nullptr, 10)), 1u, 4u) : BdaRangeCacheDefaultEntries;
+    const bool checked = !direct && std::getenv("APS5_BDA_RANGE_CACHE_CHECK") != nullptr;
+    require(keptByLookup.size() == (direct ? 5u : 1u) + entries * (checked ? 6u : 5u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
     // The module a draw specializes is optimized again (Recompiler's prepared programs): the same
     // variables must survive that pass.
     {
@@ -2584,8 +2589,18 @@ void verifyBdaInlinedSize() {
         }
         require(read.size() == keptByLookup.size(), ("BDA range cache: lookup_bda reads " + std::to_string(read.size()) + " per-invocation variables after the specializing optimization").c_str());
     }
-    std::cout << "BDA inlined size: " << Reads << " address-based dword reads inline to " << total << " instructions\n";
+    std::cout << "BDA inlined size: " << Reads << " address-based dword reads" << (direct ? " through the direct table" : "") << " inline to " << total << " instructions\n";
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
+    if (direct) {
+        // 179 instructions a read, 178,698 in all, with some room: the walk, the four ways out of a
+        // read (a dword, four bytes, a seam, a recorded fault) and, for the reads of a base read
+        // more than once in a block (all of them here), the test of the leaf walked ahead. A program
+        // that ends a faulting invocation at each read (APS5_BDA_STOP_PER_SITE=1) also publishes the
+        // fault there, which works it out with a walk of its own: 308,689.
+        require(result.bdaAbiVersion == BdaAbi::DirectVersion && result.bdaBases.empty(), "BDA inlined size: a program for the direct table has bases for the CPU to translate");
+        require(total <= (std::getenv("APS5_BDA_STOP_PER_SITE") != nullptr ? 320000u : 190000u), ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads through the direct table inline to " + std::to_string(total) + " instructions").c_str());
+        return;
+    }
     // 316 instructions a read without the cache, 47 more with one kept range, 22 for each further one
     // and 20 for the check, with some room. RADV's compile time and memory follow the count only
     // loosely: what costs most of both is an invocation ending at each read (APS5_BDA_STOP_PER_SITE=1),
@@ -2881,7 +2896,8 @@ int main(int argc, char** argv) {
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();
-        verifyBdaInlinedSize();
+        verifyBdaInlinedSize(false);
+        verifyBdaInlinedSize(true);
         verifyFunctionLdsBound();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
