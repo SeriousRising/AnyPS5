@@ -1058,6 +1058,14 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+namespace {
+std::atomic<std::uint64_t> passesBegun{0}, passesContinued{0};
+}
+
+DrawPassStats DrawPassCounters() {
+    return {passesBegun.load(std::memory_order_relaxed), passesContinued.load(std::memory_order_relaxed)};
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -1914,6 +1922,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
+    (continued ? passesContinued : passesBegun).fetch_add(1, std::memory_order_relaxed);
     const auto commands = start.commands;
     if (!continued) recorder->PrepareSampleSlot();
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
