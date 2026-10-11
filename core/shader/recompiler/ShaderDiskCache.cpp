@@ -65,8 +65,8 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 184, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 104, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 296, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(ShaderInvocation) == 136, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 320, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 448, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -374,6 +374,12 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
         out.Value(attribute.fetchIndex);
         out.Value(attribute.formatComponents);
     });
+    writer.List(invocation.bdaBases, [](Writer& out, const BdaAbi::BaseRequest& base) {
+        out.Value(base.base);
+        out.Value(base.hull);
+        out.Value(base.bytes);
+    });
+    writer.Value(invocation.bdaBaseStage);
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -394,6 +400,12 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
         in.Value(attribute.fetchIndex);
         in.Value(attribute.formatComponents);
     });
+    reader.List(invocation.bdaBases, 20, [](Reader& in, BdaAbi::BaseRequest& base) {
+        in.Value(base.base);
+        in.Value(base.hull);
+        in.Value(base.bytes);
+    });
+    reader.Value(invocation.bdaBaseStage);
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {

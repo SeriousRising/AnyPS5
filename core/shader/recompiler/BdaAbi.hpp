@@ -53,8 +53,30 @@ inline constexpr std::uint32_t WrittenPageSlots = 4096;
 inline constexpr std::uint32_t WrittenPageProbes = 8;
 inline constexpr std::uint32_t WrittenOverflowWord = sizeof(Fault) / sizeof(std::uint32_t);
 inline constexpr std::uint32_t WrittenSlotsWord = WrittenOverflowWord + 1;
-inline constexpr std::size_t FaultBufferBytes = (WrittenSlotsWord + WrittenPageSlots) * sizeof(std::uint32_t);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
+
+// The base addresses the CPU translated for one draw or dispatch follow the written pages. A program
+// whose reads share base addresses that are the same for the whole draw numbers them from 0; the
+// directory word of its stage holds 1 + the slot of its base 0, or 0 when the draw has none for it,
+// and a slot is the guest base address the CPU computed and the device address of the base's hull
+// (0: the hull is not in one readable range at a 4-aligned device address), each low dword first.
+// A program uses a slot only where its own base address equals the slot's.
+inline constexpr std::uint32_t BaseStages = 16;
+inline constexpr std::uint32_t BaseSlotCapacity = 1024;
+inline constexpr std::uint32_t BaseSlotWords = 4;
+inline constexpr std::uint32_t BaseDirectoryWord = WrittenSlotsWord + WrittenPageSlots;
+inline constexpr std::uint32_t BaseSlotsWord = BaseDirectoryWord + BaseStages;
+inline constexpr std::size_t FaultBufferBytes = (BaseSlotsWord + BaseSlotCapacity * BaseSlotWords) * sizeof(std::uint32_t);
+
+// A base as the CPU evaluated it for a draw: the base address and its hull, the `bytes` bytes from
+// `hull`. No bytes: the base could not be evaluated, or its address or hull wraps.
+struct BaseRequest {
+    std::uint64_t base = 0;
+    std::uint64_t hull = 0;
+    std::uint32_t bytes = 0;
+
+    bool operator==(const BaseRequest& other) const = default;
+};
 
 }
 

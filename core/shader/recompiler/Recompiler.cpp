@@ -21,6 +21,7 @@
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrProgram.hpp"
+#include "Optimization/include/Optimization/BdaSharedBases.hpp"
 #include "Optimization/include/Optimization/BindingAllocator.hpp"
 #include "Optimization/include/Optimization/ConstantFolder.hpp"
 #include "Optimization/include/Optimization/DeadCodeEliminator.hpp"
@@ -180,6 +181,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     resourceTracker.Track(program);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
+    PlanBdaBases(program);
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
 
     return program;
@@ -680,6 +682,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
+    result.bdaBases = snapshot.bdaBases;
+    result.bdaBaseStage = static_cast<std::uint32_t>(variant.info.stage);
     return result;
 }
 
@@ -794,7 +798,7 @@ void reportResultMemo() {
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
-// flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
+// flattened SRT, the user data, the uniform fill, the base addresses the CPU translates) and, for the vertex family, the V# table the
 // attributes are resolved from.
 std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -823,6 +827,12 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
     mix(snapshot.uniformFill.words);
     mix(snapshot.uniformFill.value);
+    mix(snapshot.bdaBases.size());
+    for (const auto& base : snapshot.bdaBases) {
+        mix(base.base);
+        mix(base.hull);
+        mix(base.bytes);
+    }
     for (const auto threads : partialThreads(request)) mix(threads);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {

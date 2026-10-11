@@ -203,10 +203,13 @@ std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, cons
 }
 
 std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t bits) {
+    const auto* shared = bits == 32u ? SharedBdaRead(ctx.state, inst) : nullptr;
+    const auto* translated = shared != nullptr ? EmitBdaCpuBaseCheck(ctx, shared->base) : nullptr;
     return EmitValueOrZeroIfCondition(ctx.state, ActiveArgument(ctx, inst), [&]() {
-        const auto* shared = bits == 32u ? SharedBdaRead(ctx.state, inst) : nullptr;
         if (shared == nullptr) return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
-        return EmitBdaSharedDwordReads(ctx, inst, ctx.state.bdaSharedBases[shared->base], shared->begin, shared->tries, GuestAddress(ctx, inst, mem), 0u, 1u)[0];
+        const auto& base = ctx.state.bdaSharedBases[shared->base];
+        const auto own = [&] { return EmitBdaSharedDwordReads(ctx, inst, base, shared->begin, shared->tries, GuestAddress(ctx, inst, mem), 0u, 1u); };
+        return (translated != nullptr ? EmitBdaCpuBaseDwordReads(ctx, inst, base, shared->begin, 1u, *translated, own) : own())[0];
     });
 }
 
@@ -359,10 +362,13 @@ void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t 
 
 std::uint32_t LoadBdaWide(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t components) {
     auto& state = ctx.state;
+    const auto* shared = SharedBdaRead(state, inst);
+    const auto* translated = shared != nullptr ? EmitBdaCpuBaseCheck(ctx, shared->base) : nullptr;
     return EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), TypeU32Composite(state, components), ConstantU32CompositeZero(state, components), [&]() {
-        const auto* shared = SharedBdaRead(state, inst);
         if (shared == nullptr) return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components));
-        return ConstructU32Composite(state, components, EmitBdaSharedDwordReads(ctx, inst, state.bdaSharedBases[shared->base], shared->begin, shared->tries, GuestAddressBase(ctx, inst, mem), mem.offset, components));
+        const auto& base = state.bdaSharedBases[shared->base];
+        const auto own = [&] { return EmitBdaSharedDwordReads(ctx, inst, base, shared->begin, shared->tries, GuestAddressBase(ctx, inst, mem), mem.offset, components); };
+        return ConstructU32Composite(state, components, translated != nullptr ? EmitBdaCpuBaseDwordReads(ctx, inst, base, shared->begin, components, *translated, own) : own());
     });
 }
 

@@ -1,6 +1,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include "Optimization/BdaSharedBases.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include <algorithm>
 #include <compare>
@@ -73,23 +74,6 @@ std::uint32_t EmitBdaBytes(SpirvEmitterState& state, std::uint32_t address, std:
         result = Binary(state, spv::OpBitwiseOr, TypeU32(state), result, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), value, ConstantU32(state, byte * 8u)));
     }
     return result;
-}
-
-// The dwords of a wide load that the program extracts (all of them when the composite is used
-// whole). Dead-code elimination has dropped the unused extracts, as it dropped unused dword loads
-// when every dword was its own instruction.
-std::uint32_t UsedBdaDwords(const IrValue& inst, std::uint32_t dwords) {
-    const auto all = (1u << dwords) - 1u;
-    if (dwords == 1u) return all;
-    std::uint32_t used = 0;
-    for (const IrValue* user : inst.Uses()) {
-        const auto opcode = user->Opcode();
-        if (opcode != IrOpcode::CompositeExtractU32x2 && opcode != IrOpcode::CompositeExtractU32x3 && opcode != IrOpcode::CompositeExtractU32x4) return all;
-        const IrValue* index = user->ArgumentCount() > 1u ? user->Argument(1) : nullptr;
-        if (index == nullptr || !index->HasImmediate() || index->ImmediateU32() >= dwords) return all;
-        used |= 1u << index->ImmediateU32();
-    }
-    return used;
 }
 
 void EmitBdaStoreAt(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t pointerType, std::uint32_t value, std::uint32_t instruction, std::uint32_t accessMask) {
@@ -585,23 +569,6 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     return values;
 }
 
-namespace {
-
-// The dwords the read extracts, as EmitBdaDwordReads finds them: {first, last}; first > last when none.
-std::pair<std::uint32_t, std::uint32_t> ExtractedBdaDwords(const IrValue& inst, std::uint32_t dwords, bool everyDword) {
-    const auto used = everyDword ? (1u << dwords) - 1u : UsedBdaDwords(inst, dwords);
-    std::uint32_t first = dwords;
-    std::uint32_t last = 0;
-    for (std::uint32_t dword = 0; dword < dwords; ++dword) {
-        if ((used & (1u << dword)) == 0u) continue;
-        first = std::min(first, dword);
-        last = dword;
-    }
-    return {first, last};
-}
-
-}
-
 // Why a member that skips its own path changes nothing. It runs only after a member of the same base,
 // with the same base address (ResetBdaSharedBases), took its own path and found the hull in one
 // range: every byte of the hull takes the search the hull's first byte took (BdaLookupSpan), so the
@@ -663,6 +630,7 @@ const BdaSharedRead* SharedBdaRead(const SpirvEmitterState& state, const IrValue
 }
 
 void ResetBdaSharedBases(SpirvEmitterState& state, const IrBlock* block) {
+    state.bdaCpuBaseChecks.clear();
     const auto found = state.bdaSharedBaseResets.find(block);
     if (found == state.bdaSharedBaseResets.end()) return;
     for (const auto base : found->second) state.module.AddFunction(spv::OpStore, state.bdaSharedBases[base].variable, BdaConstant(state, 0u));
@@ -673,83 +641,38 @@ void FindBdaSharedBases(SpirvEmitterState& state) {
     const auto& program = state.program;
     // Two lanes per invocation would need a translation for each.
     if (refused || !program.Info().usesDma || state.laneCount != 1u || BdaByteReadsForced()) return;
-    // What the base address is computed from: the address pair's dwords (or the high dword of a full
-    // address) and the low dword, and whether the low dword and the immediate lose their low bits.
-    struct Key {
-        const IrValue* pairLow;
-        const IrValue* pairHigh;
-        const IrValue* low;
-        bool scalar;
-        std::uint32_t residue;
-        auto operator<=>(const Key&) const = default;
-    };
-    struct Found {
-        std::vector<std::pair<const IrValue*, std::int64_t>> reads;
-        std::int64_t first = 0;
-        std::int64_t end = 0;
-        // The blocks and activity conditions under which a read of the base already tries the hull.
-        std::set<std::pair<const IrBlock*, const IrValue*>> tried;
-        std::vector<bool> tries;
-    };
-    std::map<Key, Found> found;
-    std::vector<Key> order;
+    const auto groups = CollectBdaBaseGroups(program);
     std::unordered_map<const IrValue*, const IrBlock*> definedIn;
-    const auto& memory = program.Resources().memoryInfo;
     for (const auto* block : program.BlockOrder()) {
-        for (const auto* inst : block->Instructions()) {
-            definedIn.emplace(inst, block);
-            std::uint32_t dwords = 0;
-            switch (inst->Opcode()) {
-                case IrOpcode::LoadAddressU32: dwords = 1u; break;
-                case IrOpcode::LoadAddressU32x2: dwords = 2u; break;
-                case IrOpcode::LoadAddressU32x3: dwords = 3u; break;
-                case IrOpcode::LoadAddressU32x4: dwords = 4u; break;
-                default: continue;
-            }
-            const auto index = inst->Flags<MemoryFlags>().index;
-            if (index >= memory.size() || inst->ArgumentCount() < 4u) continue;
-            const auto& mem = memory[index];
-            const bool scalar = mem.kind == ResourceKind::ScalarAddress;
-            if (mem.planningOnly || (!scalar && mem.kind != ResourceKind::Flat && mem.kind != ResourceKind::Global) || (scalar && dwords != 1u)) continue;
-            const auto [first, last] = ExtractedBdaDwords(*inst, dwords, false);
-            if (first > last) continue;
-            // As GuestAddress and EmitBdaDwordReads add them.
-            const auto at = [&](std::uint32_t dword) { return static_cast<std::int64_t>(static_cast<std::int32_t>(dwords == 1u ? (scalar ? mem.offset & ~3u : mem.offset) : mem.offset + dword * 4u)); };
-            if (at(last) - at(first) != static_cast<std::int64_t>(last - first) * 4) continue;
-            const IrValue* low = inst->Argument(1) != nullptr ? inst->Argument(1)->Resolve() : nullptr;
-            const IrValue* pairLow = nullptr;
-            const IrValue* pairHigh = nullptr;
-            if (mem.addressIsFull) {
-                pairHigh = inst->Argument(2) != nullptr ? inst->Argument(2)->Resolve() : nullptr;
-            } else {
-                const IrValue* handle = inst->Argument(0) != nullptr ? inst->Argument(0)->Resolve() : nullptr;
-                if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u || handle->Argument(0) == nullptr || handle->Argument(1) == nullptr) continue;
-                pairLow = handle->Argument(0)->Resolve();
-                pairHigh = handle->Argument(1)->Resolve();
-            }
-            if (low == nullptr || pairHigh == nullptr) continue;
-            const Key key{pairLow, pairHigh, low, scalar, static_cast<std::uint32_t>(at(first)) & 3u};
-            auto [entry, added] = found.try_emplace(key);
-            if (added) {
-                order.push_back(key);
-                entry->second.first = at(first);
-                entry->second.end = at(last) + 4;
-            }
-            const IrValue* active = inst->Argument(inst->ArgumentCount() - 1u);
-            entry->second.tries.push_back(entry->second.tried.emplace(block, active != nullptr ? active->Resolve() : nullptr).second);
-            entry->second.reads.emplace_back(inst, at(first));
-            entry->second.first = std::min(entry->second.first, at(first));
-            entry->second.end = std::max(entry->second.end, at(last) + 4);
-        }
+        for (const auto* inst : block->Instructions()) definedIn.emplace(inst, block);
     }
+    const auto& planned = program.Resources().bdaBases;
     std::size_t reads = 0;
     std::size_t sharing = 0;
-    for (const auto& key : order) {
-        const auto& group = found.at(key);
+    std::size_t cpuBases = 0;
+    std::size_t cpuReads = 0;
+    for (const auto& group : groups) {
         reads += group.reads.size();
         if (group.reads.size() < 2u) continue;
         sharing += group.reads.size();
+        const auto& key = group.key;
         const auto base = AddBdaSharedBase(state, group.first, static_cast<std::uint32_t>(group.end - group.first));
+        auto& added = state.bdaSharedBases[base];
+        added.pairLow = key.pairLow;
+        added.pairHigh = key.pairHigh;
+        added.low = key.low;
+        added.scalar = key.scalar;
+        // The plan was made before the passes that follow it; a slot is taken only for the same
+        // values and a hull that holds this one, and the program compares the slot's address.
+        for (std::uint32_t slot = 0; slot < planned.size() && slot < BdaAbi::BaseSlotCapacity; ++slot) {
+            const auto& plan = planned[slot];
+            if (plan.pairLow != key.pairLow || plan.pairHigh != key.pairHigh || plan.low != key.low || plan.scalar != key.scalar || plan.residue != key.residue || group.first < plan.first || group.end > plan.first + static_cast<std::int64_t>(plan.bytes)) continue;
+            added.cpuSlot = slot;
+            added.cpuBack = static_cast<std::uint32_t>(group.first - plan.first);
+            ++cpuBases;
+            cpuReads += group.reads.size();
+            break;
+        }
         for (std::size_t read = 0; read < group.reads.size(); ++read) state.bdaSharedReads.emplace(group.reads[read].first, BdaSharedRead{base, group.reads[read].second, group.tries[read]});
         for (const IrValue* value : {key.pairLow, key.pairHigh, key.low}) {
             const auto block = value != nullptr ? definedIn.find(value) : definedIn.end();
@@ -759,30 +682,106 @@ void FindBdaSharedBases(SpirvEmitterState& state) {
         }
     }
     state.bdaSharedBase = !state.bdaSharedBases.empty();
-    // APS5_TRACE_BDA=1 prints how a program's address-based dword reads share base addresses, and
-    // how many shared bases are computed only from values that are the same for the whole draw or
-    // dispatch (user data, constants and what the resource walk reads): the bases the CPU could
-    // translate once per draw. Nothing uses that count yet.
+    // APS5_TRACE_BDA=1 prints how a program's address-based dword reads share base addresses, how
+    // many shared bases are computed only from values that are the same for the whole draw or
+    // dispatch (user data, constants and what the resource walk reads), and how many of those take
+    // the device address the CPU translates for each draw (APS5_NO_BDA_CPU_BASE=1: none).
     static const bool traced = std::getenv("APS5_TRACE_BDA") != nullptr;
     if (traced && reads != 0u) {
         std::map<std::size_t, std::size_t> sizes;
-        for (const auto& key : order) ++sizes[found.at(key).reads.size()];
+        for (const auto& group : groups) ++sizes[group.reads.size()];
         std::string text;
         for (const auto& [size, count] : sizes) text += (text.empty() ? "" : ", ") + std::to_string(count) + " of " + std::to_string(size);
         std::size_t uniformBases = 0;
         std::size_t uniformReads = 0;
         const SrtWalker walker;
-        for (const auto& key : order) {
-            const auto& group = found.at(key);
+        for (const auto& group : groups) {
             if (group.reads.size() < 2u) continue;
             bool uniform = true;
-            for (const IrValue* value : {key.pairLow, key.pairHigh, key.low}) uniform = uniform && (value == nullptr || walker.ValidateRuntimeValue(program.Resources(), value, RuntimeValueType::Integer));
+            for (const IrValue* value : {group.key.pairLow, group.key.pairHigh, group.key.low}) uniform = uniform && (value == nullptr || walker.ValidateRuntimeValue(program.Resources(), value, RuntimeValueType::Integer));
             if (!uniform) continue;
             ++uniformBases;
             uniformReads += group.reads.size();
         }
-        std::fprintf(stderr, "[gpu] shader 0x%llx stage %u: %zu of %zu address-based dword reads share %zu base addresses (bases by reads: %s); %zu bases with %zu reads are the same for the whole draw or dispatch\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(program.Resources().stage), sharing, reads, state.bdaSharedBases.size(), text.c_str(), uniformBases, uniformReads);
+        std::fprintf(stderr, "[gpu] shader 0x%llx stage %u: %zu of %zu address-based dword reads share %zu base addresses (bases by reads: %s); %zu bases with %zu reads are the same for the whole draw or dispatch; %zu bases with %zu reads take the device address the CPU translates\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(program.Resources().stage), sharing, reads, state.bdaSharedBases.size(), text.c_str(), uniformBases, uniformReads, cpuBases, cpuReads);
     }
 }
+
+const BdaCpuBaseCheck* EmitBdaCpuBaseCheck(SpirvValueEmitContext& ctx, std::uint32_t baseIndex) {
+    auto& state = ctx.state;
+    const auto& base = state.bdaSharedBases[baseIndex];
+    if (base.cpuSlot == NoBdaCpuSlot || state.bdaBaseDirectory == 0u) return nullptr;
+    if (const auto found = state.bdaCpuBaseChecks.find(baseIndex); found != state.bdaCpuBaseChecks.end()) return &found->second;
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto both = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); };
+    const auto wide = [&](std::uint32_t low, std::uint32_t high) { return binary(spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, low), binary(spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, high), BdaConstant(state, 32u))); };
+    // The directory word is 1 + the slot of the program's base 0; a word that would put this base's
+    // slot past the last one is not the driver's and reads slot 0, unused.
+    const auto directory = state.bdaBaseDirectory;
+    const auto present = both(binary(spv::OpINotEqual, boolean, directory, constant(0u)), binary(spv::OpULessThanEqual, boolean, directory, constant(BdaAbi::BaseSlotCapacity - base.cpuSlot)));
+    const auto index = Select(state, u32, present, binary(spv::OpIAdd, u32, binary(spv::OpIMul, u32, directory, constant(BdaAbi::BaseSlotWords)), constant(BdaAbi::BaseSlotsWord + (base.cpuSlot - 1u) * BdaAbi::BaseSlotWords)), constant(BdaAbi::BaseSlotsWord));
+    const auto word = [&](std::uint32_t offset) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, BdaWord(state, state.faultBufferVariable, offset != 0u ? binary(spv::OpIAdd, u32, index, constant(offset)) : index));
+        return value;
+    };
+    const auto guest = wide(word(0u), word(1u));
+    const auto device = wide(word(2u), word(3u));
+    // The base address as GuestAddressBase computes it, without its fault: a sum that wrapped is
+    // below the pair, and so is a slot's address it equals.
+    auto low = ctx.Def(base.low);
+    if (base.scalar) low = binary(spv::OpBitwiseAnd, u32, low, constant(~3u));
+    auto usable = both(present, binary(spv::OpINotEqual, boolean, device, BdaConstant(state, 0u)));
+    if (base.pairLow == nullptr) {
+        usable = both(usable, binary(spv::OpIEqual, boolean, wide(low, ctx.Def(base.pairHigh)), guest));
+    } else {
+        const auto pair = wide(ctx.Def(base.pairLow), ctx.Def(base.pairHigh));
+        const auto address = binary(spv::OpIAdd, u64, pair, Unary(state, spv::OpUConvert, u64, low));
+        usable = both(usable, both(binary(spv::OpIEqual, boolean, address, guest), binary(spv::OpULessThanEqual, boolean, pair, guest)));
+    }
+    return &state.bdaCpuBaseChecks.emplace(baseIndex, BdaCpuBaseCheck{usable, device}).first->second;
+}
+
+std::array<std::uint32_t, 4> EmitBdaCpuBaseDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, const BdaSharedBase& base, std::int64_t begin, std::uint32_t dwords, const BdaCpuBaseCheck& check, const std::function<std::array<std::uint32_t, 4>()>& own) {
+    auto& state = ctx.state;
+    const auto u64 = TypeScalarU64(state);
+    const auto [first, last] = ExtractedBdaDwords(inst, dwords, false);
+    if (first > last || begin < base.first || static_cast<std::uint64_t>(begin - base.first) + (last - first + 1u) * 4u > base.bytes) ctx.Fail(inst, "BDA shared read lies outside its base's hull");
+    const auto back = base.cpuBack + static_cast<std::uint32_t>(begin - base.first);
+    const auto used = UsedBdaDwords(inst, dwords);
+    const auto directLabel = state.module.AllocateId();
+    const auto ownLabel = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, check.usable, directLabel, ownLabel);
+    EmitLabel(state, directLabel);
+    std::array<std::uint32_t, 4> direct{};
+    for (std::uint32_t dword = first; dword <= last; ++dword) {
+        if ((used & (1u << dword)) == 0u) continue;
+        const auto distance = back + (dword - first) * 4u;
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, distance != 0u ? Binary(state, spv::OpIAdd, u64, check.device, BdaConstant(state, distance)) : check.device);
+        direct[dword] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), direct[dword], pointer, BdaAccessMask(state, inst), 4u);
+    }
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, ownLabel);
+    auto values = own();
+    const auto ownExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    for (std::uint32_t dword = first; dword <= last; ++dword) {
+        if (direct[dword] == 0u) continue;
+        const auto read = values[dword];
+        values[dword] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, TypeU32(state), values[dword], direct[dword], directLabel, read, ownExit);
+    }
+    return values;
+}
+
 
 }

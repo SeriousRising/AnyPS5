@@ -1,6 +1,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include <algorithm>
 #include <bit>
 #include <utility>
 #include <vector>
@@ -389,6 +390,10 @@ void PrepareBdaLookups(SpirvEmitterState& state) {
     for (const auto variable : state.bdaRangeCache64) state.module.AddFunction(spv::OpStore, variable, BdaConstant(state, 0u));
     for (const auto variable : state.bdaRangeCache32) state.module.AddFunction(spv::OpStore, variable, ConstantU32(state, 0u));
     for (const auto& base : state.bdaSharedBases) state.module.AddFunction(spv::OpStore, base.variable, BdaConstant(state, 0u));
+    if (std::any_of(state.bdaSharedBases.begin(), state.bdaSharedBases.end(), [](const BdaSharedBase& base) { return base.cpuSlot != NoBdaCpuSlot; })) {
+        state.bdaBaseDirectory = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, state.bdaBaseDirectory, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::BaseDirectoryWord + static_cast<std::uint32_t>(state.program.Resources().stage))));
+    }
 }
 
 void DefineGetBdaPointer(SpirvEmitterState& state) {

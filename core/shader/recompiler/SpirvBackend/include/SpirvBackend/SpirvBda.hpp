@@ -92,6 +92,18 @@ const BdaSharedRead* SharedBdaRead(const SpirvEmitterState& state, const IrValue
 // not in one range, it reads as EmitBdaDwordReads does, and a member that `tries` has its own
 // lookup try the hull first.
 std::array<std::uint32_t, 4> EmitBdaSharedDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, const BdaSharedBase& base, std::int64_t begin, bool tries, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false);
+// Compares, once per block, the slot the CPU filled for a shared base with the base address the
+// program computes: the slot's hull may be used when the draw has slots for this program, the slot's
+// device address is not 0 and its guest base address is the program's (computed without a wrap).
+// Emitted where it is first asked for in a block, outside any activity condition; null for a base
+// the CPU does not translate.
+const BdaCpuBaseCheck* EmitBdaCpuBaseCheck(SpirvValueEmitContext& ctx, std::uint32_t base);
+// The dwords of a member of `base` under `check`: loaded at the slot's device address plus a constant
+// where the slot may be used, and read by `own` (the read without the CPU's slot, with its address
+// arithmetic and every fault) where it may not. The CPU translated the hull by the lookup's own rule
+// on the page table bound for the draw, so the bytes are the ones `own` would load, and no address
+// in a hull the CPU accepted wraps.
+std::array<std::uint32_t, 4> EmitBdaCpuBaseDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, const BdaSharedBase& base, std::int64_t begin, std::uint32_t dwords, const BdaCpuBaseCheck& check, const std::function<std::array<std::uint32_t, 4>()>& own);
 // Forgets, where `block` starts, the translations of the bases computed from a value it defines.
 void ResetBdaSharedBases(SpirvEmitterState& state, const IrBlock* block);
 bool BdaByteReadsForced();
