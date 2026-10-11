@@ -1808,16 +1808,41 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // against queue 0; its label goes behind a completion instead (reason 5, still no wait).
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
+    // APS5_PROFILE_DRAW: where a label store's time goes, on a [labels] line every 10 s (under the
+    // GpuMutex like the call): the reap, the import lookup, the unit shadow check, the recorded
+    // store, and the label table entry with the pending-write note and the write stamp.
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::array<double, 5> stepMs{};
+    static std::uint64_t stores = 0, idle = 0;
+    static auto lastReport = std::chrono::steady_clock::now();
+    auto stepStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto step = [&](std::size_t index) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        stepMs[index] += std::chrono::duration<double, std::milli>(now - stepStart).count();
+        stepStart = now;
+        if (index != 4 || now - lastReport < std::chrono::seconds(10)) return;
+        lastReport = now;
+        AgcDriver::ProfilePrint_nid_no_patch("[labels] %llu label stores recorded on the GPU, %llu met an idle recorder (10 s); ms by step: reap %.0f, import lookup %.0f, unit shadow %.0f, record %.0f, table and notes %.0f\n", static_cast<unsigned long long>(stores), static_cast<unsigned long long>(idle), stepMs[0], stepMs[1], stepMs[2], stepMs[3], stepMs[4]);
+        stepMs = {};
+        stores = idle = 0;
+    };
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
-    if (recorder.Idle()) return 1;
+    step(0);
+    if (recorder.Idle()) {
+        ++idle;
+        return 1;
+    }
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
+    step(1);
     if (import == nullptr) return 3;
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
     if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    step(2);
     // The store on the GPU, into the open batch: everything recorded so far completes before it,
     // and it is visible to the host after. The barriers belong to the recorder's store run: one
     // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
@@ -1849,9 +1874,12 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         return 5;
     }
     recordStore();
+    step(3);
     // The table entry and the label's own pending-write note (Recorder::NoteLabel).
     recorder.NoteLabel(address, bytes, stamp, queue);
     GuestMemory::MarkWritten(address, bytes.size());
+    ++stores;
+    step(4);
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
     // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
     // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
