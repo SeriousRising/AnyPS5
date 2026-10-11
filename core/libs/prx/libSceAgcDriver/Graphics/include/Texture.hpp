@@ -300,7 +300,8 @@ private:
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
-    void captureGuestBytes(const std::vector<bool>* layers);
+    // Returns whether units held in a unit shadow were published for the read.
+    bool captureGuestBytes(const std::vector<bool>* layers);
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -396,6 +397,9 @@ private:
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
+    // Why pendingAlias would not hand `holder`'s results to this image on the device: the index
+    // of the first difference, for the [storage] line.
+    std::size_t handOverRefusal(const StorageTexture& holder) const;
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
     // a pending unit inside the range), kept alive across the caller's use.
     static std::vector<std::shared_ptr<StorageTexture>> overlappingPending(std::uint64_t address, std::size_t bytes);
@@ -481,6 +485,9 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
+    // Where `original` came from, for the [storage] line: 0 other, 1 an upload under clear keys,
+    // 2 one that published shadowed units to read them.
+    std::uint8_t snapshotSource = 0;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
