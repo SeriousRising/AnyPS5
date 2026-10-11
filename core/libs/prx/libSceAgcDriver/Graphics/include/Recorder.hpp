@@ -488,8 +488,16 @@ public:
     // What one draw-class range rendered, for the [gputime-draws] line: the pass's target and the
     // pixel program of the draw that began it (its variant id, SPIR-V words and traits, with the
     // draw's depth test and depth write).
+    // Call sites of the recompiler's address-based access helpers in a module, outside those helpers
+    // (see ProgramAddressSites): dword and span reads, byte-path reads, stores and atomics.
+    struct AddressSites {
+        std::uint32_t reads = 0;
+        std::uint32_t byteReads = 0;
+        std::uint32_t stores = 0;
+        auto operator<=>(const AddressSites&) const = default;
+    };
     struct DrawTimingDetail {
-        static constexpr std::uint8_t EarlyTests = 1, WritesMemory = 2, Kills = 4, ExportsDepth = 8, TestsDepth = 16, WritesDepth = 32;
+        static constexpr std::uint8_t EarlyTests = 1, WritesMemory = 2, Kills = 4, ExportsDepth = 8, TestsDepth = 16, WritesDepth = 32, RecorderStoresOnly = 64;
         std::uint32_t width = 0;
         std::uint32_t height = 0;
         VkFormat color = VK_FORMAT_UNDEFINED;
@@ -498,6 +506,7 @@ public:
         std::uint64_t pixelProgram = 0;
         std::uint32_t pixelWords = 0;
         std::uint8_t pixelTraits = 0;
+        AddressSites pixelSites;
         auto operator<=>(const DrawTimingDetail&) const = default;
     };
     // One draw of the range `timing`, or of the open pass's range when it continues one.
@@ -510,6 +519,10 @@ public:
     };
     // The rows gathered since the last [gputime] report.
     static std::vector<DrawTimingRow> DrawGpuTimes();
+    // The address-based sites of the program timed under `key`, for the [gputime-address] line;
+    // false when the key has none recorded yet.
+    static bool HasAddressSites(std::uint64_t key);
+    static void NoteAddressSites(std::uint64_t key, const AddressSites& sites);
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
