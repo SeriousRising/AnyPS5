@@ -156,9 +156,10 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     // Whether a use writes guest memory beyond a draw's attachments (storage images, written or
-    // copied buffers, an address-based build's unknown writes), or reads `image` (a view of it
+    // copied buffers, a program that can store through an address), or reads `image` (a view of it
     // sampled, or the image itself bound): a recorded draw's render pass may only be continued by
-    // a draw for which neither holds (Draw.cpp).
+    // a draw for which neither holds (Draw.cpp). A build that only reads by address writes nothing
+    // a later draw reads: its fault buffer is its own (BdaResources), read by its completion.
     bool WritesMemory() const;
     bool ReadsImage(const StorageTexture* image) const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
@@ -408,6 +409,8 @@ private:
     // The programs that look addresses up were made for the direct table (BdaAbi::DirectVersion).
     bool bdaDirect = false;
     bool usesFaultBuffer = false;
+    // A program of the build can store through an address (RecompileResult::bdaWrites).
+    bool storesByAddress = false;
     // The bases the CPU translates for the build's programs, from buildPrepare to buildComplete.
     std::vector<BdaResources::StageBases> bdaBases;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;

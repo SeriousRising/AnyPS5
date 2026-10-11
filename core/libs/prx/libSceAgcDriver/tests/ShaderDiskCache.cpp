@@ -79,6 +79,7 @@ void requireSameResult(const RecompileResult& left, const RecompileResult& right
     require(sameBindings(left.bindings, right.bindings), prefix + "bindings differ");
     require(left.pushConstants == right.pushConstants, prefix + "push constants differ");
     require(left.specialization == right.specialization, prefix + "specialization constants differ");
+    require(left.bdaWrites == right.bdaWrites, prefix + "the store through an address differs");
     require(left.vertexAttributes.size() == right.vertexAttributes.size(), prefix + "vertex attribute count differs");
     for (std::size_t i = 0; i < left.vertexAttributes.size(); ++i) {
         const auto& a = left.vertexAttributes[i];
@@ -133,6 +134,7 @@ RecompileResult sampleResult() {
     result.bindings[1].imageShape.reset();
     result.pushConstants = {std::byte{1}, std::byte{0xff}, std::byte{0}, std::byte{0x80}, std::byte{7}};
     result.bdaAbiVersion = 3;
+    result.bdaWrites = true;
     result.memoryOffsetDword = 7;
     result.hostSubgroupSize = 32;
     result.vertexInputs = {{1, 4, 2}, {5, 2, 0}};

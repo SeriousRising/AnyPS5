@@ -685,6 +685,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     result.pushConstants = std::move(bindings.pushConstants);
     result.bdaBases = snapshot.bdaBases;
     result.bdaBaseStage = static_cast<std::uint32_t>(variant.info.stage);
+    result.bdaWrites = variant.info.info.bdaWrites;
     return result;
 }
 

@@ -468,6 +468,8 @@ struct ShaderInvocation {
     // (BdaAbi::BaseDirectoryWord).
     std::vector<BdaAbi::BaseRequest> bdaBases;
     std::uint32_t bdaBaseStage = 0;
+    // Whether the program can store through an address (ShaderInfo::bdaWrites).
+    bool bdaWrites = false;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
