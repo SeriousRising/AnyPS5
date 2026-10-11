@@ -56,6 +56,11 @@ void PadInput::openController(int deviceIndex) {
         SDL_GameControllerHasSensor(controller, SDL_SENSOR_ACCEL) == SDL_TRUE, SDL_GameControllerHasSensor(controller, SDL_SENSOR_GYRO) == SDL_TRUE,
         SDL_GameControllerGetNumTouchpads(controller), SDL_GameControllerHasLED(controller) == SDL_TRUE, SDL_GameControllerHasRumbleTriggers(controller) == SDL_TRUE);
     enableSensors();
+    static const bool emulateMotion = std::getenv("APS5_PAD_MOTION_EMULATION") != nullptr;
+    motionEmulated = emulateMotion && (SDL_GameControllerHasSensor(controller, SDL_SENSOR_ACCEL) != SDL_TRUE || SDL_GameControllerHasSensor(controller, SDL_SENSOR_GYRO) != SDL_TRUE);
+    motion = {};
+    lastMotion = {};
+    if (motionEmulated) APS5_LOG_OUT("Pad: motion emulation is active for %s (APS5_PAD_MOTION_EMULATION): while the right stick click is held, the right stick tilts the controller up to 60 degrees and the left stick click lifts it", name != nullptr ? name : "unknown");
     outputPending = true;
 }
 
@@ -265,6 +270,12 @@ void PadInput::Update() {
     applyOutput();
     if (controller != nullptr) {
         controllerState = sampleController();
+        if (motionEmulated) {
+            const auto sampled = std::chrono::steady_clock::now();
+            const float dt = lastMotion == std::chrono::steady_clock::time_point{} ? 0.0f : std::min(std::chrono::duration<float>(sampled - lastMotion).count(), 0.1f);
+            lastMotion = sampled;
+            motion.Step(controllerState, dt);
+        }
         publish();
     }
     const auto now = std::chrono::steady_clock::now();

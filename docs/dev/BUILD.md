@@ -141,6 +141,15 @@ Set `APS5_LOOP_GUARD=<count>` to find a recompiled shader loop that does not end
 ## Frames in flight
 
 A submission that carries a flip waits on the submitting thread while `APS5_FRAMES_IN_FLIGHT` earlier flips (default 1, at most 16) have not completed; a flip completes when the GPU work submitted before it and its presentation are done. This keeps a title from rewriting a frame's memory while the GPU work that reads it is still queued. `sceVideoOutIsFlipPending` therefore reports at most that many flips, and `sceVideoOutSubmitFlip` waits instead of returning `VIDEO_OUT_ERROR_FLIP_QUEUE_FULL` unless the value is 16. A larger value lets the title prepare more frames ahead of the GPU.
+## Motion emulation
+
+Set `APS5_PAD_MOTION_EMULATION=1` to give a controller without an accelerometer or gyroscope emulated motion (a controller with both sensors is not affected). While the right stick click is held:
+
+- the right stick tilts the controller, up to 60 degrees at full deflection and at most 180 degrees per second: pulling the stick toward you raises the far edge (positive rotation about x), pushing it right lowers the right side (negative rotation about z). The gyroscope reports the rate while the angle changes and the accelerometer reports gravity (9.80665 m/s^2) in the tilted frame;
+- pressing the left stick click lifts the controller: 1 g more along the axis out of its face for 150 ms, then 1 g less for 150 ms, once per press;
+- the right stick and both stick clicks do not reach the title.
+
+Releasing the right stick click turns the controller back to level at the same rate. At rest it reports 1 g on +y and no rotation.
 
 ## Shader recompiler
 

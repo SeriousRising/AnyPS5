@@ -4,6 +4,7 @@
 #include "SDL_events.h"
 #include "SDL_gamecontroller.h"
 #include "prx/libScePad/include/InputMapping.hpp"
+#include "prx/libScePad/include/PadMotionEmulation.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 #include <array>
 #include <chrono>
@@ -38,6 +39,9 @@ private:
     bool mouseEnabled = false;
     SDL_GameController* controller = nullptr;
     PadInputState controllerState{};
+    bool motionEmulated = false;
+    Pad::MotionEmulation motion{};
+    std::chrono::steady_clock::time_point lastMotion{};
     std::uint32_t outputSequence = 0;
     PadOutputState outputState{};
     bool outputPending = false;
