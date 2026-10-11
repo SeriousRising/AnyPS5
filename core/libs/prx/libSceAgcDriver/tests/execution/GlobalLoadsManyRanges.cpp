@@ -45,11 +45,13 @@ public:
         arena = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, 2 * Ranges * BlockBytes));
 #endif
         Require(arena != nullptr, "global loads over many ranges: cannot allocate the guest ranges");
-        for (std::size_t range = 0; range < Ranges; ++range) GuestAllocations::Mutation().Add(Data(range), BlockBytes, true, false, true);
+        for (std::size_t range = 0; range < Ranges; ++range) Add(range);
     }
 
     ~GuestRanges() {
-        for (std::size_t range = 0; range < Ranges; ++range) GuestAllocations::Mutation().Remove(Data(range));
+        for (std::size_t range = 0; range < Ranges; ++range) {
+            if (registered[range]) Remove(range);
+        }
 #ifdef _WIN32
         VirtualFree(arena, 0, MEM_RELEASE);
 #else
@@ -62,8 +64,19 @@ public:
 
     std::uint8_t* Data(std::size_t range) { return arena + 2 * range * BlockBytes; }
 
+    void Add(std::size_t range) {
+        GuestAllocations::Mutation().Add(Data(range), BlockBytes, true, false, true);
+        registered[range] = true;
+    }
+
+    void Remove(std::size_t range) {
+        GuestAllocations::Mutation().Remove(Data(range));
+        registered[range] = false;
+    }
+
 private:
     std::uint8_t* arena = nullptr;
+    std::array<bool, Ranges> registered{};
 };
 
 std::uint32_t BaseOf(std::uint32_t read) {
@@ -132,6 +145,36 @@ int main() {
         device->Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
         device->WaitIdle();
         Require(Output[0] == expected, "global loads over many ranges at " + std::to_string(Reads) + " sites: the sum is " + std::to_string(Output[0]) + ", expected " + std::to_string(expected));
+        // The table changes between dispatches of the one program: ranges below, between and above
+        // the bases leave the registered set while a base's data changes, then a base's own range
+        // leaves, whose reads must be refused and end the invocation, and comes back.
+        const auto dispatch = [&] {
+            Output.fill(Sentinel);
+            device->Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+            device->WaitIdle();
+            return Output[0];
+        };
+        for (const std::size_t range : {std::size_t{0}, Ranges / 2, Ranges - 1}) guest.Remove(range);
+        for (std::uint32_t word = 0; word < BaseBytes / 4u; ++word) {
+            const auto value = (word + 7u) * 0x85ebca6bu;
+            std::memcpy(guest.Data(BaseRanges[1]) + word * 4u, &value, 4u);
+        }
+        std::uint32_t changed = 0;
+        for (std::uint32_t read = 0; read < Reads; ++read) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, guest.Data(BaseRanges[BaseOf(read)]) + OffsetOf(read), 4u);
+            changed += value;
+        }
+        Require(changed != expected, "global loads over many ranges: the changed data gives the same sum");
+        auto sum = dispatch();
+        Require(sum == changed, "global loads over many ranges after ranges left: the sum is " + std::to_string(sum) + ", expected " + std::to_string(changed));
+        guest.Add(Ranges / 2);
+        guest.Remove(BaseRanges[3]);
+        sum = dispatch();
+        Require(sum == Sentinel, "global loads over many ranges: reads of a range that left the table stored " + std::to_string(sum));
+        guest.Add(BaseRanges[3]);
+        sum = dispatch();
+        Require(sum == changed, "global loads over many ranges after a range came back: the sum is " + std::to_string(sum) + ", expected " + std::to_string(changed));
         std::puts("global loads over many ranges tests passed");
         return 0;
     } catch (const std::exception& error) {

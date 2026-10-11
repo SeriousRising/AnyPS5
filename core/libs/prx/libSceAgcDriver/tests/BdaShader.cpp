@@ -9,6 +9,8 @@
 
 namespace {
 
+bool directTable = false;
+
 template<typename TEmit>
 std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t extracted = 0, bool writes = false) {
     using namespace ShaderRecompiler;
@@ -38,10 +40,12 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
         state.module.AddAnnotation(spv::OpDecorate, interfaceVariables[0], spv::DecorationBuiltIn, spv::BuiltInLocalInvocationIndex);
     }
     state.bdaStopsInvocations = stops;
+    state.bdaDirect = directTable;
     DefineGetBdaPointer(state);
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
+    PrepareBdaDirectLookups(state);
     SpirvValueEmitContext ctx(state);
     auto& instruction = writes ? program.CreateValue(IrOpcode::StoreAddressU32, IrType::Void) : extracted != 0u ? program.CreateValue(IrOpcode::LoadAddressU32x4, IrType::U32x4) : program.CreateValue(IrOpcode::LoadAddressU32, IrType::U32);
     IrBuilder ir(program);
@@ -69,6 +73,10 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     return state.module.Finalize();
 }
 
+}
+
+void SetBdaTestTable(bool direct) {
+    directTable = direct;
 }
 
 std::vector<std::uint32_t> MakeBdaTestShader(std::uint64_t address, std::uint32_t bits, std::int64_t offset) {

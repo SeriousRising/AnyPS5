@@ -11,6 +11,9 @@ std::vector<std::uint32_t> MakeBdaSpanReadTestShader(std::uint64_t address, std:
 std::vector<std::uint32_t> MakeBdaDwordWriteTestShader(std::uint64_t address, std::uint32_t dwords, const std::uint32_t* values);
 std::vector<std::uint32_t> MakeBdaStoreTestShader(std::uint64_t address, std::uint32_t value, std::uint32_t bits, bool coherent);
 std::vector<std::uint32_t> MakeBdaWriteTestShader(std::uint64_t address, std::uint32_t value, std::uint32_t bits, bool coherent);
+// The table form the shaders made from here on are for: the direct table (BdaAbi::DirectVersion) or
+// the sorted ranges.
+void SetBdaTestTable(bool direct);
 void RunBdaStoreExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaContractTests();
