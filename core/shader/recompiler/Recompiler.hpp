@@ -504,6 +504,8 @@ struct ShaderInvocation {
     std::vector<std::byte> pushConstants;
     std::vector<VertexAttribute> vertexAttributes;
     std::uint32_t poisonedSrtReads = 0;
+    // Whether the program can store through an address (ShaderInfo::bdaWrites).
+    bool bdaWrites = false;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {

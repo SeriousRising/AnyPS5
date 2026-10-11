@@ -177,6 +177,10 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
+    // Whether a program of the build can store through an address (RecompileResult::bdaWrites). A
+    // build that only reads by address writes nothing a later draw reads: its fault buffer is its
+    // own (BdaResources), read by its completion.
+    bool StoresByAddress() const { return storesByAddress; }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
@@ -439,6 +443,8 @@ private:
     // The programs that look addresses up were made for the direct table (BdaAbi::DirectVersion).
     bool bdaDirect = false;
     bool usesFaultBuffer = false;
+    // A program of the build can store through an address (RecompileResult::bdaWrites).
+    bool storesByAddress = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
     bool ownsLayout = false;

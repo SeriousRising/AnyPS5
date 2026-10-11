@@ -391,6 +391,7 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
         out.Value(attribute.formatComponents);
     });
     writer.Value(invocation.poisonedSrtReads);
+    writer.Value(invocation.bdaWrites);
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -412,6 +413,7 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
         in.Value(attribute.formatComponents);
     });
     reader.Value(invocation.poisonedSrtReads);
+    reader.Value(invocation.bdaWrites);
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
