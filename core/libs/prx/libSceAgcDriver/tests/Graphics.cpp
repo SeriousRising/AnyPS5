@@ -2351,6 +2351,41 @@ void orderedPixelShaderTests() {
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(orderedPixelRequest(0x30600u, plain))); }, "fragmentShaderPixelInterlock");
 }
 
+// The pixel program above with `between` after its two address reads: v4 holds what they read.
+std::size_t faultKills(std::initializer_list<std::uint32_t> between) {
+    std::vector<std::uint32_t> code(OrderedBdaPixelCode.begin(), OrderedBdaPixelCode.begin() + 8);
+    code.insert(code.end(), between);
+    code.insert(code.end(), OrderedBdaPixelCode.begin() + 8, OrderedBdaPixelCode.end());
+    const std::array<std::uint32_t, 5> capabilities{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    auto request = orderedPixelRequest(0x30600u, capabilities, code);
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    std::size_t kills = 0;
+    const auto exits = interlockExits(ShaderRecompiler::Recompile(request).spirv.Words(), kills);
+    Require(exits.empty() && kills != 0u, "a pixel shader with BDA reads: " + exits);
+    return kills - 1u;
+}
+
+// Programs whose faulting address reads flag the pixel and discard it where the program returns (one
+// kill) instead of ending it at each of the five places a read can fault (see BdaStopCanBeDeferred).
+void faultStopFormTests() {
+    const bool perSite = std::getenv("APS5_BDA_STOP_PER_SITE") != nullptr;
+    const auto check = [&](std::string_view name, std::initializer_list<std::uint32_t> between, bool flagged) {
+        const auto kills = faultKills(between);
+        const std::size_t expected = flagged && !perSite ? 1u : 5u;
+        Require(kills == expected, "a pixel shader with BDA reads and " + std::string(name) + " has " + std::to_string(kills) + " OpKill for BDA faults, expected " + std::to_string(expected));
+    };
+    check("nothing else", {}, true);
+    // v_mov_b32 v6, v4 quad_perm:[1,0,3,2]; v_add_nc_u32 v4, v4, v6
+    check("a DPP move", {0x7e0c02fau, 0xff00b104u, 0x4a080d04u}, true);
+    // The same with fetch-inactive, and bound_ctrl.
+    check("a fetch-inactive DPP move", {0x7e0c02fau, 0xff04b104u, 0x4a080d04u}, true);
+    check("a bound DPP move", {0x7e0c02fau, 0xff08b104u, 0x4a080d04u}, true);
+    // v_readlane_b32 s4, v4, 1; v_mov_b32 v6, s4; v_add_nc_u32 v4, v4, v6
+    check("v_readlane_b32", {0xd7600004u, 0x00010304u, 0x7e0c0204u, 0x4a080d04u}, false);
+}
+
 void ConservativeRasterizationTests() {
     auto queue = makeState();
     queue.context[0x1b3] = 2;
@@ -2820,6 +2855,7 @@ int main() {
         DepthBoundsBiasTests();
         conservativeZExportTests();
         orderedPixelShaderTests();
+        faultStopFormTests();
         ConservativeRasterizationTests();
         DisabledColorTests();
         CompactedExportTests();
