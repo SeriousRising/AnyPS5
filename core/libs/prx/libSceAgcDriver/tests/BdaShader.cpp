@@ -2,11 +2,15 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <utility>
 
 namespace {
 
 template<typename TEmit>
-std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, bool deferred, std::uint32_t rangeCacheEntries = ShaderRecompiler::BdaRangeCacheDefaultEntries, bool writes = false, bool rangeCacheCheck = false) {
+std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, bool deferred, std::uint32_t rangeCacheEntries = ShaderRecompiler::BdaRangeCacheDefaultEntries, bool writes = false, bool rangeCacheCheck = false, const std::function<void(ShaderRecompiler::SpirvEmitterState&)>& shareBases = {}) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -37,7 +41,9 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
     state.bdaStopDeferred = stops && deferred;
     state.bdaRangeCacheEntries = rangeCacheEntries;
     state.bdaRangeCacheCheck = rangeCacheCheck;
+    state.bdaSharedBase = static_cast<bool>(shareBases);
     DefineGetBdaPointer(state);
+    if (shareBases) shareBases(state);
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
@@ -82,8 +88,33 @@ std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std
     }, deferred);
 }
 
-std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck, bool deferred) {
+std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck, bool deferred, std::uint64_t sharedBytes) {
     using namespace ShaderRecompiler;
+    // The hull of each base, by block and residue: [first address, end), and the reads in it.
+    struct Hull {
+        std::uint64_t first = ~std::uint64_t{0};
+        std::uint64_t end = 0;
+        std::uint32_t reads = 0;
+        std::uint32_t base = 0;
+        std::uint32_t emitted = 0;
+    };
+    std::map<std::pair<std::uint64_t, std::uint64_t>, Hull> hulls;
+    const auto hullOf = [&](const BdaTestStep& step) -> Hull* {
+        if (sharedBytes == 0u || step.kind != BdaTestStep::Read) return nullptr;
+        return &hulls[{step.address & ~(sharedBytes - 1u), step.address & 3u}];
+    };
+    for (const auto& step : steps) {
+        auto* hull = hullOf(step);
+        if (hull == nullptr) continue;
+        hull->first = std::min(hull->first, step.address);
+        hull->end = std::max(hull->end, step.address + step.dwords * 4u);
+        ++hull->reads;
+    }
+    const auto shareBases = [&](SpirvEmitterState& state) {
+        for (auto& [block, hull] : hulls) {
+            if (hull.reads >= 2u) hull.base = AddBdaSharedBase(state, 0, static_cast<std::uint32_t>(hull.end - hull.first));
+        }
+    };
     return MakeShader(0, false, stops, [&](SpirvValueEmitContext& ctx, IrValue& instruction, std::uint32_t) {
         auto& state = ctx.state;
         std::vector<std::uint32_t> values;
@@ -94,7 +125,18 @@ std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep
             const auto address = BdaConstant(state, steps[index].address);
             const auto operand = ConstantU32(state, steps[index].value);
             switch (steps[index].kind) {
-                case BdaTestStep::Read: values.push_back(EmitBdaRead(ctx, instruction, address, 32u)); break;
+                case BdaTestStep::Read: {
+                    auto* hull = hullOf(steps[index]);
+                    const auto dwords = steps[index].dwords;
+                    std::array<std::uint32_t, 4> read{};
+                    // The first read of a base tries its hull, and every third one after it (as a read under another condition would).
+                    if (hull != nullptr && hull->reads >= 2u) read = EmitBdaSharedDwordReads(ctx, instruction, state.bdaSharedBases[hull->base], static_cast<std::int64_t>(steps[index].address - hull->first), hull->emitted++ % 3u == 0u, address, 0u, dwords, true);
+                    else if (dwords == 1u) read[0] = EmitBdaRead(ctx, instruction, address, 32u);
+                    else read = EmitBdaDwordReads(ctx, instruction, address, 0u, dwords, true);
+                    for (std::uint32_t dword = 1; dword < dwords; ++dword) read[0] = Binary(state, spv::OpIAdd, TypeU32(state), read[0], Binary(state, spv::OpIMul, TypeU32(state), read[dword], ConstantU32(state, 2u * dword + 1u)));
+                    values.push_back(read[0]);
+                    break;
+                }
                 case BdaTestStep::Store:
                     EmitBdaStore(ctx, instruction, address, operand, 32u);
                     values.push_back(operand);
@@ -109,5 +151,5 @@ std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep
             }
         }
         return values;
-    }, deferred, rangeCacheEntries, true, rangeCacheCheck);
+    }, deferred, rangeCacheEntries, true, rangeCacheCheck, sharedBytes != 0u ? std::function<void(SpirvEmitterState&)>(shareBases) : std::function<void(SpirvEmitterState&)>{});
 }

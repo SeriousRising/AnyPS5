@@ -94,6 +94,11 @@ private:
 // APS5_NO_BDA_RANGE_CACHE=1 in the recompiler), with and without stopping invocations: the output words, the whole fault buffer
 // (fault record and noted pages) and the data must be equal, and the cached runs must give the
 // stated values and fault.
+// Each sequence also runs with its reads sharing base addresses (EmitBdaSharedDwordReads; off with
+// APS5_NO_BDA_SHARED_BASE=1 in the recompiler) by blocks of 16 bytes (a range of `sorted`), of 64 (two
+// ranges and the gap behind them) and of 4096 (every read of the sequence): searched, with two kept
+// ranges and the check, and with the invocation ended at the faulting read. All must equal the run
+// in which every read looks its own bytes up.
 static void RunBdaRangeCacheTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     constexpr std::uint64_t guest = 0x7fff12340000ULL;
@@ -135,11 +140,11 @@ static void RunBdaRangeCacheTests(const Context& context) {
         Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         Buffer output(context, steps.size() * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         for (const bool stops : {true, false}) {
-            const auto run = [&](std::uint32_t rangeCacheEntries, bool rangeCacheCheck = false, bool deferred = true) {
+            const auto run = [&](std::uint32_t rangeCacheEntries, bool rangeCacheCheck = false, bool deferred = true, std::uint64_t sharedBytes = 0) {
                 fill();
                 std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
                 for (std::size_t word = 0; word < steps.size(); ++word) std::memcpy(output.Bytes().data() + word * 4u, &Sentinel, 4u);
-                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCacheEntries, stops, rangeCacheCheck, deferred), {&table, &fault, &output});
+                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCacheEntries, stops, rangeCacheCheck, deferred, sharedBytes), {&table, &fault, &output});
                 pipeline.Run(1);
                 Outcome outcome{std::vector<std::uint32_t>(steps.size()), {fault.Bytes().begin(), fault.Bytes().end()}, {writable.Bytes().begin(), writable.Bytes().end()}};
                 std::memcpy(outcome.values.data(), output.Bytes().data(), steps.size() * 4u);
@@ -153,6 +158,12 @@ static void RunBdaRangeCacheTests(const Context& context) {
             }
             if (stops) {
                 for (const auto entries : {0u, 1u, 2u, 4u}) Require(run(entries, false, false) == searched, "BDA range cache: " + name + " with " + std::to_string(entries) + " kept ranges and the invocation ended at the faulting read differs from the deferred stop");
+            }
+            for (const std::uint64_t sharedBytes : {16u, 64u, 4096u}) {
+                const auto differs = [&](const char* how) { return "BDA shared base: " + name + (stops ? " (stopping)" : " (continuing)") + " with reads sharing bases by " + std::to_string(sharedBytes) + " bytes" + how + " differs from every read looking its own bytes up"; };
+                Require(run(0, false, true, sharedBytes) == searched, differs(""));
+                Require(run(2, true, true, sharedBytes) == searched, differs(", two kept ranges and the check,"));
+                if (stops) Require(run(0, false, false, sharedBytes) == searched, differs(" and the invocation ended at the faulting read"));
             }
             if (expected == nullptr) continue;
             Abi::Fault report{};
@@ -188,6 +199,29 @@ static void RunBdaRangeCacheTests(const Context& context) {
     check("reads below the first range", sorted, 3, {{Step::Read, guest - 4}, {Step::Read, guest}}, &expected);
     expected = {{0, 0}, Abi::FaultReason::InvalidTable, guest, 1, 0};
     check("an invalid table", sorted, 2, {{Step::Read, guest}, {Step::Read, guest + 4}}, &expected);
+    // Reads sharing a base (see the blocks above): the base's hull inside one range, across a range's
+    // end into the gap (the reads before the end succeed and the one past it faults with its own
+    // address), across two adjacent ranges, in the gap, two bases in turn, and reads of other sizes
+    // and alignments on one base (a wide read inside the hull, one across the range's end, and
+    // unaligned dwords, which share a base of their own whose device address is not 4-aligned).
+    expected = {{low(0), low(4), low(8), low(12), low(4), low(0)}};
+    check("a base's reads inside one range", sorted, 3, {{Step::Read, guest}, {Step::Read, guest + 4}, {Step::Read, guest + 8}, {Step::Read, guest + 12}, {Step::Read, guest + 4}, {Step::Read, guest}}, &expected);
+    expected = {{high(0), high(8), high(12), 0, high(4)}, Abi::FaultReason::Unmapped, guest + 32, 1, 3};
+    check("a base's reads across a range's end into the gap", sorted, 3, {{Step::Read, guest + 16}, {Step::Read, guest + 24}, {Step::Read, guest + 28}, {Step::Read, guest + 32}, {Step::Read, guest + 20}}, &expected);
+    expected = {{low(8), high(0), low(12), high(12), low(0)}};
+    check("a base's reads across two adjacent ranges", sorted, 3, {{Step::Read, guest + 8}, {Step::Read, guest + 16}, {Step::Read, guest + 12}, {Step::Read, guest + 28}, {Step::Read, guest}}, &expected);
+    expected = {{0, 0, low(0), 0}, Abi::FaultReason::Unmapped, guest + 40, 1, 0};
+    check("a base's reads in the gap", sorted, 3, {{Step::Read, guest + 40}, {Step::Read, guest + 44}, {Step::Read, guest}, {Step::Read, guest + 48}}, &expected);
+    expected = {{low(0), low(16), high(0), low(4), low(20), high(4), low(8), low(24), high(8), low(12), low(28), high(12)}};
+    {
+        std::vector<Step> steps;
+        for (const auto offset : {0u, 4u, 8u, 12u}) steps.insert(steps.end(), {{Step::Read, guest + offset}, {Step::Read, guest + 64 + offset}, {Step::Read, guest + 16 + offset}});
+        check("three bases' reads in turn", sorted, 3, steps, &expected);
+    }
+    expected = {{low(0), low(4) + 3u * low(8), low(12), low(1), low(5), low(8) + 3u * low(12) + 5u * high(0), low(0) + 3u * low(4) + 5u * low(8) + 7u * low(12), low(9)}};
+    check("a base's reads of several sizes and alignments", sorted, 3, {{Step::Read, guest}, {Step::Read, guest + 4, 0, 2}, {Step::Read, guest + 12}, {Step::Read, guest + 1}, {Step::Read, guest + 5}, {Step::Read, guest + 8, 0, 3}, {Step::Read, guest, 0, 4}, {Step::Read, guest + 9}}, &expected);
+    expected = {{high(4), high(8) + 3u * high(12), high(12), high(0)}, Abi::FaultReason::Unmapped, guest + 32, 1, 2};
+    check("a base's wide read across a range's end into the gap", sorted, 3, {{Step::Read, guest + 20}, {Step::Read, guest + 24, 0, 2}, {Step::Read, guest + 28, 0, 2}, {Step::Read, guest + 16}}, &expected);
     // More ranges than any cache keeps, each read twice in turn, then a store and reads behind it.
     {
         std::vector<Abi::Range> many;
