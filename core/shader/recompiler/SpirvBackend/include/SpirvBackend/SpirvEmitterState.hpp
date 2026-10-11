@@ -71,6 +71,9 @@ struct MemoryResourceAccess {
     std::uint32_t misalignment = 0;
 };
 
+// The ranges lookup_bda keeps unless a switch says otherwise.
+inline constexpr std::uint32_t BdaRangeCacheDefaultEntries = 2;
+
 struct SpirvEmitterState {
     const ImageResource* runtimeImage = nullptr;
     std::uint32_t runtimeImageMetadata = 0u;
@@ -105,12 +108,12 @@ struct SpirvEmitterState {
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaLookupFunction = 0;
-    // Whether lookup_bda keeps the last range it found for its invocation (see DefineBdaLookupCore);
-    // APS5_NO_BDA_RANGE_CACHE=1 clears it.
-    bool bdaRangeCache = true;
-    // The cache's Private variables (64-bit, then 32-bit); 0 without the cache.
-    std::array<std::uint32_t, 4> bdaRangeCache64 {};
-    std::array<std::uint32_t, 2> bdaRangeCache32 {};
+    // How many ranges lookup_bda keeps for its invocation (see DefineBdaLookupCore); 0 searches at
+    // every lookup. APS5_BDA_RANGE_CACHE_ENTRIES sets it, APS5_NO_BDA_RANGE_CACHE=1 clears it.
+    std::uint32_t bdaRangeCacheEntries = BdaRangeCacheDefaultEntries;
+    // The cache's Private variables (64-bit, then 32-bit); empty without the cache.
+    std::vector<std::uint32_t> bdaRangeCache64;
+    std::vector<std::uint32_t> bdaRangeCache32;
     std::uint32_t bdaPointerFunction = 0;
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
     // every read takes the byte path.

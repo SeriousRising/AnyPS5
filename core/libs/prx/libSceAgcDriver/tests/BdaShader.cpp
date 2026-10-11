@@ -6,7 +6,7 @@
 namespace {
 
 template<typename TEmit>
-std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, bool rangeCache = true, bool writes = false) {
+std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool stops, const TEmit& emit, std::uint32_t rangeCacheEntries = ShaderRecompiler::BdaRangeCacheDefaultEntries, bool writes = false) {
     using namespace ShaderRecompiler;
     IrProgram program;
     program.Resources().stage = IrShaderStage::Compute;
@@ -34,7 +34,7 @@ std::vector<std::uint32_t> MakeShader(std::uint64_t address, bool coherent, bool
         state.module.AddAnnotation(spv::OpDecorate, interfaceVariables[0], spv::DecorationBuiltIn, spv::BuiltInLocalInvocationIndex);
     }
     state.bdaStopsInvocations = stops;
-    state.bdaRangeCache = rangeCache;
+    state.bdaRangeCacheEntries = rangeCacheEntries;
     DefineGetBdaPointer(state);
     const auto main = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
@@ -78,7 +78,7 @@ std::vector<std::uint32_t> MakeBdaDwordReadTestShader(std::uint64_t address, std
     });
 }
 
-std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, bool rangeCache, bool stops) {
+std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops) {
     using namespace ShaderRecompiler;
     return MakeShader(0, false, stops, [&](SpirvValueEmitContext& ctx, IrValue& instruction, std::uint32_t) {
         auto& state = ctx.state;
@@ -105,5 +105,5 @@ std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep
             }
         }
         return values;
-    }, rangeCache, true);
+    }, rangeCacheEntries, true);
 }
