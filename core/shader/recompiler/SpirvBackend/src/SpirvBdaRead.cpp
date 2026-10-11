@@ -36,16 +36,10 @@ std::uint32_t EmitBdaByte(SpirvEmitterState& state, std::uint32_t guest, std::ui
     const auto bytePointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, byteType);
     const auto physical = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaPointerFunction, guest, ConstantU32(state, 1u), instruction);
-    if (state.bdaStopsInvocations && !state.bdaStopDeferred) {
-        StopBdaInvocationIf(state, Binary(state, spv::OpIEqual, TypeBool(state), physical, BdaConstant(state, 0u)));
-        const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpConvertUToPtr, bytePointer, pointer, physical);
-        const auto loaded = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, byteType, loaded, pointer, accessMask, 1u);
-        return Unary(state, spv::OpUConvert, TypeU32(state), loaded);
-    }
     // Unmapped bytes read as zero; the fault is recorded and every invocation reaches the
-    // program's barriers, or runs on with its stop pending.
+    // program's barriers, or runs on with its stop pending. The load is guarded also where the
+    // invocation ends at the read: a pixel's OpKill does not end it on every driver (RADV compiles
+    // it to a demotion and runs the rest of the program for the helper).
     const auto mapped = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
     const auto before = state.currentLabel;
     const auto loadLabel = state.module.AllocateId();
