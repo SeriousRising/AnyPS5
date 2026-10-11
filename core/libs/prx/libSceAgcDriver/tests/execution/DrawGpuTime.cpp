@@ -350,6 +350,16 @@ void AddressSiteTests() {
         {"main", calls({42, 42, 44, 43, 45, 45, 45, 46, 47, 48, 41})}}));
     Require(sites.reads == 3 && sites.byteReads == 4 && sites.stores == 2, "address-based sites were counted as " + std::to_string(sites.reads) + "/" + std::to_string(sites.byteReads) + "/" + std::to_string(sites.stores) + ", expected 3/4/2");
     Require(AgcDriver::Graphics::ProgramAddressSites(NamedModule({{"helper", calls({41})}, {"main", calls({40})}})) == AgcDriver::Graphics::Recorder::AddressSites{}, "calls of other functions were counted as address-based sites");
+    // A compute module's shape: the local size, and the loops, image accesses and atomics outside the helpers.
+    constexpr std::uint32_t loop = (4u << 16u) | 246u, fetch = (5u << 16u) | 95u, sample = (5u << 16u) | 87u, gather = (6u << 16u) | 96u, imageRead = (5u << 16u) | 98u, imageWrite = (4u << 16u) | 99u, atomicAdd = (7u << 16u) | 234u, atomicLoad = (6u << 16u) | 227u, localSize = (6u << 16u) | 16u;
+    const std::vector<std::uint32_t> looping{loop, 1, 2, 0, atomicAdd, 30, 61, 4, 5, 6, 7};
+    auto compute = NamedModule({{"lookup_bda", looping}, {"read_bda_dword", looping}, {"record_bda_fault", looping}, {"helper", {loop, 1, 2, 0, fetch, 30, 62, 3, 4}},
+        {"main", {loop, 1, 2, 0, loop, 1, 2, 0, fetch, 30, 62, 3, 4, sample, 30, 63, 3, 4, gather, 30, 64, 3, 4, 5, imageRead, 30, 65, 3, 4, imageRead, 30, 66, 3, 4, imageRead, 30, 67, 3, 4, imageWrite, 3, 4, 5, atomicAdd, 30, 68, 4, 5, 6, 7, atomicLoad, 30, 69, 4, 5, 6}}});
+    const std::array<std::uint32_t, 6> mode{localSize, 44, 17, 8, 4, 2};
+    compute.insert(compute.begin() + 8, mode.begin(), mode.end());
+    const auto shape = AgcDriver::Graphics::ProgramComputeShape(compute);
+    Require(shape == AgcDriver::Graphics::Recorder::ComputeShape{{8, 4, 2}, 3, 2, 2, 3, 1, 2}, "a compute module's shape was read as local size " + std::to_string(shape.localSize[0]) + "x" + std::to_string(shape.localSize[1]) + "x" + std::to_string(shape.localSize[2]) + " with " + std::to_string(shape.loops) + " loops, " + std::to_string(shape.fetches) + " fetches, " + std::to_string(shape.samples) + " samples, " + std::to_string(shape.imageReads) + " image reads, " + std::to_string(shape.imageWrites) + " image writes and " + std::to_string(shape.atomics) + " atomics");
+    Require(AgcDriver::Graphics::ProgramComputeShape(std::span(compute).first(compute.size() - 3)).atomics == 1, "a truncated instruction was read");
 }
 
 }

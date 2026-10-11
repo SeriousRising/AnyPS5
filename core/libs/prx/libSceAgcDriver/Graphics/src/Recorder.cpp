@@ -1712,6 +1712,16 @@ std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 std::map<Recorder::DrawTimingDetail, Recorder::DrawTimingRow> timingDraws;
 std::map<std::uint64_t, Recorder::AddressSites> timingSites;
+std::map<std::uint64_t, Recorder::ComputeShape> timingShapes;
+// Per program since the last report: dispatches, the indirect ones among them, the workgroups of the
+// direct ones and the last direct dispatch's counts.
+struct TimingDispatches {
+    std::uint64_t count = 0;
+    std::uint64_t indirect = 0;
+    double groups = 0;
+    std::array<std::uint32_t, 3> last{};
+};
+std::map<std::uint64_t, TimingDispatches> timingDispatches;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -1918,6 +1928,28 @@ bool Recorder::HasAddressSites(std::uint64_t key) {
 void Recorder::NoteAddressSites(std::uint64_t key, const AddressSites& sites) {
     std::lock_guard lock(timingMutex);
     timingSites.emplace(key, sites);
+}
+
+bool Recorder::HasComputeShape(std::uint64_t key) {
+    std::lock_guard lock(timingMutex);
+    return timingShapes.contains(key);
+}
+
+void Recorder::NoteComputeShape(std::uint64_t key, const ComputeShape& shape) {
+    std::lock_guard lock(timingMutex);
+    timingShapes.emplace(key, shape);
+}
+
+void Recorder::NoteDispatch(std::uint64_t key, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    std::lock_guard lock(timingMutex);
+    auto& dispatches = timingDispatches[key];
+    ++dispatches.count;
+    if (x == 0 && y == 0 && z == 0) {
+        ++dispatches.indirect;
+        return;
+    }
+    dispatches.groups += static_cast<double>(x) * y * z;
+    dispatches.last = {x, y, z};
 }
 
 std::vector<Recorder::DrawTimingRow> Recorder::DrawGpuTimes() {
@@ -2267,6 +2299,19 @@ void Recorder::readGpuTiming(Batch& batch) {
         addressed += text;
     }
     if (!addressed.empty()) AgcDriver::ProfilePrint_nid_no_patch("[gputime-address] the programs above that access memory by address, as address-based read sites/byte-path read sites/store sites:%s\n", addressed.c_str());
+    std::string computed;
+    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) {
+        const auto shape = timingShapes.find(hot[i].first);
+        const auto dispatches = timingDispatches.find(hot[i].first);
+        if (shape == timingShapes.end() || dispatches == timingDispatches.end()) continue;
+        const auto& size = shape->second.localSize;
+        const auto& last = dispatches->second.last;
+        char text[256];
+        std::snprintf(text, sizeof(text), " [0x%llx %ux%ux%u groups of %ux%ux%u, %.0f invocations in %llu dispatches (%llu indirect), l%u f%u s%u r%u w%u a%u]", static_cast<unsigned long long>(hot[i].first), last[0], last[1], last[2], size[0], size[1], size[2], dispatches->second.groups * size[0] * size[1] * size[2], static_cast<unsigned long long>(dispatches->second.count), static_cast<unsigned long long>(dispatches->second.indirect), shape->second.loops, shape->second.fetches, shape->second.samples, shape->second.imageReads, shape->second.imageWrites, shape->second.atomics);
+        computed += text;
+    }
+    if (!computed.empty()) AgcDriver::ProfilePrint_nid_no_patch("[gputime-compute] the compute programs above, as [key, workgroups of the last direct dispatch, local size, invocations of the direct dispatches and dispatches over 10 s, and in the module outside the address helpers: loops, texel fetches, samples and gathers, image reads, image writes, atomics]:%s\n", computed.c_str());
+    timingDispatches.clear();
     reportDrawTimes(perPresent);
     timingDraws.clear();
     timingByKey.clear();
