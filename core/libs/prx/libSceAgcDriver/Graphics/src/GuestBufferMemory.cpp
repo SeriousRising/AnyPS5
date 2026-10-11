@@ -3426,22 +3426,30 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     return CachedTable{writeTableSerial, writeTableRanges.get()};
 }
 
+bool GuestBufferMemory::storedByCpu(const Region& region) {
+    if (region.direct != nullptr) return false;
+    // A GPU copy whose written sub-ranges were copied back by the GPU lands like a direct
+    // write; until RecordCopyBacks ran it still counts (a use without it stores in WriteBack).
+    // A staged copy never counts: its use always records the copy-back (AllowDeviceStaging),
+    // and nothing could be stored from it by the CPU.
+    if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) return false;
+    // Writes into a read-only image mirror are never stored (its pages could not take them).
+    return region.mirror == nullptr || region.mirror->writable;
+}
+
 bool GuestBufferMemory::HasCopiedWrites() const {
-    for (const auto& [begin, end] : writes) {
-        const auto* found = owner(begin);
-        if (found == nullptr) continue;
-        const auto& region = *found;
-        if (region.direct != nullptr) continue;
-        // A GPU copy whose written sub-ranges were copied back by the GPU lands like a direct
-        // write; until RecordCopyBacks ran it still counts (a use without it stores in WriteBack).
-        // A staged copy never counts: its use always records the copy-back (AllowDeviceStaging),
-        // and nothing could be stored from it by the CPU.
-        if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) continue;
-        // Writes into a read-only image mirror are never stored (its pages could not take them).
-        if (region.mirror != nullptr && !region.mirror->writable) continue;
-        return true;
-    }
-    return false;
+    return std::any_of(writes.begin(), writes.end(), [&](const auto& range) {
+        const auto* found = owner(range.first);
+        return found != nullptr && storedByCpu(*found);
+    });
+}
+
+bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const {
+    return std::any_of(writes.begin(), writes.end(), [&](const auto& range) {
+        if (address >= range.second || range.first >= address + bytes) return false;
+        const auto* found = owner(range.first);
+        return found == nullptr || storedByCpu(*found);
+    });
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
@@ -3534,7 +3542,7 @@ void GuestBufferMemory::WriteBack() {
         Require(found != nullptr, "write-back range has no GPU owner");
         const auto& region = *found;
         // Every branch below but the direct, copied-back and staged ones stores from the CPU.
-        if (region.direct == nullptr && !(region.gpuCopy && (region.copiedBack || region.deviceLocal)) && !(region.mirror != nullptr && !region.mirror->writable)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
+        if (storedByCpu(region)) Recorder::NoteWrittenBack(begin, static_cast<std::size_t>(end - begin));
         if (region.direct != nullptr) {
             // The GPU wrote imported guest memory directly; page write watching did not see it.
             GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));

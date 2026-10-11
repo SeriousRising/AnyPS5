@@ -110,7 +110,7 @@ void CountDrawSkip(DrawSkip kind, double us);
 // write-back overwrites the fill). Draws are listed here only under APS5_RECORD_COPIED_DRAWS=1,
 // which is safe only once BOTH of those checks also test this list, i.e. each extends its
 // `std::any_of(state->copiedWriters ...)` with
-// `|| std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(<its range>); })`;
+// `|| std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(<its range>); })`;
 // cleaner still, State::copiedWriters can become this list (one registry for both producers), after
 // which the switch can turn into APS5_NO_RECORD_COPIED_DRAWS. Until then such draws are recorded and
 // waited for at once. Read and written under GuestMemory::GpuMutex, like the device's list.

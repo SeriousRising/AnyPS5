@@ -238,6 +238,9 @@ public:
     struct AddressSpace;
     void WriteBack();
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const;
+    // Whether WriteBack stores into the range from the CPU: a written range in a copied buffer
+    // overlaps it. Ranges the GPU writes in place or copies back itself do not count.
+    bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const;
     // Guest ranges the shader may write through descriptors, as [begin, end).
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.
@@ -326,6 +329,9 @@ private:
         bool unstaged = false;
     };
 
+    // Whether WriteBack stores the region's written ranges from the CPU (not in place in an
+    // import, copied back by the GPU, staged, or in a read-only mirror).
+    static bool storedByCpu(const Region& region);
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };
     BaseOverlap baseOverlap(std::uint64_t begin, std::uint64_t end, const Region** owner) const;
