@@ -87,13 +87,19 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 // Refreshes that compared the surface with `original` after a stamp, those the compare rescued
-// from an upload, and of the rescued those whose `original` an upload under clear keys read (and
-// those that published shadowed units to read it): what skipping that read would change.
-std::atomic<std::uint64_t> snapshotCompares{0}, snapshotRescues{0}, clearSnapshotRescues{0}, publishedSnapshotRescues{0};
+// from an upload, and of the rescued those whose `original` an upload under clear keys read.
+std::atomic<std::uint64_t> snapshotCompares{0}, snapshotRescues{0}, clearSnapshotRescues{0};
+// Bytes captureGuestBytes read from guest memory: per 10 s for the line, and in total for the tests.
+std::atomic<std::uint64_t> snapshotBytes{0}, snapshotBytesTotal{0};
 // Images a refresh stored to guest memory because pendingAlias could not hand their results over
 // on the device, by the first difference (StorageTexture::handOverRefusal).
 constexpr std::array<const char*, 12> HandOverRefusalNames{"base", "size", "units", "extent", "layers", "mips", "tile mode", "dimension", "element size", "not cached", "holder keys", "none"};
 std::array<std::atomic<std::uint64_t>, HandOverRefusalNames.size()> handOverRefusals{};
+// The shapes of those pairs, as {refusal, holder base - refreshed base, then for the refreshed
+// image and the holder: width, height, depth or last array, mips, element bytes, tile mode};
+// under their own mutex, a leaf.
+std::mutex handOverShapesMutex;
+std::map<std::array<std::int64_t, 14>, std::uint64_t> handOverShapes;
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -138,7 +144,21 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     for (std::size_t i = 0; i < handOverRefusals.size(); ++i) {
         if (const auto count = take(handOverRefusals[i]); count != 0) refusals += std::string(" ") + HandOverRefusalNames[i] + " " + std::to_string(count);
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys, %llu of them after publishing shadowed units); images a refresh stored instead of handing over, by first difference:%s\n", take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), take(publishedSnapshotRescues), refusals.c_str());
+    std::vector<std::pair<std::uint64_t, std::array<std::int64_t, 14>>> shapes;
+    {
+        std::lock_guard lock(handOverShapesMutex);
+        for (const auto& [shape, count] : handOverShapes) shapes.emplace_back(count, shape);
+        handOverShapes.clear();
+    }
+    std::sort(shapes.begin(), shapes.end(), [](const auto& left, const auto& right) { return left.first > right.first; });
+    refusals += "; most common pairs (count: difference, holder base offset, refreshed then holder as WxHxD mips/element bytes/tile mode):";
+    for (std::size_t i = 0; i < shapes.size() && i < 8; ++i) {
+        const auto& v = shapes[i].second;
+        char shape[224];
+        std::snprintf(shape, sizeof(shape), " [%llu: %s %+lld, %lldx%lldx%lld %lld/%lld/%lld, %lldx%lldx%lld %lld/%lld/%lld]", static_cast<unsigned long long>(shapes[i].first), HandOverRefusalNames[static_cast<std::size_t>(v[0])], static_cast<long long>(v[1]), static_cast<long long>(v[2]), static_cast<long long>(v[3]), static_cast<long long>(v[4]), static_cast<long long>(v[5]), static_cast<long long>(v[6]), static_cast<long long>(v[7]), static_cast<long long>(v[8]), static_cast<long long>(v[9]), static_cast<long long>(v[10]), static_cast<long long>(v[11]), static_cast<long long>(v[12]), static_cast<long long>(v[13]));
+        refusals += shape;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshots read %.1f MiB; snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s\n", take(snapshotBytes) / 1048576.0, take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str());
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -1348,7 +1368,6 @@ bool StorageTexture::Refresh() {
                 stamped = false;
                 snapshotRescues.fetch_add(1, std::memory_order_relaxed);
                 if (snapshotSource != 0) clearSnapshotRescues.fetch_add(1, std::memory_order_relaxed);
-                if (snapshotSource == 2) publishedSnapshotRescues.fetch_add(1, std::memory_order_relaxed);
             }
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
@@ -1526,33 +1545,22 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 }
 
-bool StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
+std::uint64_t StorageTexture::SnapshotBytesRead() {
+    return snapshotBytesTotal.load(std::memory_order_relaxed);
+}
+
+void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
     snapshotSource = 0;
-    bool published = false;
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
-    // The units a shadow holds are published with one copy per run of layers read, not one per
-    // layer: each layer's read below would publish its own and wait for it.
-    std::uint64_t runBegin = 0, runEnd = 0;
-    const auto publishRun = [&] {
-        if (runEnd > runBegin && PublishShadowsOnly(runBegin, static_cast<std::size_t>(runEnd - runBegin), PublishScope::Whole)) published = true;
-    };
-    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (layers != nullptr && !(*layers)[layer]) continue;
-        if (layerBegin(layer) != runEnd) {
-            publishRun();
-            runBegin = layerBegin(layer);
-        }
-        runEnd = layerBegin(layer) + layerBytes(layer);
-    }
-    publishRun();
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
         const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
         GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+        snapshotBytes.fetch_add(layerBytes(layer), std::memory_order_relaxed);
+        snapshotBytesTotal.fetch_add(layerBytes(layer), std::memory_order_relaxed);
     }
     originalValid = originalValid || complete;
-    return published;
 }
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
@@ -1619,7 +1627,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
-        snapshotSource = captureGuestBytes(nullptr) ? 2 : 1;
+        // Imported memory the write tracker watches needs no bytes to compare with, as for a
+        // direct upload below: its stamps say what changed, and its write-backs go to the import.
+        // The import is looked up first: making one can end the watch of its range.
+        if (HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr && GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
+        else {
+            captureGuestBytes(nullptr);
+            snapshotSource = 1;
+        }
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
@@ -2458,7 +2473,20 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     flushedAfterSkip.fetch_add(1, std::memory_order_relaxed);
                     if (PublishReasonFor(reason) == PublishReason::Hook && texture->hookSkipSite.load(std::memory_order_relaxed) == static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())) flushedAfterSkipSameSite.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (exempt != nullptr && LookupOutcomes::Profiled()) handOverRefusals[exempt->handOverRefusal(*texture)].fetch_add(1, std::memory_order_relaxed);
+                if (exempt != nullptr && LookupOutcomes::Profiled()) {
+                    const auto refusal = exempt->handOverRefusal(*texture);
+                    handOverRefusals[refusal].fetch_add(1, std::memory_order_relaxed);
+                    const auto shape = [](const StorageTexture& image, std::int64_t* out) {
+                        const auto& d = image.descriptor;
+                        const std::array<std::int64_t, 6> values{d.width, d.height, d.depthOrLastArray, d.mipCount, static_cast<std::int64_t>(BytesPerElement(d.format)), static_cast<std::int64_t>(d.tileMode)};
+                        std::copy(values.begin(), values.end(), out);
+                    };
+                    std::array<std::int64_t, 14> key{static_cast<std::int64_t>(refusal), static_cast<std::int64_t>(texture->descriptor.baseAddress - exempt->descriptor.baseAddress)};
+                    shape(*exempt, key.data() + 2);
+                    shape(*texture, key.data() + 8);
+                    std::lock_guard shapesLock(handOverShapesMutex);
+                    ++handOverShapes[key];
+                }
                 if (auto alive = texture->weak_from_this().lock()) flush.push_back(std::move(alive));
                 it = pending.textures.erase(it);
             } else {

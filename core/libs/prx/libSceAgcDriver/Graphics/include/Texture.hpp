@@ -205,6 +205,8 @@ public:
     // FlushPending's publish of the unit shadows over the range without the image stores (what it
     // does when it lists no image, and all an access AccessKeptByCpu approved needs): whether any
     // unit was published.
+    // Guest bytes read into compare snapshots so far (every image; the tests read it).
+    static std::uint64_t SnapshotBytesRead();
     static bool PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason = "memory access");
     // For the [hooksync] recorded-store line: images a FlushPending stored after a hook skip of
     // theirs (AccessKeptByCpu), of which by the hook for the same read site as the last skip; 10 s deltas.
@@ -300,8 +302,7 @@ private:
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
-    // Returns whether units held in a unit shadow were published for the read.
-    bool captureGuestBytes(const std::vector<bool>* layers);
+    void captureGuestBytes(const std::vector<bool>* layers);
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
@@ -485,8 +486,7 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
-    // Where `original` came from, for the [storage] line: 0 other, 1 an upload under clear keys,
-    // 2 one that published shadowed units to read them.
+    // Where `original` came from, for the [storage] line: 0 other, 1 an upload under clear keys.
     std::uint8_t snapshotSource = 0;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
