@@ -264,8 +264,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
-    // Debug aids: APS5_NO_BDA_RANGE_CACHE=1 searches the page table at every address lookup;
-    // APS5_BDA_RANGE_CACHE_ENTRIES=<1 to 4> sets how many ranges a lookup keeps.
+    // APS5_BDA_RANGE_CACHE_ENTRIES=<1 to 4> has an address lookup keep that many ranges instead of
+    // searching the page table every time; APS5_NO_BDA_RANGE_CACHE=1 overrides it.
     static const std::uint32_t bdaRangeCacheEntries = [] {
         if (std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr) return 0u;
         const char* entries = std::getenv("APS5_BDA_RANGE_CACHE_ENTRIES");

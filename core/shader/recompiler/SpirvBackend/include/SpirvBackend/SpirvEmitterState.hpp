@@ -71,8 +71,9 @@ struct MemoryResourceAccess {
     std::uint32_t misalignment = 0;
 };
 
-// The ranges lookup_bda keeps unless a switch says otherwise.
-inline constexpr std::uint32_t BdaRangeCacheDefaultEntries = 2;
+// The ranges lookup_bda keeps unless a switch says otherwise: none, because RADV takes more memory to
+// compile a program whose lookups keep ranges (see the range cache's technical debt entry).
+inline constexpr std::uint32_t BdaRangeCacheDefaultEntries = 0;
 
 struct SpirvEmitterState {
     const ImageResource* runtimeImage = nullptr;
@@ -111,7 +112,7 @@ struct SpirvEmitterState {
     // Private: not zero when the page table's header is invalid (set by PrepareBdaLookups).
     std::uint32_t bdaTableInvalid = 0;
     // How many ranges lookup_bda keeps for its invocation (see DefineBdaLookupCore); 0 searches at
-    // every lookup. APS5_BDA_RANGE_CACHE_ENTRIES sets it, APS5_NO_BDA_RANGE_CACHE=1 clears it.
+    // every lookup. APS5_BDA_RANGE_CACHE_ENTRIES=<1 to 4> sets it, APS5_NO_BDA_RANGE_CACHE=1 clears it.
     std::uint32_t bdaRangeCacheEntries = BdaRangeCacheDefaultEntries;
     // Debug aid (APS5_BDA_RANGE_CACHE_CHECK=1): lookup_bda searches at every lookup as well and reports
     // a kept range that differs from the one the search selects (BdaAbi::FaultReason::RangeCacheMismatch).
