@@ -181,6 +181,18 @@ static void RunBdaRangeCacheTests(const Context& context) {
     check("reads below the first range", sorted, 3, {{Step::Read, guest - 4}, {Step::Read, guest}}, &expected);
     expected = {{0, 0}, Abi::FaultReason::InvalidTable, guest, 1, 0};
     check("an invalid table", sorted, 2, {{Step::Read, guest}, {Step::Read, guest + 4}}, &expected);
+    // Ranges the cache does not keep, because the checks a kept range skips could fail in them: a
+    // device address of zero, and device addresses that wrap.
+    {
+        auto unkept = sorted;
+        unkept[1].deviceAddress = 0;
+        // No byte read below has a device address short of the wrap: it would be loaded.
+        unkept[2].deviceAddress = ~std::uint64_t{0} - 3u;
+        expected = {{low(0), 0, 0, low(4)}, Abi::FaultReason::InvalidTable, guest + 16, 1, 1};
+        check("a range without a device address", unkept, 3, {{Step::Read, guest}, {Step::Read, guest + 16}, {Step::Read, guest + 20}, {Step::Read, guest + 4}}, &expected);
+        expected = {{low(0), 0, 0, low(4)}, Abi::FaultReason::Overflow, guest + 76, 1, 1};
+        check("a range whose device addresses wrap", unkept, 3, {{Step::Read, guest}, {Step::Read, guest + 76}, {Step::Read, guest + 72}, {Step::Read, guest + 4}}, &expected);
+    }
     // The search does not require sorted begins; the cache keeps the bounds of the steps it took, so
     // it must agree on any table.
     for (const auto& order : {std::array{2u, 0u, 1u}, std::array{1u, 2u, 0u}, std::array{2u, 1u, 0u}, std::array{0u, 2u, 1u}}) {

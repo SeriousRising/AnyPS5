@@ -51,12 +51,17 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     // compares with the begins the search visits: an address at or above every begin it stepped past
     // and below every begin it stopped short of takes the same steps and selects the same range,
     // sorted table or not. Those two bounds and the selected range are kept in Private variables,
-    // per invocation, and an address between the bounds skips the header checks and the search; the
-    // checks that depend on the address, bytes and permission then run on the kept words, in the
-    // same order, so every result and fault reason is the one the search gives. The entry point
-    // empties the cache (ResetBdaRangeCache) by storing to every one of these variables: a variable
-    // only this function used would be made a local of it by the optimizer's private-to-local pass
-    // and lose its value between calls.
+    // per invocation, and an address between the bounds skips the header checks and the search.
+    // The selected range's begin is one of the begins stepped past, so such an address is not below
+    // it. A range is kept only when its device address is not zero and the device addresses of its
+    // bytes do not wrap: the checks of those two that follow the permission check then pass for any
+    // access the earlier checks let through, so a kept range skips them too and keeps, instead of
+    // its begin and device address, their difference. The checks that depend on the address, bytes
+    // and permission (overflow, the range's end, the permission) run on the kept words, in the same
+    // order, so every result and fault reason is the one the search gives. The entry point empties
+    // the cache (ResetBdaRangeCache) by storing to every one of these variables: a variable only
+    // this function used would be made a local of it by the optimizer's private-to-local pass and
+    // lose its value between calls.
     const bool cache = state.bdaRangeCache;
     const auto loadWide = [&](std::uint32_t variable) {
         const auto value = state.module.AllocateId();
@@ -64,23 +69,29 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
         return value;
     };
     struct {
-        std::uint32_t floor, ceiling, begin, finish, base, permissions, validated;
+        std::uint32_t floor, ceiling, finish, delta, permissions, validated;
     } kept{};
+    // The kept range as the lookup found it on entry, and the block that goes to `found` with it.
+    struct {
+        std::uint32_t finish, delta, permissions, block;
+    } hit{};
     std::uint32_t floor = 0;
     std::uint32_t ceiling = 0;
     std::uint32_t found = 0;
     if (cache) {
         const auto wide = [&] { return state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u64), spv::StorageClassPrivate); };
         const auto word = [&] { return state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate); };
-        kept = {wide(), wide(), wide(), wide(), wide(), word(), word()};
-        state.bdaRangeCache64 = {kept.floor, kept.ceiling, kept.begin, kept.finish, kept.base};
+        kept = {wide(), wide(), wide(), wide(), word(), word()};
+        state.bdaRangeCache64 = {kept.floor, kept.ceiling, kept.finish, kept.delta};
         state.bdaRangeCache32 = {kept.permissions, kept.validated};
-        floor = state.module.AllocateId();
-        ceiling = state.module.AllocateId();
         found = state.module.AllocateId();
-        const auto widePointer = TypePointer(state, spv::StorageClassFunction, u64);
-        state.module.AddFunction(spv::OpVariable, widePointer, floor, spv::StorageClassFunction);
-        state.module.AddFunction(spv::OpVariable, widePointer, ceiling, spv::StorageClassFunction);
+        const auto local = [&](std::uint32_t type) {
+            const auto variable = state.module.AllocateId();
+            state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, type), variable, spv::StorageClassFunction);
+            return variable;
+        };
+        floor = local(u64);
+        ceiling = local(u64);
     }
     // Returns the header's range count.
     const auto validate = [&] {
@@ -101,10 +112,11 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
     const auto overflowed = either(binary(spv::OpIEqual, boolean, bytes, constant(0)), binary(spv::OpULessThanEqual, boolean, end, address));
     if (cache) {
-        const auto hit = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThanEqual, boolean, loadWide(kept.floor), address), binary(spv::OpULessThan, boolean, address, loadWide(kept.ceiling)));
+        const auto within = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThanEqual, boolean, loadWide(kept.floor), address), binary(spv::OpULessThan, boolean, address, loadWide(kept.ceiling)));
+        hit = {loadWide(kept.finish), loadWide(kept.delta), load(kept.permissions), state.currentLabel};
         const auto missed = state.module.AllocateId();
         state.module.AddFunction(spv::OpSelectionMerge, found, spv::SelectionControlMaskNone);
-        state.module.AddFunction(spv::OpBranchConditional, hit, found, missed);
+        state.module.AddFunction(spv::OpBranchConditional, within, found, missed);
         EmitLabel(state, missed);
         EmitIfCondition(state, binary(spv::OpIEqual, boolean, load(kept.validated), constant(0)), [&] {
             validate();
@@ -162,28 +174,49 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     auto base = BdaLoadAddress(state, at(4));
     auto permissions = BdaLoadWord(state, at(6));
     fail(either(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, at(7)), constant(0)), binary(spv::OpUGreaterThanEqual, boolean, begin, finish)), BdaAbi::FaultReason::InvalidTable);
+    std::uint32_t delta = 0;
+    // Whether the device checks are still due: not for a kept range.
+    std::uint32_t unchecked = 0;
     if (cache) {
-        state.module.AddFunction(spv::OpStore, kept.floor, loadWide(floor));
-        state.module.AddFunction(spv::OpStore, kept.ceiling, loadWide(ceiling));
-        state.module.AddFunction(spv::OpStore, kept.begin, begin);
-        state.module.AddFunction(spv::OpStore, kept.finish, finish);
-        state.module.AddFunction(spv::OpStore, kept.base, base);
-        state.module.AddFunction(spv::OpStore, kept.permissions, permissions);
+        delta = binary(spv::OpISub, u64, base, begin);
+        const auto last = binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, finish, begin));
+        const auto keeps = binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, base, BdaConstant(state, 0u)), binary(spv::OpUGreaterThan, boolean, last, base));
+        EmitIfCondition(state, keeps, [&] {
+            state.module.AddFunction(spv::OpStore, kept.floor, loadWide(floor));
+            state.module.AddFunction(spv::OpStore, kept.ceiling, loadWide(ceiling));
+            state.module.AddFunction(spv::OpStore, kept.finish, finish);
+            state.module.AddFunction(spv::OpStore, kept.delta, delta);
+            state.module.AddFunction(spv::OpStore, kept.permissions, permissions);
+        });
+        const auto discarded = Unary(state, spv::OpLogicalNot, boolean, keeps);
+        const auto searched = state.currentLabel;
         state.module.AddFunction(spv::OpBranch, found);
         EmitLabel(state, found);
+        const auto phi = [&](std::uint32_t type, std::uint32_t kept, std::uint32_t looked) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpPhi, type, value, kept, hit.block, looked, searched);
+            return value;
+        };
+        finish = phi(u64, hit.finish, finish);
+        delta = phi(u64, hit.delta, delta);
+        permissions = phi(u32, hit.permissions, permissions);
+        base = phi(u64, BdaConstant(state, 0u), base);
+        unchecked = phi(boolean, ConstantBool(state, false), discarded);
         fail(overflowed, BdaAbi::FaultReason::Overflow);
-        begin = loadWide(kept.begin);
-        finish = loadWide(kept.finish);
-        base = loadWide(kept.base);
-        permissions = load(kept.permissions);
     }
     fail(binary(spv::OpUGreaterThan, boolean, end, finish), BdaAbi::FaultReason::Unmapped);
     fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, permission), permission), BdaAbi::FaultReason::Permission);
-    fail(binary(spv::OpIEqual, boolean, base, BdaConstant(state, 0)), BdaAbi::FaultReason::InvalidTable);
-    const auto offset = binary(spv::OpISub, u64, address, begin);
-    const auto result = binary(spv::OpIAdd, u64, base, offset);
-    const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
-    fail(either(binary(spv::OpULessThan, boolean, result, base), binary(spv::OpULessThanEqual, boolean, deviceEnd, result)), BdaAbi::FaultReason::Overflow);
+    const auto result = cache ? binary(spv::OpIAdd, u64, address, delta) : binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, address, begin));
+    const auto checkDevice = [&](std::uint32_t deviceBase) {
+        fail(binary(spv::OpIEqual, boolean, deviceBase, BdaConstant(state, 0)), BdaAbi::FaultReason::InvalidTable);
+        const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
+        fail(either(binary(spv::OpULessThan, boolean, result, deviceBase), binary(spv::OpULessThanEqual, boolean, deviceEnd, result)), BdaAbi::FaultReason::Overflow);
+    };
+    if (cache) {
+        EmitIfCondition(state, unchecked, [&] { checkDevice(base); });
+    } else {
+        checkDevice(base);
+    }
     const auto looked = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeConstruct, pair, looked, result, BdaConstant(state, 0u));
     state.module.AddFunction(spv::OpReturnValue, looked);
@@ -271,7 +304,8 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
 
 void ResetBdaRangeCache(SpirvEmitterState& state) {
     if (state.bdaRangeCache64[0] == 0) return;
-    for (std::size_t index = 0; index < state.bdaRangeCache64.size(); ++index) state.module.AddFunction(spv::OpStore, state.bdaRangeCache64[index], BdaConstant(state, index == 0 ? ~std::uint64_t{0} : 0u));
+    // No address is below a ceiling of zero.
+    for (const auto variable : state.bdaRangeCache64) state.module.AddFunction(spv::OpStore, variable, BdaConstant(state, 0u));
     for (const auto variable : state.bdaRangeCache32) state.module.AddFunction(spv::OpStore, variable, ConstantU32(state, 0u));
 }
 

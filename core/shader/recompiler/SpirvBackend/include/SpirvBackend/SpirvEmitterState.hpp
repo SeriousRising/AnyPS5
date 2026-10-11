@@ -108,8 +108,8 @@ struct SpirvEmitterState {
     // Whether lookup_bda keeps the last range it found for its invocation (see DefineBdaLookupCore);
     // APS5_NO_BDA_RANGE_CACHE=1 clears it.
     bool bdaRangeCache = true;
-    // The cache's Private variables (lower bound first; 64-bit, then 32-bit); 0 without the cache.
-    std::array<std::uint32_t, 5> bdaRangeCache64 {};
+    // The cache's Private variables (64-bit, then 32-bit); 0 without the cache.
+    std::array<std::uint32_t, 4> bdaRangeCache64 {};
     std::array<std::uint32_t, 2> bdaRangeCache32 {};
     std::uint32_t bdaPointerFunction = 0;
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
