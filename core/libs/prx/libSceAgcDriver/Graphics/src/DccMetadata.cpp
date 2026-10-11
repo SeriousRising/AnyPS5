@@ -69,6 +69,9 @@ struct ScanProfile {
     // GPU stores whose range had a 4-byte unaligned head or tail (copied instead of filled).
     std::atomic<std::uint64_t> gpuSplitStores{0};
     std::atomic<std::uint64_t> cpuStores{0};
+    // Reads of a CMASK under recorded writes: answered from the pending fills, or waited for.
+    std::atomic<std::uint64_t> pendingFillKeys{0};
+    std::atomic<std::uint64_t> pendingKeyWaits{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -105,7 +108,7 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     }
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto& proofs = Proofs();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()));
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable; CMASK reads under recorded writes: %llu answered from pending fills, %llu waited for\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(profile.pendingFillKeys.load()), static_cast<unsigned long long>(profile.pendingKeyWaits.load()));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -297,6 +300,54 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
     return keys;
 }
 
+// The keys the range will hold once the recorded work has run, when that is known without waiting
+// for it and they are uniform: every byte's newest recorded writer is a fill of one known byte (the
+// title's fill of the keys through the fill kernel, or the driver's own store of uncompressed
+// keys), and the bytes no recorded work writes are read from memory. A writer whose bytes are not
+// known (a kernel storing keys, a copy, a label) over any byte it would decide, or keys that would
+// differ, answer nothing, and the caller waits and reads the bytes.
+// Debug aid: APS5_NO_PENDING_FILL_KEYS=1 always waits, as before.
+std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    static const bool disabled = std::getenv("APS5_NO_PENDING_FILL_KEYS") != nullptr;
+    if (disabled || !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    auto writes = recorder.PendingWritesOver(begin, count);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
+    int value = -1;
+    bool mixed = false;
+    const auto see = [&](int key) {
+        if (value < 0) value = key;
+        else if (value != key) mixed = true;
+    };
+    for (const auto& write : writes) {
+        if (unwritten.empty()) break;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        bool decides = false;
+        for (const auto& [from, to] : unwritten) {
+            if (write.end <= from || to <= write.begin) {
+                rest.emplace_back(from, to);
+                continue;
+            }
+            decides = true;
+            if (from < write.begin) rest.emplace_back(from, write.begin);
+            if (write.end < to) rest.emplace_back(write.end, to);
+        }
+        unwritten = std::move(rest);
+        if (!decides) continue;
+        if (write.value < 0) return std::nullopt;
+        see(write.value);
+    }
+    for (const auto& [from, to] : unwritten) {
+        if (mixed) break;
+        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
+        if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
+        else mixed = true;
+    }
+    if (mixed) return std::nullopt;
+    if (ScanProfileEnabled()) Scans().pendingFillKeys.fetch_add(1, std::memory_order_relaxed);
+    return ByteKeys(static_cast<std::uint8_t>(value));
+}
+
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
 // as a scan too.
 bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
@@ -458,10 +509,14 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
     return keys;
 }
 
-DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count) {
+DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool filled = false) {
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
+            if (filled) {
+                if (const auto keys = PendingFillKeys(*recorder, metaAddress, count)) return *keys;
+                if (ScanProfileEnabled()) Scans().pendingKeyWaits.fetch_add(1, std::memory_order_relaxed);
+            }
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
         }
@@ -490,6 +545,10 @@ DccKeys ReadDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
 
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
     return currentDccKeys(metaAddress, DccKeyBytes(surfaceBytes));
+}
+
+DccKeys CurrentOrFilledKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+    return currentDccKeys(metaAddress, DccKeyBytes(surfaceBytes), true);
 }
 
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {

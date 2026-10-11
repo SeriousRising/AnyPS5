@@ -137,7 +137,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
 bool materializeCmaskClear(const Context& context, const ColorTarget& color, StorageTexture* resident) {
     if (color.cmaskAddress == 0) return false;
     const auto metadataBytes = static_cast<std::uint64_t>(color.cmaskBytes) * 256u;
-    const auto state = CurrentDccKeys(color.cmaskAddress, metadataBytes);
+    const auto state = CurrentOrFilledKeys(color.cmaskAddress, metadataBytes);
     if (state == DccKeys::Uncompressed) return false;
     Require(color.dccAddress == 0, std::string("CMASK of a DCC color target that is not all expanded is not modeled (") + DccKeysName(state) + ")");
     Require(state == DccKeys::Clear0000, std::string("CMASK whose tiles are not all fast-cleared or all expanded is not modeled (") + DccKeysName(state) + ")");
