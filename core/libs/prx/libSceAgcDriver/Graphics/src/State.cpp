@@ -138,6 +138,13 @@ bool depthSurfaceBound(const Registers& cx) {
     return (z != cx.end() && (z->second & 3u) != 0) || (stencil != cx.end() && (stencil->second & 1u) != 0);
 }
 
+// DB_DEPTH_CONTROL without DEPTH_BOUNDS_ENABLE when no depth plane is bound: the bounds test
+// compares the depth the buffer holds, and there is none.
+std::uint32_t withoutIdleDepthBounds(const Registers& cx, std::uint32_t depthControl) {
+    const auto z = find(cx, 0x010);
+    return z != cx.end() && (z->second & 3u) != 0 ? depthControl : depthControl & ~8u;
+}
+
 bool depthPlanesAbsent(const Registers& cx) {
     const auto z = find(cx, 0x010);
     const auto stencil = find(cx, 0x011);
@@ -521,7 +528,14 @@ State DecodeState(const QueueState& queue) {
     }
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
     {
-        const auto depthControl = read(cx, 0x200);
+        const auto depthControl = withoutIdleDepthBounds(cx, read(cx, 0x200));
+        if (depthControl != read(cx, 0x200)) {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                std::fprintf(stderr, "[gpu] the depth bounds test is ignored without a depth plane (DB_DEPTH_CONTROL=0x%08x)\n", read(cx, 0x200));
+            }
+        }
         if ((depthControl & 0xbu) != 0 && depthSurfaceBound(cx)) {
             decodeDepth(cx, depthControl, result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 3u) != 0 && depthPlanesAbsent(cx))) {
@@ -854,9 +868,10 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     }
     if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
     if (value(cx, 0x200, word)) {
-        const bool surface = (word & 0xbu) != 0 && depthSurfaceBound(cx);
-        if (!surface && !((word & 3u) != 0 && depthPlanesAbsent(cx)) && !depthPassThrough(word) && !IgnoreDepthTest() && (effectiveDepthControl(word) & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");
-        if (auto reason = require((word & 8u) == 0 || surface, "depth bounds without a depth surface"); !reason.empty()) return reason;
+        const auto control = withoutIdleDepthBounds(cx, word);
+        const bool surface = (control & 0xbu) != 0 && depthSurfaceBound(cx);
+        if (!surface && !((control & 3u) != 0 && depthPlanesAbsent(cx)) && !depthPassThrough(control) && !IgnoreDepthTest() && (effectiveDepthControl(control) & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");
+        if (auto reason = require((control & 8u) == 0 || surface, "depth bounds without a depth surface"); !reason.empty()) return reason;
         if (auto reason = require((word & 0xc0000000u) == 0, "depth-conditional color writes are unsupported"); !reason.empty()) return reason;
     }
     std::uint32_t zFormat = 0;
