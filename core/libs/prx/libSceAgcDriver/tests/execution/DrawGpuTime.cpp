@@ -31,6 +31,8 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -307,6 +309,49 @@ void TraitTests() {
     Require(Traits({(4u << 16u) | 99u, 4, 5, 6}) == Detail::WritesMemory, "an image write was not read");
 }
 
+// A module of named functions, the last one the entry point.
+std::vector<std::uint32_t> NamedModule(std::initializer_list<std::pair<std::string_view, std::vector<std::uint32_t>>> functions) {
+    constexpr std::uint32_t entryPoint = (3u << 16u) | 15u, function = (5u << 16u) | 54u, functionEnd = (1u << 16u) | 56u;
+    std::vector<std::uint32_t> words{0x07230203u, 0x00010500u, 0u, 64u, 0u, entryPoint, 4, 40u + static_cast<std::uint32_t>(functions.size()) - 1u};
+    std::uint32_t id = 40;
+    for (const auto& [name, body] : functions) {
+        std::vector<std::uint32_t> text(name.size() / 4 + 1, 0u);
+        std::memcpy(text.data(), name.data(), name.size());
+        words.push_back((static_cast<std::uint32_t>(text.size() + 2) << 16u) | 5u);
+        words.push_back(id++);
+        words.insert(words.end(), text.begin(), text.end());
+    }
+    id = 40;
+    for (const auto& [name, body] : functions) {
+        words.insert(words.end(), {function, 30, id++, 0, 31});
+        words.insert(words.end(), body.begin(), body.end());
+        words.push_back(functionEnd);
+    }
+    return words;
+}
+
+void AddressSiteTests() {
+    constexpr std::uint32_t pointer = (4u << 16u) | 32u, variable = (4u << 16u) | 59u, store = (3u << 16u) | 62u, call = (4u << 16u) | 57u;
+    const std::vector<std::uint32_t> stores{pointer, 2, 12, 3, variable, 2, 4, 12, store, 4, 6};
+    using AgcDriver::Graphics::PixelProgramTraits;
+    Require(PixelProgramTraits(NamedModule({{"record_bda_fault", stores}, {"note_bda_write", stores}, {"main", {call, 30, 50, 40, call, 30, 51, 41}}})) == (Detail::WritesMemory | Detail::RecorderStoresOnly), "stores in the fault recorder alone were not read as the recorder's only");
+    Require(PixelProgramTraits(NamedModule({{"store_word", stores}, {"main", {call, 30, 50, 40}}})) == Detail::WritesMemory, "a store in another function was read as the fault recorder's");
+    auto both = stores;
+    both.insert(both.end(), {call, 30, 50, 40});
+    Require(PixelProgramTraits(NamedModule({{"record_bda_fault", stores}, {"main", both}})) == Detail::WritesMemory, "a store beside the fault recorder's was read as the recorder's only");
+    const auto calls = [&](std::initializer_list<std::uint32_t> callees) {
+        std::vector<std::uint32_t> body;
+        for (const auto callee : callees) body.insert(body.end(), {call, 30, 60, callee});
+        return body;
+    };
+    const auto sites = AgcDriver::Graphics::ProgramAddressSites(NamedModule({
+        {"lookup_bda", {}}, {"record_bda_fault", {}}, {"read_bda_dword_stop", calls({40, 41})}, {"read_bda_dword_bytes_stop", calls({40, 41})}, {"probe_bda_pointer", calls({40})},
+        {"get_bda_pointer", calls({40, 41})}, {"get_bda_write_pointer", calls({40, 41})}, {"get_bda_atomic_pointer", calls({40, 41})}, {"note_bda_write", {}},
+        {"main", calls({42, 42, 44, 43, 45, 45, 45, 46, 47, 48, 41})}}));
+    Require(sites.reads == 3 && sites.byteReads == 4 && sites.stores == 2, "address-based sites were counted as " + std::to_string(sites.reads) + "/" + std::to_string(sites.byteReads) + "/" + std::to_string(sites.stores) + ", expected 3/4/2");
+    Require(AgcDriver::Graphics::ProgramAddressSites(NamedModule({{"helper", calls({41})}, {"main", calls({40})}})) == AgcDriver::Graphics::Recorder::AddressSites{}, "calls of other functions were counted as address-based sites");
+}
+
 }
 
 int main() {
@@ -317,6 +362,7 @@ int main() {
         setenv("APS5_PROFILE_GPU", "1", 1);
 #endif
         TraitTests();
+        AddressSiteTests();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Block first(8 * BlockBytes);

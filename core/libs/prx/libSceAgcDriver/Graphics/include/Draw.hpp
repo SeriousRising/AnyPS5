@@ -33,7 +33,14 @@ std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters
 // The Recorder::DrawTimingDetail traits of a fragment module, read off its instructions: a declared
 // EarlyFragmentTests mode, a DepthReplacing mode, and, in the entry point or a function some call
 // names, a kill and a store or atomic update through a buffer or image pointer (or an image write).
+// RecorderStoresOnly when every such store is in record_bda_fault or note_bda_write, the recompiler's
+// fault recorder and written-page notes, so the guest program itself stores nothing.
 std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv);
+// The OpFunctionCall sites, by the callee's OpName and outside the helpers themselves, of the
+// recompiler's address-based accesses: read_bda_dword* (not the _bytes ones) and probe_bda_pointer
+// as reads, get_bda_pointer and read_bda_dword_bytes* as byte-path reads, get_bda_write_pointer and
+// get_bda_atomic_pointer as stores. Zero for a module without those names.
+Recorder::AddressSites ProgramAddressSites(std::span<const std::uint32_t> spirv);
 
 struct MeshArguments {
     std::uint32_t groups;
