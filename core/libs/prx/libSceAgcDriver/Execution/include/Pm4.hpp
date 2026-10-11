@@ -143,6 +143,8 @@ std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet
 std::uint32_t DmaSource(std::span<const std::uint32_t> packet);
 std::uint32_t DmaDestination(std::span<const std::uint32_t> packet);
 std::optional<MemoryCopy> DecodeGdsSourceCopy(std::span<const std::uint32_t> packet);
+// Likewise a DMA_DATA that copies out of memory, to memory or to the GDS.
+std::optional<MemoryCopy> DecodeMemorySourceCopy(std::span<const std::uint32_t> packet);
 // A DISPATCH_INDIRECT's arguments: the guest address of its three group-count dwords (no memory
 // access, so the GPU can read them in place: VulkanDevice::DispatchIndirect), the DISPATCH_DIRECT
 // packet made by reading them there (through the checked guest memory path, which waits for

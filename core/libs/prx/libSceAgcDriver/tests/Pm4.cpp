@@ -442,6 +442,10 @@ void testCopies() {
     check(withinGds.has_value() && withinGds->destination == AgcDriver::Pm4::GdsAddress() + 0x200, "a DMA_DATA within the GDS did not decode as a copy between GDS addresses");
     check(!AgcDriver::Pm4::DecodeGdsSourceCopy(makePacket(0x50, {0x20100000, 0x100, 0, 0x108, 0, 16})).has_value() && !AgcDriver::Pm4::DecodeGdsSourceCopy(makePacket(0x50, {0x20000000, 0x100, 0, low(destination.data()), high(destination.data()), 0})).has_value(), "an overlapping or empty DMA_DATA out of the GDS decoded as a copy");
     check(!AgcDriver::Pm4::DecodeGdsSourceCopy(toGds).has_value() && !AgcDriver::Pm4::DecodeGdsSourceCopy(makePacket(0x50, {0x40000000, 0x44332211, 0, low(destination.data()), high(destination.data()), 16})).has_value(), "a DMA_DATA from memory or an immediate decoded as a copy out of the GDS");
+    const auto memoryCopy = AgcDriver::Pm4::DecodeMemorySourceCopy(toGds);
+    check(memoryCopy.has_value() && memoryCopy->source == reinterpret_cast<std::uintptr_t>(source.data()) && memoryCopy->destination == AgcDriver::Pm4::GdsAddress() + 0x100 && memoryCopy->bytes == 16, "a DMA_DATA from memory to the GDS did not decode as a copy to the GDS address");
+    check(AgcDriver::Pm4::DecodeMemorySourceCopy(makePacket(0x50, {0x60000000, low(source.data()), high(source.data()), low(destination.data()), high(destination.data()), 16})).has_value(), "a DMA_DATA between memory ranges did not decode as a copy out of memory");
+    check(!AgcDriver::Pm4::DecodeMemorySourceCopy(fromGds).has_value() && !AgcDriver::Pm4::DecodeMemorySourceCopy(makePacket(0x50, {0x40100000, 0x44332211, 0, 0x100, 0, 16})).has_value() && !AgcDriver::Pm4::DecodeMemorySourceCopy(makePacket(0x50, {0x60100000, low(source.data()), high(source.data()), 0x100, 0, 0})).has_value(), "a DMA_DATA from the GDS, an immediate or an empty one decoded as a copy out of memory");
     const auto store = AgcDriver::Pm4::ResolveStore(fromGds, state, 64);
     check(store.has_value() && store->Bytes().size() == 16 && std::memcmp(store->Bytes().data(), source.data(), 16) == 0, "DMA_DATA from GDS did not resolve its source bytes");
     destination = {};

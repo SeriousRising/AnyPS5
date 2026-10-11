@@ -36,6 +36,7 @@ constexpr std::uint32_t Results = 4;
 constexpr std::uint32_t Counters = 4;
 constexpr std::uint32_t CounterOffset = 0x10;
 constexpr std::uint32_t LabelOffset = 0x100;
+constexpr std::uint32_t ReturnOffset = 0x124;
 constexpr std::array<std::uint32_t, Counters> Starts{1000, 2000, 3000, 4000};
 constexpr std::uint32_t Untouched = 0xdeadbeefu;
 constexpr std::uint32_t GdsLabel = 0x11223344u;
@@ -101,6 +102,7 @@ struct Bytes {
     std::array<std::uint32_t, Threads * Results> output{};
     std::array<std::uint32_t, Counters> counters{};
     std::uint32_t gdsLabel = 0;
+    std::uint32_t gdsReturn = 0;
     std::array<std::uint32_t, 8> destination{};
 
     bool operator==(const Bytes&) const = default;
@@ -111,6 +113,7 @@ struct Waits {
     int gdsLabel = -1;
     int outputLabel = -1;
     CopyOutcome fromGds{};
+    CopyOutcome toGds{};
     CopyOutcome overLabel{};
     CopyOutcome fromOutput{};
 };
@@ -137,6 +140,7 @@ Bytes Run(AgcDriver::VulkanDevice& device, GuestBlock& output, GuestBlock& desti
     AgcDriver::GuestMemory::Write(gds + CounterOffset, std::as_bytes(std::span(Starts)), 4);
     const std::uint32_t cleared = 0;
     AgcDriver::GuestMemory::Write(gds + LabelOffset, std::as_bytes(std::span(&cleared, 1)), 4);
+    AgcDriver::GuestMemory::Write(gds + ReturnOffset, std::as_bytes(std::span(&cleared, 1)), 4);
     const auto outputAddress = output.Address();
     const std::vector<std::uint32_t> userData{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu) | (4u << 16u), Threads * Results, 0x11016facu};
     const std::span<const std::uint32_t> code(Code);
@@ -165,6 +169,8 @@ Bytes Run(AgcDriver::VulkanDevice& device, GuestBlock& output, GuestBlock& desti
     settle();
     waits.fromGds = Copy(device, destination.Address(), gds + LabelOffset, 4);
     settle();
+    waits.toGds = Copy(device, gds + ReturnOffset, destination.Address(), 4);
+    settle();
     StoreLabel(device, destination.Address() + 8, DestinationLabel);
     settle();
     waits.overLabel = Copy(device, destination.Address() + 8, gds + CounterOffset, 4);
@@ -177,6 +183,7 @@ Bytes Run(AgcDriver::VulkanDevice& device, GuestBlock& output, GuestBlock& desti
     std::memcpy(bytes.output.data(), output.Data(), sizeof(bytes.output));
     std::memcpy(bytes.counters.data(), reinterpret_cast<const void*>(gds + CounterOffset), sizeof(bytes.counters));
     std::memcpy(&bytes.gdsLabel, reinterpret_cast<const void*>(gds + LabelOffset), sizeof(bytes.gdsLabel));
+    std::memcpy(&bytes.gdsReturn, reinterpret_cast<const void*>(gds + ReturnOffset), sizeof(bytes.gdsReturn));
     std::memcpy(bytes.destination.data(), destination.Data(), sizeof(bytes.destination));
     return bytes;
 }
@@ -207,13 +214,14 @@ int main() {
         }
         Waits serial, waits;
         const auto expected = Run(*device, output, destination, false, serial);
-        Require(expected.output[1] != Untouched && expected.output[0] == OutputLabel && expected.gdsLabel == GdsLabel && expected.counters != Starts, "completion store waits: the dispatch and the stores waited for one by one left other bytes than they store");
+        Require(expected.output[1] != Untouched && expected.output[0] == OutputLabel && expected.gdsLabel == GdsLabel && expected.gdsReturn == GdsLabel && expected.counters != Starts, "completion store waits: the dispatch and the stores waited for one by one left other bytes than they store");
         Require(expected.destination[0] == GdsLabel && expected.destination[2] == expected.counters[0] && expected.destination[4] == OutputLabel && expected.destination[5] == expected.output[1] && expected.destination[7] == expected.output[3], "completion store waits: the copies waited for one by one left other bytes than their sources");
         const auto actual = Run(*device, output, destination, true, waits);
         Require(actual == expected, "completion store waits: stores and copies recorded behind a dispatch left other bytes than the same ones waited for one by one");
         Require(waits.completionPending, "completion store waits: no completion was pending behind the dispatch");
         Require(waits.gdsLabel == 0, "completion store waits: a store to memory the dispatch writes on the GPU went behind its completion (reason " + std::to_string(waits.gdsLabel) + ")");
         Require(waits.fromGds.path == 1 && !waits.fromGds.synced, "completion store waits: a copy out of memory the dispatch writes on the GPU waited (cause " + std::to_string(waits.fromGds.syncCause) + ")");
+        Require(waits.toGds.path == 1 && !waits.toGds.synced, "completion store waits: a copy into the GDS out of memory a recorded copy writes waited (cause " + std::to_string(waits.toGds.syncCause) + ")");
         Require(waits.overLabel.path == 1 && !waits.overLabel.synced, "completion store waits: a copy over a label stored on the GPU waited (cause " + std::to_string(waits.overLabel.syncCause) + ")");
         Require(waits.outputLabel == 5, "completion store waits: a store over a copied buffer's pending write-back did not go behind it (reason " + std::to_string(waits.outputLabel) + ")");
         Require(waits.fromOutput.path == 1 && waits.fromOutput.synced && (waits.fromOutput.syncCause & 1) != 0, "completion store waits: a copy out of a copied buffer did not wait for its write-back (cause " + std::to_string(waits.fromOutput.syncCause) + ")");

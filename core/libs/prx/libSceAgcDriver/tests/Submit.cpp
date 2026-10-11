@@ -215,6 +215,12 @@ void testDmaData() {
     destination.fill(0xdeadbeefu);
     submit({0xc0055000u, 0x20000000u, 0x208u, 0u, low(destination.data()), high(destination.data()), 16u});
     check(destination[0] == 0x01234567u && destination[1] == 0x89abcdefu && destination[2] == 0 && destination[3] == 0x55667788u && destination[4] == 0xdeadbeefu, "a DMA_DATA copy from the GDS stored other bytes than the GDS holds");
+    destination.fill(0xdeadbeefu);
+    std::array<std::uint32_t, 21> chain{0xc0055000u, 0x40100000u, 0x0badcafeu, 0u, 0x300u, 0u, 4u, 0xc0055000u, 0x20000000u, 0x300u, 0u, low(destination.data()), high(destination.data()), 4u, 0xc0055000u, 0x60100000u, low(destination.data()), high(destination.data()), 0x324u, 0u, 4u};
+    Packet chained{chain.data(), static_cast<std::uint32_t>(chain.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&chained) == 0, "DMA_DATA chain submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(gds[0x300 / 4] == 0x0badcafeu && destination[0] == 0x0badcafeu && destination[1] == 0xdeadbeefu && gds[0x324 / 4] == 0x0badcafeu, "a DMA_DATA copy back into the GDS stored other bytes than the copy out of it left");
 }
 
 void testEndOfPipeInterrupts() {

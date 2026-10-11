@@ -255,7 +255,13 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         // A copy out of the GDS is recorded as a copy in queue order (or made at once when its
         // source and destination are settled) instead of reading the GDS here, which waits for
         // the recorded work that writes it. A refused copy takes the store path below.
-        const auto gdsCopy = opcode == 0x50 ? Pm4::DecodeGdsSourceCopy(packet) : std::nullopt;
+        auto gdsCopy = opcode == 0x50 ? Pm4::DecodeGdsSourceCopy(packet) : std::nullopt;
+        // So is a copy out of memory that recorded work writes: reading that source here waits
+        // for the work too. One whose source nothing recorded writes stays a store of its bytes.
+        if (opcode == 0x50 && !gdsCopy.has_value()) {
+            gdsCopy = Pm4::DecodeMemorySourceCopy(packet);
+            if (gdsCopy.has_value() && !(GuestMemory::Accessible(reinterpret_cast<const void*>(gdsCopy->source), gdsCopy->bytes) && Graphics::Recorder::SnapshotWriteOverlaps(gdsCopy->source, gdsCopy->bytes))) gdsCopy.reset();
+        }
         if (gdsCopy.has_value() && gdsCopy->bytes <= gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(gdsCopy->destination), gdsCopy->bytes, true)) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
