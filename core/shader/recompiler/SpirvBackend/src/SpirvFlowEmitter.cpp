@@ -761,6 +761,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ctx.Fail(*inst, "appears after a non-Phi instruction");
             }
         } else {
+            if (!emittedNonPhi) ResetBdaSharedBases(state, block);
             emittedNonPhi = true;
         }
         if (state.waveLdsScope != 0) {
@@ -801,6 +802,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
         }
         state.laneHalf = 0;
     }
+    if (!emittedNonPhi) ResetBdaSharedBases(state, block);
 }
 
 void PatchStructuredPhis(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState) {

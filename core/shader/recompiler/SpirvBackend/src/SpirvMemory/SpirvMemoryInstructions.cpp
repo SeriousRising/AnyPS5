@@ -204,7 +204,9 @@ std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, cons
 
 std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t bits) {
     return EmitValueOrZeroIfCondition(ctx.state, ActiveArgument(ctx, inst), [&]() {
-        return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
+        const auto* shared = bits == 32u ? SharedBdaRead(ctx.state, inst) : nullptr;
+        if (shared == nullptr) return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
+        return EmitBdaSharedDwordReads(ctx, inst, ctx.state.bdaSharedBases[shared->base], shared->begin, shared->tries, GuestAddress(ctx, inst, mem), 0u, 1u)[0];
     });
 }
 
@@ -358,7 +360,9 @@ void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t 
 std::uint32_t LoadBdaWide(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t components) {
     auto& state = ctx.state;
     return EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), TypeU32Composite(state, components), ConstantU32CompositeZero(state, components), [&]() {
-        return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components));
+        const auto* shared = SharedBdaRead(state, inst);
+        if (shared == nullptr) return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components));
+        return ConstructU32Composite(state, components, EmitBdaSharedDwordReads(ctx, inst, state.bdaSharedBases[shared->base], shared->begin, shared->tries, GuestAddressBase(ctx, inst, mem), mem.offset, components));
     });
 }
 

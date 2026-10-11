@@ -20,6 +20,11 @@ struct BdaLookupResult {
 // Calls lookup_bda, which searches the page table unless one of the ranges the invocation found last
 // holds the address (APS5_NO_BDA_RANGE_CACHE=1 always searches); see DefineBdaLookupCore.
 BdaLookupResult BdaLookup(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission);
+// A permission bit for lookup_bda_span, beside BdaAbi's: the lookup then fails unless every byte of
+// the access also takes the search the first one took (and it always searches).
+inline constexpr std::uint32_t BdaLookupSpan = 4u;
+// BdaLookup with the permission as a value, through lookup_bda_span with `span` (modules that share bases).
+BdaLookupResult BdaSpanLookup(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission, bool span = true);
 // Validates the page table's header for lookup_bda and empties its range cache; emitted at the start
 // of the program's function.
 void PrepareBdaLookups(SpirvEmitterState& state);
@@ -61,7 +66,34 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
 // Reads the dwords of a 1-4 dword load at address + offset that the program extracts, with one
 // table lookup for the whole span; the per-byte lookups of EmitBdaRead remain the fallback (and
 // the only path under APS5_BDA_BYTE_READS=1). Dwords the program never extracts are neither read
-std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false);
+// With `shared` the read's own lookup also tries the hull of that base when no member has yet, and
+// leaves the outcome in the base's variable (see EmitBdaSharedDwordReads).
+struct BdaSharedTry {
+    std::uint32_t variable;
+    // The variable's value where the read starts.
+    std::uint32_t held;
+    // Bytes from the hull's first byte to the read's first extracted dword.
+    std::uint32_t back;
+    std::uint32_t bytes;
+};
+std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false, const BdaSharedTry* shared = nullptr);
+// Groups the program's address-based dword reads by base address (the values it is computed from,
+// the kind of address and the immediates' residue modulo 4); a base with two reads or more is shared.
+// Nothing is emitted. APS5_NO_BDA_SHARED_BASE=1 finds none, so that every read looks its own bytes up.
+void FindBdaSharedBases(SpirvEmitterState& state);
+// Adds a shared base for the bytes [first, first + bytes) from some address; its variable is defined
+// with the lookup functions (DefineGetBdaPointer) or, after them, here.
+std::uint32_t AddBdaSharedBase(SpirvEmitterState& state, std::int64_t first, std::uint32_t bytes);
+// The shared read that `inst` is, or null.
+const BdaSharedRead* SharedBdaRead(const SpirvEmitterState& state, const IrValue& inst);
+// EmitBdaDwordReads for a member of `base` whose first extracted dword lies `begin` bytes from the
+// base address. Once a member has found the hull in one readable range, a member loads its dwords
+// at the hull's device address plus a constant, with no lookup; until then, and when the hull is
+// not in one range, it reads as EmitBdaDwordReads does, and a member that `tries` has its own
+// lookup try the hull first.
+std::array<std::uint32_t, 4> EmitBdaSharedDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, const BdaSharedBase& base, std::int64_t begin, bool tries, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false);
+// Forgets, where `block` starts, the translations of the bases computed from a value it defines.
+void ResetBdaSharedBases(SpirvEmitterState& state, const IrBlock* block);
 bool BdaByteReadsForced();
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);

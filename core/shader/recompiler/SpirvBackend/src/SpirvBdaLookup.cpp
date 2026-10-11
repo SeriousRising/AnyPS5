@@ -20,7 +20,13 @@ namespace {
 // per invocation, see PrepareBdaLookups), overflow of the access, no range at or below the address,
 // the range's own words, its end, the permission, a zero device address, overflow of the device
 // address.
-std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
+//
+// With `span` the function is lookup_bda_span, for the reads that try a shared base's hull: a lookup
+// may ask it (BdaLookupSpan) whether the whole access takes the search its first byte takes. It then
+// searches whatever is kept, and fails unless the access ends at or below every begin the search
+// stopped short of: every byte of such an access, looked up by itself, is found in the same range,
+// sorted table or not. It shares the per-invocation variables of lookup_bda, defined first.
+std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state, bool span = false) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto pair = state.module.Type(spv::OpTypeVector, u64, 2u);
@@ -44,7 +50,8 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     const auto word = [&] { return state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate); };
     const auto zero = BdaConstant(state, 0u);
     const auto no = ConstantBool(state, false);
-    state.bdaTableInvalid = word();
+    const bool first = state.bdaTableInvalid == 0u;
+    if (first) state.bdaTableInvalid = word();
     // The range cache. The page table does not change while a draw or dispatch runs (BdaResources
     // fills it once, before it is bound), so the outcome of a search depends only on how the address
     // compares with the begins the search visits: an address at or above every begin it stepped past
@@ -66,19 +73,25 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     // an invalid one, or one with another begin, end, device address or permissions.
     const bool cache = state.bdaRangeCacheEntries != 0;
     const bool check = cache && state.bdaRangeCacheCheck;
+    const bool shared = span;
     // `begin` only with the check.
     struct Kept {
         std::uint32_t floor, ceiling, finish, delta, permissions, begin;
     };
     std::vector<Kept> kept;
     for (std::uint32_t entry = 0; cache && entry < state.bdaRangeCacheEntries; ++entry) {
+        if (!first) {
+            const auto* words = &state.bdaRangeCache64[entry * (check ? 5u : 4u)];
+            kept.push_back({words[0], words[1], words[2], words[3], state.bdaRangeCache32[entry], check ? words[4] : 0u});
+            continue;
+        }
         kept.push_back({wide(), wide(), wide(), wide(), word(), check ? wide() : 0u});
         state.bdaRangeCache64.insert(state.bdaRangeCache64.end(), {kept.back().floor, kept.back().ceiling, kept.back().finish, kept.back().delta});
         if (check) state.bdaRangeCache64.push_back(kept.back().begin);
         state.bdaRangeCache32.push_back(kept.back().permissions);
     }
     const auto function = state.module.AllocateId();
-    state.module.AddName(function, "lookup_bda");
+    state.module.AddName(function, span ? "lookup_bda_span" : "lookup_bda");
     state.module.AddFunction(spv::OpFunction, pair, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, pair, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
@@ -95,7 +108,10 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     const auto low = local(u32);
     const auto high = local(u32);
     const auto floor = cache ? local(u64) : 0u;
-    const auto ceiling = cache ? local(u64) : 0u;
+    const auto ceiling = cache || shared ? local(u64) : 0u;
+    const auto spanning = shared ? binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permission, constant(BdaLookupSpan)), constant(0)) : 0u;
+    const auto wanted = shared ? binary(spv::OpBitwiseAnd, u32, permission, constant(BdaAbi::Read | BdaAbi::Write)) : permission;
+    if (shared) state.module.AddFunction(spv::OpStore, ceiling, BdaConstant(state, 0u));
     const auto invalidTable = binary(spv::OpINotEqual, boolean, load(state.bdaTableInvalid), constant(0));
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
     const auto overflowed = either(binary(spv::OpIEqual, boolean, bytes, constant(0)), binary(spv::OpULessThanEqual, boolean, end, address));
@@ -118,7 +134,7 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     }
     const Taken held = taken;
     auto searches = negate(either(invalidTable, overflowed));
-    if (cache && !check) searches = both(searches, negate(within));
+    if (cache && !check) searches = both(searches, shared ? either(negate(within), spanning) : negate(within));
     const auto phi = [&](std::uint32_t type, std::uint32_t value, std::uint32_t from, std::uint32_t otherwise, std::uint32_t before) {
         const auto merged = state.module.AllocateId();
         state.module.AddFunction(spv::OpPhi, type, merged, value, from, otherwise, before);
@@ -132,10 +148,8 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     EmitLabel(state, searchLabel);
     state.module.AddFunction(spv::OpStore, low, constant(0));
     state.module.AddFunction(spv::OpStore, high, BdaLoadWord(state, constant(1)));
-    if (cache) {
-        state.module.AddFunction(spv::OpStore, floor, zero);
-        state.module.AddFunction(spv::OpStore, ceiling, BdaConstant(state, ~std::uint64_t{0}));
-    }
+    if (cache) state.module.AddFunction(spv::OpStore, floor, zero);
+    if (cache || shared) state.module.AddFunction(spv::OpStore, ceiling, BdaConstant(state, ~std::uint64_t{0}));
     const auto header = state.module.AllocateId();
     const auto body = state.module.AllocateId();
     const auto continuation = state.module.AllocateId();
@@ -155,8 +169,10 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpStore, high, Select(state, u32, before, midpoint, upper));
     if (cache) {
         const auto oldFloor = loadWide(floor);
-        const auto oldCeiling = loadWide(ceiling);
         state.module.AddFunction(spv::OpStore, floor, Select(state, u64, both(negate(before), binary(spv::OpUGreaterThan, boolean, visited, oldFloor)), visited, oldFloor));
+    }
+    if (cache || shared) {
+        const auto oldCeiling = loadWide(ceiling);
         state.module.AddFunction(spv::OpStore, ceiling, Select(state, u64, both(before, binary(spv::OpULessThan, boolean, visited, oldCeiling)), visited, oldCeiling));
     }
     state.module.AddFunction(spv::OpBranch, continuation);
@@ -234,9 +250,11 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state) {
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     const auto reasons = [&](std::uint32_t condition, BdaAbi::FaultReason reason, std::uint32_t otherwise) { return Select(state, u64, condition, BdaConstant(state, static_cast<std::uint32_t>(reason)), otherwise); };
     const auto due = [&](std::uint32_t condition) { return cache && !check ? both(loose, condition) : condition; };
-    auto reason = reasons(due(either(binary(spv::OpULessThan, boolean, result, taken.base), binary(spv::OpULessThanEqual, boolean, deviceEnd, result))), BdaAbi::FaultReason::Overflow, zero);
+    // A span that fails only here is in one range by its first byte's search and not by a later byte's.
+    auto reason = shared ? reasons(both(spanning, binary(spv::OpUGreaterThan, boolean, end, loadWide(ceiling))), BdaAbi::FaultReason::Unmapped, zero) : zero;
+    reason = reasons(due(either(binary(spv::OpULessThan, boolean, result, taken.base), binary(spv::OpULessThanEqual, boolean, deviceEnd, result))), BdaAbi::FaultReason::Overflow, reason);
     reason = reasons(due(binary(spv::OpIEqual, boolean, taken.base, zero)), BdaAbi::FaultReason::InvalidTable, reason);
-    reason = reasons(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, taken.permissions, permission), permission), BdaAbi::FaultReason::Permission, reason);
+    reason = reasons(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, taken.permissions, wanted), wanted), BdaAbi::FaultReason::Permission, reason);
     reason = reasons(binary(spv::OpUGreaterThan, boolean, end, taken.finish), BdaAbi::FaultReason::Unmapped, reason);
     reason = reasons(bad, BdaAbi::FaultReason::InvalidTable, reason);
     reason = reasons(unmapped, BdaAbi::FaultReason::Unmapped, reason);
@@ -285,9 +303,13 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
 }
 
 BdaLookupResult BdaLookup(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission) {
+    return BdaSpanLookup(state, address, bytes, ConstantU32(state, permission), false);
+}
+
+BdaLookupResult BdaSpanLookup(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission, bool span) {
     const auto u64 = TypeScalarU64(state);
     const auto looked = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVector, u64, 2u), looked, state.bdaLookupFunction, address, bytes, ConstantU32(state, permission));
+    state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVector, u64, 2u), looked, span ? state.bdaSpanLookupFunction : state.bdaLookupFunction, address, bytes, permission);
     const auto device = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, u64, device, looked, 0u);
     const auto reason = state.module.AllocateId();
@@ -359,6 +381,7 @@ void PrepareBdaLookups(SpirvEmitterState& state) {
     // No address is below a ceiling of zero.
     for (const auto variable : state.bdaRangeCache64) state.module.AddFunction(spv::OpStore, variable, BdaConstant(state, 0u));
     for (const auto variable : state.bdaRangeCache32) state.module.AddFunction(spv::OpStore, variable, ConstantU32(state, 0u));
+    for (const auto& base : state.bdaSharedBases) state.module.AddFunction(spv::OpStore, base.variable, BdaConstant(state, 0u));
 }
 
 void DefineGetBdaPointer(SpirvEmitterState& state) {
@@ -366,9 +389,11 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
     DefineBdaFaultFunction(state);
     if (state.bdaStopDeferred) state.bdaStopped = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
     state.bdaLookupFunction = DefineBdaLookupCore(state);
+    if (state.bdaSharedBase) state.bdaSpanLookupFunction = DefineBdaLookupCore(state, true);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);
+    for (auto& base : state.bdaSharedBases) base.variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state)), spv::StorageClassPrivate);
     if (state.program.Info().bdaWrites) {
         state.bdaWritePointerFunction = DefineBdaLookup(state, "get_bda_write_pointer", true, BdaAbi::Write);
         state.bdaAtomicPointerFunction = DefineBdaLookup(state, "get_bda_atomic_pointer", true, BdaAbi::Read | BdaAbi::Write);
