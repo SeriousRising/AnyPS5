@@ -674,6 +674,11 @@ State DecodeState(const QueueState& queue) {
     return result;
 }
 
+bool WritesNoDepthOrStencil(const State& state) {
+    const auto keeps = [](const VkStencilOpState& face) { return face.writeMask == 0 || (face.failOp == VK_STENCIL_OP_KEEP && face.passOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP); };
+    return !state.depth || (!state.depthWrite && (!state.stencilTest || (keeps(state.stencilFront) && keeps(state.stencilBack))));
+}
+
 std::array<std::uint8_t, 8> ExportMappings(const State& state) {
     std::array<std::uint8_t, 8> mappings{};
     mappings.fill(0xe4u);

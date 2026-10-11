@@ -176,7 +176,8 @@ void DefineModule(SpirvEmitterState& state) {
                 state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDepthGreater);
             }
         }
-        if (pixel.psEarlyZ && !pixel.psPixelKillEnable && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable) {
+        // The caller decides whether a shader that kills may test early (DecodePixelStageInfo).
+        if (pixel.psEarlyZ && !pixel.psDepthExportEnable && !pixel.psSampleMaskExportEnable) {
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeEarlyFragmentTests);
         }
         if (pixel.psOrderedPixelShader) {

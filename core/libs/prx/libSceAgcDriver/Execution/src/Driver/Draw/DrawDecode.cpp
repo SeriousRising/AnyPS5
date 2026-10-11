@@ -115,7 +115,7 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     auto product = std::make_shared<DrawDecode>();
     product->state = Graphics::DecodeState(queue);
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
-    product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
+    product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue), Graphics::WritesNoDepthOrStencil(product->state));
     return product;
 }
 
