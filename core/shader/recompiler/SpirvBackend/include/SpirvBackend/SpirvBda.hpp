@@ -29,8 +29,11 @@ std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst);
 // are: the driver's compile time grows much faster than the program with one return per read site.
 // A flagged invocation must leave no trace, so this holds only for one-lane pixel and compute
 // programs whose effects are all suppressed for it (address-based stores and atomics, void buffer
-// and image stores) or discarded with it (pixel exports), and whose only view of other invocations
-// is a ballot, where a flagged invocation counts as absent.
+// and image stores) or discarded with it (pixel exports), and whose only views of other invocations
+// are a ballot, where a flagged invocation counts as absent, and a DPP operand: one that skips
+// inactive lanes reads zero from a flagged lane, as it did from one that had ended, and a
+// fetch-inactive one reads what the flagged lane computed, where a lane that had ended gave nothing
+// defined.
 // APS5_BDA_STOP_PER_SITE=1 ends every faulting invocation at the read, as before.
 bool BdaStopCanBeDeferred(const SpirvEmitterState& state);
 // Ends the invocation here when a deferred stop is pending (before a guest loop, which a flagged
