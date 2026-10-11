@@ -1637,15 +1637,21 @@ void verifyBdaReadFallbackFunctions() {
         request.useCache = false;
         return Recompile(request).spirv;
     };
+    // The loads share one base address unless APS5_NO_BDA_SHARED_BASE is set: the first read site then
+    // calls the function that tries the base's hull first, and two sites are needed to share at all.
+    const bool sharing = std::getenv("APS5_NO_BDA_SHARED_BASE") == nullptr;
     for (const bool barrier : {false, true}) {
         for (const bool coherent : {false, true}) {
-            const auto one = compile(1u, barrier, coherent);
+            const auto two = compile(2u, barrier, coherent);
             const auto five = compile(5u, barrier, coherent);
             std::map<std::uint32_t, std::string> names;
             std::map<std::string, std::uint32_t> definitions;
             const auto suffix = std::string(barrier ? "" : "_stop") + (coherent ? "_coherent" : "");
             const auto reader = "read_bda_dword_bytes" + suffix;
             const auto probed = "read_bda_dword" + suffix;
+            const auto trying = "read_bda_dword_shared" + suffix;
+            std::size_t tryingReads = 0;
+            std::size_t directLoads = 0;
             std::size_t mainReads = 0;
             std::array<std::size_t, 2> probedLoads{};
             std::string function;
@@ -1667,6 +1673,8 @@ void verifyBdaReadFallbackFunctions() {
                 if (op == spv::OpAtomicCompareExchange) ++compareExchanges;
                 if (op == spv::OpFunctionCall && function == "main" && names[five[cursor + 3]] == "get_bda_pointer") ++mainLookups;
                 if (op == spv::OpFunctionCall && function == "main" && names[five[cursor + 3]] == probed) ++mainReads;
+                if (op == spv::OpFunctionCall && function == "main" && names[five[cursor + 3]] == trying) ++tryingReads;
+                if (op == spv::OpLoad && length > 4u && function == "main" && ((five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u) == coherent) ++directLoads;
                 if (op == spv::OpLoad && length > 4u && function == reader) ++readerLoads[(five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
                 if (op == spv::OpLoad && length > 4u && function == probed) ++probedLoads[(five[cursor + 4] & spv::MemoryAccessVolatileMask) != 0u];
                 cursor += length;
@@ -1675,9 +1683,10 @@ void verifyBdaReadFallbackFunctions() {
             for (const auto& [name, count] : definitions) require(count == 1u, "BDA read functions: a function is defined twice");
             require(compareExchanges == 1u, "BDA read functions: a fault is recorded outside record_bda_fault");
             require(mainLookups == 0u, "BDA read functions: a read site looks up its bytes inline");
-            require(mainReads == 5u, "BDA read functions: a read site does not call the dword read function once");
+            require(mainReads + tryingReads == 5u && tryingReads == (sharing ? 1u : 0u), "BDA read functions: a read site does not call the dword read function once, or more than the first one tries the shared base's hull");
             require(readerLoads[coherent] == 1u && readerLoads[!coherent] == 0u && probedLoads[coherent] == 2u && probedLoads[!coherent] == 0u, "BDA read functions: the dword and byte loads do not keep the access's coherence");
-            require(five.size() - one.size() < 4u * 300u, "BDA read functions: a read site takes 300 SPIR-V words or more");
+            require(directLoads == (sharing ? 5u : 0u), "BDA read functions: a read site of a shared base does not load its dword once at the base's device address");
+            require(five.size() - two.size() < 3u * 300u, "BDA read functions: a read site takes 300 SPIR-V words or more");
         }
     }
 }
@@ -1789,7 +1798,10 @@ void verifyBdaInlinedSize() {
     // not the count. 200 such reads took 4.0 s and 0.53 GiB without the cache (310,034 here; 23 s and
     // 1.03 GiB, 315,987, ending at each read) and 4.6 s and 0.55 GiB with one kept range (357,039;
     // 25 s and 1.23 GiB, 362,992), on Mesa 26.1.6.
-    const std::uint64_t limit = 320000u + (entries != 0u ? 25000u + entries * 22000u : 0u) + (checked ? 20000u : 0u);
+    // Reads that share a base address (all of them here, on four bases; APS5_NO_BDA_SHARED_BASE=1 has
+    // none) each add the test of the base's translation and the load at it, 12 instructions, and the
+    // first read of each base inlines the larger lookup that tries the base's hull: 322,223.
+    const std::uint64_t limit = 320000u + (std::getenv("APS5_NO_BDA_SHARED_BASE") == nullptr ? 13000u : 0u) + (entries != 0u ? 25000u + entries * 22000u : 0u) + (checked ? 20000u : 0u);
     require(total <= limit, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than " + std::to_string(limit)).c_str());
 }
 

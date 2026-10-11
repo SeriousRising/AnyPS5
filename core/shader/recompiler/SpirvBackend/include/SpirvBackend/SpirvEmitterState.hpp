@@ -75,6 +75,25 @@ struct MemoryResourceAccess {
 // compile a program whose lookups keep ranges (see the range cache's technical debt entry).
 inline constexpr std::uint32_t BdaRangeCacheDefaultEntries = 0;
 
+// A set of address-based dword reads whose addresses differ only by their immediates (see
+// FindBdaSharedBases). `variable` is a Private u64: 0 until a member tries to translate the hull, the
+// `bytes` bytes from the base address plus `first`; then the hull's device address, or 1 when the
+// hull does not lie in one readable range at a 4-aligned device address.
+struct BdaSharedBase {
+    std::uint32_t variable = 0;
+    std::int64_t first = 0;
+    std::uint32_t bytes = 0;
+};
+
+// A member of bdaSharedBases[base]: its first extracted dword lies `begin` bytes from the base address.
+// The members that try the hull are the first of their base in each block for each activity
+// condition: every helper call is inlined, and the call that tries a hull is the larger one.
+struct BdaSharedRead {
+    std::uint32_t base = 0;
+    std::int64_t begin = 0;
+    bool tries = false;
+};
+
 struct SpirvEmitterState {
     const ImageResource* runtimeImage = nullptr;
     std::uint32_t runtimeImageMetadata = 0u;
@@ -130,6 +149,17 @@ struct SpirvEmitterState {
     std::uint32_t bdaFaultFunction = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaProbedDwordReadFunctions {};
+    // Set when reads share translations (FindBdaSharedBases, off with APS5_NO_BDA_SHARED_BASE=1):
+    // lookup_bda_span and the two functions below, which try a hull before the read's own bytes,
+    // are then defined.
+    bool bdaSharedBase = false;
+    std::uint32_t bdaSpanLookupFunction = 0;
+    std::vector<BdaSharedBase> bdaSharedBases;
+    std::unordered_map<const IrValue*, BdaSharedRead> bdaSharedReads;
+    // The bases to forget where a block starts: those whose address is computed from a value the block defines.
+    std::unordered_map<const IrBlock*, std::vector<std::uint32_t>> bdaSharedBaseResets;
+    std::array<std::array<std::uint32_t, 2>, 2> bdaSharedDwordReadFunctions {};
+    std::uint32_t bdaSharedProbeFunction = 0;
     std::uint32_t bdaStopValue = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
