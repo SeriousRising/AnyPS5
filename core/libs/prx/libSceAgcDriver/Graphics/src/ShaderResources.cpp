@@ -111,6 +111,12 @@ struct TextureCache {
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
     std::uint64_t bytes = 0;
+    // The snapshots the entries keep in host memory to compare guest memory against: no device
+    // figure counts them, so the budget covers them with `bytes`.
+    std::uint64_t hostBytes = 0;
+    std::uint64_t snapshotsMade = 0;
+    std::uint64_t snapshotBytesMade = 0;
+    std::chrono::steady_clock::time_point hostReported{};
     VkPhysicalDevice budgetDevice = VK_NULL_HANDLE;
     std::chrono::steady_clock::time_point budgetRead{};
     std::uint64_t budget = 0;
@@ -159,6 +165,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
+    cache.hostBytes -= it->bytes.size();
     if (it->source != nullptr) {
         for (auto [view, last] = cache.views.equal_range(it->source.get()); view != last; ++view) {
             if (view->second == it) {
@@ -545,11 +552,22 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     const auto budget = sampledBudget(context, cache);
-    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) eraseTexture(cache, std::prev(cache.entries.end()));
+    while (!cache.entries.empty() && cache.bytes + cache.hostBytes + entry.accounted + entry.bytes.size() > budget) eraseTexture(cache, std::prev(cache.entries.end()));
     cache.bytes += entry.accounted;
+    cache.hostBytes += entry.bytes.size();
+    if (!entry.bytes.empty()) {
+        ++cache.snapshotsMade;
+        cache.snapshotBytesMade += entry.bytes.size();
+    }
     auto texture = entry.texture;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));
+    if (const auto now = std::chrono::steady_clock::now(); now - cache.hostReported >= std::chrono::seconds(30)) {
+        cache.hostReported = now;
+        const auto mapped = MappedBufferUsage();
+        std::fprintf(stderr, "[gpu] sampled texture cache host memory: %zu entries keep %llu MiB of snapshots beside %llu MiB of device memory (budget %llu MiB for both); %llu snapshots of %llu MiB made so far; %llu mapped buffers of %llu MiB are live\n", cache.entries.size(), static_cast<unsigned long long>(cache.hostBytes >> 20u), static_cast<unsigned long long>(cache.bytes >> 20u), static_cast<unsigned long long>(budget >> 20u),
+                     static_cast<unsigned long long>(cache.snapshotsMade), static_cast<unsigned long long>(cache.snapshotBytesMade >> 20u), static_cast<unsigned long long>(mapped.count), static_cast<unsigned long long>(mapped.bytes >> 20u));
+    }
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
     reportTextureCounters();
@@ -765,6 +783,7 @@ TextureCacheUse TextureCacheUsage() {
         dropUncachedViews(sampled);
         use.sampledEntries = sampled.entries.size();
         use.sampledBytes = sampled.bytes;
+        use.sampledHostBytes = sampled.hostBytes;
     }
     use.storageBytes = storageCacheBytes();
     return use;
