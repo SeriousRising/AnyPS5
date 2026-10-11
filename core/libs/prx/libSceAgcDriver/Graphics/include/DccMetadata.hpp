@@ -38,6 +38,10 @@ DccKeys ReadDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 bool IsDccClear(DccKeys keys);
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount);
+// CurrentDccKeys for a caller that acts on the answer alone and reads the keys' bytes no more: keys
+// that recorded fills of one known byte will leave uniform are answered without waiting for them
+// (the bytes still hold what the fills overwrite, which ReadDccKeys would read).
+DccKeys CurrentOrFilledKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 // Stores "uncompressed" keys over the surface's metadata on the CPU (a guest memory write: it waits
 // for recorded GPU work that writes the keys first).
 void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
