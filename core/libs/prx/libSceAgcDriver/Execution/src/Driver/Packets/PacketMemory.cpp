@@ -18,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace AgcDriver::DriverDetail {
@@ -37,7 +38,7 @@ struct DmaTimes {
     int reason = -1;
 };
 
-constexpr std::array<const char*, 6> DmaOutcomeNames{"gpu", "completion", "cpu", "gpu copy", "empty", "drained"};
+constexpr std::array<const char*, 7> DmaOutcomeNames{"gpu", "completion", "cpu", "gpu copy", "empty", "drained", "settled copy"};
 
 std::chrono::steady_clock::time_point dmaClock(bool timed) {
     return timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -52,7 +53,7 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
         std::uint64_t packets = 0;
         std::uint64_t bytes = 0;
         double ms = 0, resolveMs = 0, flushMs = 0, storeMs = 0;
-        std::array<std::uint64_t, 6> outcomes{};
+        std::array<std::uint64_t, 7> outcomes{};
         std::array<std::uint64_t, 4> sizes{};
         std::array<std::uint64_t, 3> sources{};
     };
@@ -121,8 +122,8 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
         for (std::size_t i = 0; i < forms.size(); ++i) {
             const auto& each = forms[i];
             if (each.packets == 0) continue;
-            std::snprintf(text, sizeof(text), " %s x%llu %.1f MiB %.0f ms (resolve %.0f, flush %.0f, store %.0f; gpu %llu, completion %llu, cpu %llu, gpu copy %llu, empty %llu, drained %llu);", formNames[i], static_cast<unsigned long long>(each.packets), static_cast<double>(each.bytes) / 1048576.0, each.ms, each.resolveMs, each.flushMs, each.storeMs,
-                          static_cast<unsigned long long>(each.outcomes[0]), static_cast<unsigned long long>(each.outcomes[1]), static_cast<unsigned long long>(each.outcomes[2]), static_cast<unsigned long long>(each.outcomes[3]), static_cast<unsigned long long>(each.outcomes[4]), static_cast<unsigned long long>(each.outcomes[5]));
+            std::snprintf(text, sizeof(text), " %s x%llu %.1f MiB %.0f ms (resolve %.0f, flush %.0f, store %.0f; gpu %llu, completion %llu, cpu %llu, gpu copy %llu, settled copy %llu, empty %llu, drained %llu);", formNames[i], static_cast<unsigned long long>(each.packets), static_cast<double>(each.bytes) / 1048576.0, each.ms, each.resolveMs, each.flushMs, each.storeMs,
+                          static_cast<unsigned long long>(each.outcomes[0]), static_cast<unsigned long long>(each.outcomes[1]), static_cast<unsigned long long>(each.outcomes[2]), static_cast<unsigned long long>(each.outcomes[3]), static_cast<unsigned long long>(each.outcomes[6]), static_cast<unsigned long long>(each.outcomes[4]), static_cast<unsigned long long>(each.outcomes[5]));
             line += text;
             if (i >= 4) {
                 std::snprintf(text, sizeof(text), " (bytes <=4 %llu, <=8 %llu, <=64 %llu, more %llu; source fill %llu, memory %llu, GDS %llu);", static_cast<unsigned long long>(each.sizes[0]), static_cast<unsigned long long>(each.sizes[1]), static_cast<unsigned long long>(each.sizes[2]), static_cast<unsigned long long>(each.sizes[3]),
@@ -241,8 +242,30 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
+        // A copy out of the GDS is recorded as a copy in queue order (or made at once when its
+        // source and destination are settled) instead of reading the GDS here, which waits for
+        // the recorded work that writes it. A refused copy takes the store path below.
+        const auto gdsCopy = opcode == 0x50 ? Pm4::DecodeGdsSourceCopy(packet) : std::nullopt;
+        if (gdsCopy.has_value() && gdsCopy->bytes <= gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(gdsCopy->destination), gdsCopy->bytes, true)) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) {
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                const auto storeStart = dmaClock(dmaTimed);
+                const auto outcome = localDevice->CopyBuffer(gdsCopy->destination, gdsCopy->source, gdsCopy->bytes, gdsCopy->bytes, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                if (outcome.path == 0 || outcome.path == 1 || outcome.path == 3) {
+                    if (outcome.path == 0) noteForeignWriter(gdsCopy->destination, gdsCopy->destination + gdsCopy->bytes, submission.queue);
+                    dmaTimes.storeMs = dmaSince(dmaTimed, storeStart) - outcome.syncMs;
+                    dmaTimes.flushMs = outcome.syncMs;
+                    dmaTimes.reason = outcome.reason;
+                    dmaTimes.outcome = outcome.path == 0 ? 6u : 3u;
+                    wroteOnGpu = true;
+                    drained = false;
+                }
+            }
+        }
         const auto resolveStart = dmaClock(dmaTimed);
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        if (const auto store = drained ? Pm4::ResolveStore(packet, queue, gpuStoreLimit) : std::optional<Pm4::StoreWrite>{}) {
             dmaTimes.resolveMs = dmaSince(dmaTimed, resolveStart);
             const auto bytes = store->Bytes();
             if (bytes.empty()) {

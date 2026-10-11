@@ -436,6 +436,12 @@ void testCopies() {
     execute(state, makePacket(0x50, {0x20000000 | cachePolicies, 0xfff8, 0, low(destination.data()), high(destination.data()), 8}));
     check(destination[0] == 12 && destination[1] == 13 && destination[2] == 0, "DMA_DATA GDS to GDS round trip failed");
     const auto fromGds = makePacket(0x50, {0x20000000, 0x100, 0, low(destination.data()), high(destination.data()), 16});
+    const auto gdsCopy = AgcDriver::Pm4::DecodeGdsSourceCopy(fromGds);
+    check(gdsCopy.has_value() && gdsCopy->source == AgcDriver::Pm4::GdsAddress() + 0x100 && gdsCopy->destination == reinterpret_cast<std::uintptr_t>(destination.data()) && gdsCopy->bytes == 16, "a DMA_DATA out of the GDS did not decode as a copy from the GDS address");
+    const auto withinGds = AgcDriver::Pm4::DecodeGdsSourceCopy(makePacket(0x50, {0x20100000, 0x100, 0, 0x200, 0, 16}));
+    check(withinGds.has_value() && withinGds->destination == AgcDriver::Pm4::GdsAddress() + 0x200, "a DMA_DATA within the GDS did not decode as a copy between GDS addresses");
+    check(!AgcDriver::Pm4::DecodeGdsSourceCopy(makePacket(0x50, {0x20100000, 0x100, 0, 0x108, 0, 16})).has_value() && !AgcDriver::Pm4::DecodeGdsSourceCopy(makePacket(0x50, {0x20000000, 0x100, 0, low(destination.data()), high(destination.data()), 0})).has_value(), "an overlapping or empty DMA_DATA out of the GDS decoded as a copy");
+    check(!AgcDriver::Pm4::DecodeGdsSourceCopy(toGds).has_value() && !AgcDriver::Pm4::DecodeGdsSourceCopy(makePacket(0x50, {0x40000000, 0x44332211, 0, low(destination.data()), high(destination.data()), 16})).has_value(), "a DMA_DATA from memory or an immediate decoded as a copy out of the GDS");
     const auto store = AgcDriver::Pm4::ResolveStore(fromGds, state, 64);
     check(store.has_value() && store->Bytes().size() == 16 && std::memcmp(store->Bytes().data(), source.data(), 16) == 0, "DMA_DATA from GDS did not resolve its source bytes");
     destination = {};
