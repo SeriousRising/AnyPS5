@@ -125,6 +125,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
 std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);
+// Whether a draw with this state leaves the depth and stencil planes as they are.
+bool WritesNoDepthOrStencil(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);

@@ -103,7 +103,7 @@ ShaderRecompiler::ShaderPixelStageInfo DefaultUnexportedInputs(ShaderRecompiler:
     return pixel;
 }
 
-ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram) {
+ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram, bool testsOnly) {
     const auto inControl = nullProgram ? 0u : read(context, spiPsInControl, RegisterBank::Context);
     const auto inputNum = inControl & 0x3Fu;
     if (inputNum > 32u) {
@@ -164,7 +164,9 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .pixelKillEnable = pixelKillEnable,
         .depthExportEnable = depthExportEnable,
         .sampleMaskExportEnable = sampleMaskExportEnable,
-        .earlyZ = zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable && !stencilRefExportEnable,
+        // EARLY_Z_THEN_LATE_Z tests before the shader and writes after it; Vulkan's early tests also write
+        // before it, so a shader that kills takes them only for a draw that writes neither depth nor stencil.
+        .earlyZ = zOrder == 1u && (!pixelKillEnable || testsOnly) && !depthExportEnable && !sampleMaskExportEnable && !stencilRefExportEnable,
         .executeOnNoop = ((shaderControl >> 10u) & 0x1u) != 0,
         .conservativeZExport = static_cast<ShaderRecompiler::ConservativeZExport>(conservativeZExport),
         .orderedPixelShader = ((shaderControl >> 16u) & 0x1u) != 0,

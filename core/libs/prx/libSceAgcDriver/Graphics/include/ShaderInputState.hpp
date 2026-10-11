@@ -10,7 +10,8 @@
 
 namespace AgcDriver::Graphics {
 
-ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram = false);
+// `testsOnly`: the draw writes neither depth nor stencil (WritesNoDepthOrStencil).
+ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& context, const std::array<std::uint8_t, 8>& exportMappings, bool nullProgram = false, bool testsOnly = false);
 ShaderRecompiler::ShaderPixelStageInfo DefaultUnexportedInputs(ShaderRecompiler::ShaderPixelStageInfo pixel, std::span<const std::uint32_t> parameterExports);
 ShaderRecompiler::ShaderComputeStageInfo DecodeComputeStageInfo(const Registers& shader, std::span<const std::byte> header);
 // A guest range DecodeVertexStageInfo read (an attribute word, a vertex V#) with the bytes as read:
