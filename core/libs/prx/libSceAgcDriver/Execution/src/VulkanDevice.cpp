@@ -2222,6 +2222,12 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const bool waitDestination = recorder.PendingWriteOverlaps(destination, bytes) && completionStoreOverlaps(destination);
     if (waitSource || waitDestination) {
         outcome.synced = true;
+        const auto cause = [&](std::uint64_t address) {
+            const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+            return (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), overlaps) ? 1 : 0) | (std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), overlaps) ? 2 : 0)
+                 | (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes) ? 4 : 0);
+        };
+        outcome.syncCause = (waitSource ? cause(source) : 0) | (waitDestination ? cause(destination) << 4 : 0);
         const auto syncStart = std::chrono::steady_clock::now();
         if (waitSource) {
             Graphics::Recorder::CountSync(4);

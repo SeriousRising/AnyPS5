@@ -36,6 +36,7 @@ struct DmaTimes {
     double storeMs = 0;
     std::size_t outcome = 5;
     int reason = -1;
+    int syncCause = 0;
 };
 
 constexpr std::array<const char*, 7> DmaOutcomeNames{"gpu", "completion", "cpu", "gpu copy", "empty", "drained", "settled copy"};
@@ -56,6 +57,8 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
         std::array<std::uint64_t, 7> outcomes{};
         std::array<std::uint64_t, 4> sizes{};
         std::array<std::uint64_t, 3> sources{};
+        std::uint64_t waits = 0;
+        std::array<std::uint64_t, 8> waitCauses{};
     };
     struct Slow {
         double ms = 0;
@@ -111,6 +114,8 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
         ++entry.outcomes[times.outcome];
         ++entry.sizes[bytes <= 4 ? 0u : bytes <= 8 ? 1u : bytes <= 64 ? 2u : 3u];
         ++entry.sources[fill ? 0u : source == 1 ? 2u : 1u];
+        if (times.syncCause != 0) ++entry.waits;
+        for (std::size_t bit = 0; bit < entry.waitCauses.size(); ++bit) entry.waitCauses[bit] += (times.syncCause >> bit) & 1;
         if (!slowText.empty()) {
             const auto least = std::min_element(slowest.begin(), slowest.end(), [](const Slow& left, const Slow& right) { return left.ms < right.ms; });
             if (totalMs > least->ms) *least = {totalMs, std::move(slowText)};
@@ -128,6 +133,11 @@ void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, doubl
             if (i >= 4) {
                 std::snprintf(text, sizeof(text), " (bytes <=4 %llu, <=8 %llu, <=64 %llu, more %llu; source fill %llu, memory %llu, GDS %llu);", static_cast<unsigned long long>(each.sizes[0]), static_cast<unsigned long long>(each.sizes[1]), static_cast<unsigned long long>(each.sizes[2]), static_cast<unsigned long long>(each.sizes[3]),
                               static_cast<unsigned long long>(each.sources[0]), static_cast<unsigned long long>(each.sources[1]), static_cast<unsigned long long>(each.sources[2]));
+                line += text;
+            }
+            if (each.waits != 0) {
+                std::snprintf(text, sizeof(text), " (%llu copies waited: source for a dispatch's copied buffer %llu, a draw's %llu, a completion label %llu; destination for %llu, %llu, %llu);", static_cast<unsigned long long>(each.waits), static_cast<unsigned long long>(each.waitCauses[0]), static_cast<unsigned long long>(each.waitCauses[1]), static_cast<unsigned long long>(each.waitCauses[2]),
+                              static_cast<unsigned long long>(each.waitCauses[4]), static_cast<unsigned long long>(each.waitCauses[5]), static_cast<unsigned long long>(each.waitCauses[6]));
                 line += text;
             }
         }
@@ -258,6 +268,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     dmaTimes.storeMs = dmaSince(dmaTimed, storeStart) - outcome.syncMs;
                     dmaTimes.flushMs = outcome.syncMs;
                     dmaTimes.reason = outcome.reason;
+                    dmaTimes.syncCause = outcome.syncCause;
                     dmaTimes.outcome = outcome.path == 0 ? 6u : 3u;
                     wroteOnGpu = true;
                     drained = false;

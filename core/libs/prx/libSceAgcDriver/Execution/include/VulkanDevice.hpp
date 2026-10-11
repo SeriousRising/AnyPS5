@@ -148,6 +148,9 @@ public:
         std::uint32_t readerQueue;
         int readerKind;
         bool readerOpen;
+        // Why the GPU path waited (`synced`): 1 a dispatch's copied buffer, 2 a draw's copied
+        // buffer, 4 a completion label, over the source; the same times 16 over the destination.
+        int syncCause = 0;
     };
     using CopyWriterNote = std::function<void(std::span<const std::byte> value, std::uint64_t generation)>;
     CopyOutcome CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter);
