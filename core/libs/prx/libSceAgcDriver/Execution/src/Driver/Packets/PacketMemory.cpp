@@ -4,20 +4,129 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// APS5_PROFILE_DRAW: what each DMA_DATA cost in preparePacketMemory and how it was served, as a
+// [dma] line every 10 s (the first packet reports at once): by form, the packets, their bytes and
+// time, the time's parts (reading the source, flushing pending image results over the destination
+// or syncing a copy, recording the store) and the outcomes; then the slowest packets of the window
+// with what their destination and source memory is to the storage images (ClassifyFill's cover).
+struct DmaTimes {
+    double resolveMs = 0;
+    double flushMs = 0;
+    double storeMs = 0;
+    std::size_t outcome = 5;
+    int reason = -1;
+};
+
+constexpr std::array<const char*, 6> DmaOutcomeNames{"gpu", "completion", "cpu", "gpu copy", "empty", "drained"};
+
+std::chrono::steady_clock::time_point dmaClock(bool timed) {
+    return timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
+
+double dmaSince(bool timed, std::chrono::steady_clock::time_point start) {
+    return timed ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() : 0.0;
+}
+
+void noteDma(std::span<const std::uint32_t> packet, const DmaTimes& times, double totalMs) {
+    struct Form {
+        std::uint64_t packets = 0;
+        std::uint64_t bytes = 0;
+        double ms = 0, resolveMs = 0, flushMs = 0, storeMs = 0;
+        std::array<std::uint64_t, 6> outcomes{};
+    };
+    struct Slow {
+        double ms = 0;
+        std::string text;
+    };
+    static constexpr std::array<const char*, 5> formNames{"fill <=64K", "fill >64K", "copy <=64K", "copy >64K", "GDS"};
+    static constexpr std::array<const char*, 8> coverNames{"none", "exact", "inside", "around", "straddle", "several", "keys", "layer"};
+    static std::mutex mutex;
+    static std::array<Form, 5> forms{};
+    static std::array<Slow, 6> slowest{};
+    static std::chrono::steady_clock::time_point lastReport{};
+    if (packet.size() < 7) return;
+    const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
+    const auto destination = ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);
+    const std::size_t bytes = packet[6] & 0x3ffffffu;
+    const bool gds = source == 1 || destination == 1;
+    const bool fill = source == 2;
+    const std::size_t form = gds ? 4u : (fill ? 0u : 2u) + (bytes > 65536 ? 1u : 0u);
+    const auto from = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const auto to = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+    std::string slowText;
+    if (totalMs >= 1.0 && !gds && bytes != 0) {
+        const auto cover = [](std::uint64_t address, std::size_t size) {
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            return coverNames[static_cast<std::size_t>(Graphics::StorageTexture::ClassifyFill(address, size).cover) % coverNames.size()];
+        };
+        char text[320];
+        if (fill) std::snprintf(text, sizeof(text), " [%.1f ms: fill 0x%zx bytes of %08x at 0x%llx (images: %s), resolve %.1f flush %.1f store %.1f, %s reason %d]", totalMs, bytes, packet[2], static_cast<unsigned long long>(to), cover(to, bytes), times.resolveMs, times.flushMs, times.storeMs, DmaOutcomeNames[times.outcome], times.reason);
+        else std::snprintf(text, sizeof(text), " [%.1f ms: copy 0x%zx bytes 0x%llx (images: %s) -> 0x%llx (images: %s), resolve %.1f flush %.1f store %.1f, %s reason %d]", totalMs, bytes, static_cast<unsigned long long>(from), cover(from, bytes), static_cast<unsigned long long>(to), cover(to, bytes), times.resolveMs, times.flushMs, times.storeMs, DmaOutcomeNames[times.outcome], times.reason);
+        slowText = text;
+    }
+    std::string line;
+    {
+        std::lock_guard lock(mutex);
+        auto& entry = forms[form];
+        ++entry.packets;
+        entry.bytes += bytes;
+        entry.ms += totalMs;
+        entry.resolveMs += times.resolveMs;
+        entry.flushMs += times.flushMs;
+        entry.storeMs += times.storeMs;
+        ++entry.outcomes[times.outcome];
+        if (!slowText.empty()) {
+            const auto least = std::min_element(slowest.begin(), slowest.end(), [](const Slow& left, const Slow& right) { return left.ms < right.ms; });
+            if (totalMs > least->ms) *least = {totalMs, std::move(slowText)};
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport < std::chrono::seconds(10)) return;
+        lastReport = now;
+        char text[320];
+        for (std::size_t i = 0; i < forms.size(); ++i) {
+            const auto& each = forms[i];
+            if (each.packets == 0) continue;
+            std::snprintf(text, sizeof(text), " %s x%llu %.1f MiB %.0f ms (resolve %.0f, flush %.0f, store %.0f; gpu %llu, completion %llu, cpu %llu, gpu copy %llu, empty %llu, drained %llu);", formNames[i], static_cast<unsigned long long>(each.packets), static_cast<double>(each.bytes) / 1048576.0, each.ms, each.resolveMs, each.flushMs, each.storeMs,
+                          static_cast<unsigned long long>(each.outcomes[0]), static_cast<unsigned long long>(each.outcomes[1]), static_cast<unsigned long long>(each.outcomes[2]), static_cast<unsigned long long>(each.outcomes[3]), static_cast<unsigned long long>(each.outcomes[4]), static_cast<unsigned long long>(each.outcomes[5]));
+            line += text;
+        }
+        line += " slowest:";
+        std::sort(slowest.begin(), slowest.end(), [](const Slow& left, const Slow& right) { return left.ms > right.ms; });
+        for (const auto& slow : slowest) line += slow.text;
+        forms = {};
+        slowest = {};
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[dma] DMA_DATA in the last window:%s\n", line.c_str());
+}
+
+}
 
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool dmaTimed = profile && opcode == 0x50;
+    const auto dmaStart = dmaClock(dmaTimed);
+    DmaTimes dmaTimes;
     wroteOnGpu = false;
 
     bool orderedAlready = false;
@@ -112,23 +221,32 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
+        const auto resolveStart = dmaClock(dmaTimed);
         if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+            dmaTimes.resolveMs = dmaSince(dmaTimed, resolveStart);
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
                 orderedAlready = true;
                 drained = false;
+                dmaTimes.outcome = 4;
             } else {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
 
+                const auto flushStart = dmaClock(dmaTimed);
                 Graphics::StorageTexture::FlushPending(store->address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+                dmaTimes.flushMs = dmaSince(dmaTimed, flushStart);
 
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
+                const auto storeStart = dmaClock(dmaTimed);
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
+                dmaTimes.storeMs = dmaSince(dmaTimed, storeStart);
+                dmaTimes.reason = reason;
+                dmaTimes.outcome = reason == 0 ? 0u : reason == 5 ? 1u : reason == 1 ? 2u : 5u;
                 if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
@@ -151,8 +269,13 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 if (const auto localDevice = device.Load()) {
                     recordDeferredLabels(localDevice.get(), submission.queue);
+                    const auto storeStart = dmaClock(dmaTimed);
                     const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                    dmaTimes.storeMs = dmaSince(dmaTimed, storeStart) - outcome.syncMs;
+                    dmaTimes.flushMs = outcome.syncMs;
+                    dmaTimes.reason = outcome.path;
                     if (outcome.path == 1 || outcome.path == 3) {
+                        dmaTimes.outcome = 3;
                         wroteOnGpu = true;
                         drained = false;
                     } else if (outcome.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
@@ -227,6 +350,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             draining.reset();
         }
     }
+    if (dmaTimed) noteDma(packet, dmaTimes, dmaSince(true, dmaStart));
     return drains;
 }
 

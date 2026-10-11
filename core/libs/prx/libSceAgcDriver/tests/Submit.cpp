@@ -185,6 +185,27 @@ void testSubmissions() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void testDmaData() {
+    alignas(16) static std::array<std::uint32_t, 0x10000> source{};
+    alignas(16) static std::array<std::uint32_t, 0x10000> destination{};
+    const auto low = [](const void* address) { return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(address)); };
+    const auto high = [](const void* address) { return static_cast<std::uint32_t>(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(address)) >> 32u); };
+    const auto submit = [](std::array<std::uint32_t, 7> words) {
+        Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+        check(sceAgcDriverSubmitDcb(&packet) == 0, "DMA_DATA submit failed");
+        AgcDriverWaitIdle_nid_postfix();
+    };
+    for (const std::uint32_t bytes : {0x1000u, 0x20000u}) {
+        const std::size_t words = bytes / 4u;
+        destination.fill(0xdeadbeefu);
+        submit({0xc0055000u, 0x40000000u, 0x44332211u, 0u, low(destination.data()), high(destination.data()), bytes});
+        check(std::all_of(destination.begin(), destination.begin() + words, [](std::uint32_t word) { return word == 0x44332211u; }) && destination[words] == 0xdeadbeefu, "a DMA_DATA fill stored other bytes than its immediate over its range");
+        for (std::size_t i = 0; i < source.size(); ++i) source[i] = static_cast<std::uint32_t>(i * 2654435761u + bytes);
+        submit({0xc0055000u, 0x60000000u, low(source.data()), high(source.data()), low(destination.data()), high(destination.data()), bytes});
+        check(std::equal(source.begin(), source.begin() + words, destination.begin()) && destination[words] == 0xdeadbeefu, "a DMA_DATA copy stored other bytes than its source over its range");
+    }
+}
+
 void testEndOfPipeInterrupts() {
     KernelEqueue eq = 0;
     check(sceKernelCreateEqueue(&eq, "AGC test") == 0, "event queue creation failed");
@@ -769,6 +790,7 @@ int main(int argc, char** argv) {
         testValidation();
         testClearState();
         testSubmissions();
+        testDmaData();
         testEndOfPipeInterrupts();
         testLabelStoredSinceSubmission();
         testEndOfPipeLabelsWithoutWork();
