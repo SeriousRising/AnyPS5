@@ -89,6 +89,13 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
+// Refreshes that compared the surface with `original` after a stamp, those the compare rescued
+// from an upload, and of the rescued those whose `original` an upload under clear keys read.
+std::atomic<std::uint64_t> snapshotCompares{0}, snapshotRescues{0}, clearSnapshotRescues{0};
+// Images a refresh stored to guest memory because pendingAlias could not hand their results over
+// on the device, by the first difference (StorageTexture::handOverRefusal).
+constexpr std::array<const char*, 12> HandOverRefusalNames{"base", "size", "units", "extent", "layers", "mips", "tile mode", "dimension", "element size", "not cached", "holder keys", "none"};
+std::array<std::atomic<std::uint64_t>, HandOverRefusalNames.size()> handOverRefusals{};
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -129,6 +136,11 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
+    std::string refusals;
+    for (std::size_t i = 0; i < handOverRefusals.size(); ++i) {
+        if (const auto count = take(handOverRefusals[i]); count != 0) refusals += std::string(" ") + HandOverRefusalNames[i] + " " + std::to_string(count);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s\n", take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str());
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -1662,9 +1674,14 @@ bool StorageTexture::Refresh() {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
         }
-        if (!unchanged && !keysChanged && !pendingChanged && originalValid && equalsOriginal()) {
-            unchanged = true;
-            stamped = false;
+        if (!unchanged && !keysChanged && !pendingChanged && originalValid) {
+            snapshotCompares.fetch_add(1, std::memory_order_relaxed);
+            if (equalsOriginal()) {
+                unchanged = true;
+                stamped = false;
+                snapshotRescues.fetch_add(1, std::memory_order_relaxed);
+                if (snapshotSource != 0) clearSnapshotRescues.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
@@ -1891,6 +1908,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
+    snapshotSource = 0;
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
@@ -1947,6 +1965,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     original.resize(static_cast<std::size_t>(guestBytes));
+    snapshotSource = 0;
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -1979,7 +1998,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // the stamped units with the copy (WatchedImportsStampPages).
         static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && !WatchedImportsStampPages(context)) originalValid = false;
-        else captureGuestBytes(nullptr);
+        else {
+            captureGuestBytes(nullptr);
+            snapshotSource = 1;
+        }
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
@@ -2923,6 +2945,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     flushedAfterSkip.fetch_add(1, std::memory_order_relaxed);
                     if (PublishReasonFor(reason) == PublishReason::Hook && texture->hookSkipSite.load(std::memory_order_relaxed) == static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())) flushedAfterSkipSameSite.fetch_add(1, std::memory_order_relaxed);
                 }
+                if (exempt != nullptr && LookupOutcomes::Profiled()) handOverRefusals[exempt->handOverRefusal(*texture)].fetch_add(1, std::memory_order_relaxed);
                 if (auto alive = texture->weak_from_this().lock()) flush.push_back(std::move(alive));
                 it = pending.textures.erase(it);
             } else {
@@ -3854,6 +3877,23 @@ void StorageTexture::blockGenerations(std::vector<std::uint64_t>& generations) c
         const auto end = layerBegin(layer) + layerBytes(layer);
         for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) generations[static_cast<std::size_t>((at - spanBegin) / block)] = layerGeneration[layer];
     }
+}
+
+std::size_t StorageTexture::handOverRefusal(const StorageTexture& holder) const {
+    const auto& mine = descriptor;
+    const auto& theirs = holder.descriptor;
+    if (theirs.baseAddress != mine.baseAddress) return 0;
+    if (holder.guestBytes != guestBytes) return 1;
+    if (!blockUnits || !holder.blockUnits || trackedLayers != holder.trackedLayers) return 2;
+    if (mine.width != theirs.width || mine.height != theirs.height) return 3;
+    if (mine.depthOrLastArray != theirs.depthOrLastArray || mine.baseArray != theirs.baseArray || geometry.imageLayers != holder.geometry.imageLayers || geometry.imageDepth != holder.geometry.imageDepth) return 4;
+    if (mine.mipCount != theirs.mipCount) return 5;
+    if (mine.tileMode != theirs.tileMode) return 6;
+    if (mine.dimension != theirs.dimension) return 7;
+    if (BytesPerElement(mine.format) != BytesPerElement(theirs.format)) return 8;
+    if (!holder.Cached()) return 9;
+    if (holder.uploadedKeys != DccKeys::Uncompressed) return 10;
+    return 11;
 }
 
 std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {

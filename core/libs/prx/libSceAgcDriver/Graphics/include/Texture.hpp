@@ -434,6 +434,9 @@ private:
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
+    // Why pendingAlias would not hand `holder`'s results to this image on the device: the index
+    // of the first difference, for the [storage] line.
+    std::size_t handOverRefusal(const StorageTexture& holder) const;
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
     // a pending unit inside the range), kept alive across the caller's use.
     static std::vector<std::shared_ptr<StorageTexture>> overlappingPending(std::uint64_t address, std::size_t bytes);
@@ -541,6 +544,8 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
+    // Where `original` came from, for the [storage] line: 0 other, 1 an upload under clear keys.
+    std::uint8_t snapshotSource = 0;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
