@@ -244,6 +244,13 @@ void stateTests() {
     queue.context[0x1b4] = 2;
     (void)AgcDriver::Graphics::DecodeState(queue);
     Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a depth write without the depth test was rejected");
+    queue.context[0x200] = 0x007007b8;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(!state.depth.has_value() && !state.depthBoundsTest && AgcDriver::Graphics::DrawRejection(queue, false).empty(), "depth bounds without a depth surface were not ignored");
+    queue.context[0x010] = 0x80000180;
+    queue.context[0x011] = 0x20000180;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(!state.depth.has_value() && !state.depthBoundsTest && AgcDriver::Graphics::DrawRejection(queue, false).empty(), "depth bounds on absent depth planes were not ignored");
     queue = makeState();
     queue.context[0x200] = 0x007007b6;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth");
