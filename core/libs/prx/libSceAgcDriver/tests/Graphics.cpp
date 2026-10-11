@@ -2219,6 +2219,41 @@ std::set<std::uint32_t> depthModes(const ShaderRecompiler::RecompileRequest& req
     return modes;
 }
 
+// Z_ORDER EARLY_Z_THEN_LATE_Z (0x10) with KILL_ENABLE (0x40): early tests only for a draw that writes
+// neither depth nor stencil; Z export (0x1) and mask export (0x100) never take them.
+void earlyTestsWithKillTests() {
+    const auto early = [](std::uint32_t shaderControl, bool testsOnly) {
+        const auto queue = depthExportQueue(shaderControl);
+        auto request = depthExportRequest(shaderControl & ~1u);
+        const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports, false, testsOnly);
+        request.context.pixel = pixel;
+        if ((shaderControl & 1u) != 0) return pixel.earlyZ;
+        const auto words = ShaderRecompiler::Recompile(request).spirv.Words();
+        bool declared = false;
+        for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) declared = declared || (static_cast<spv::Op>(words[at] & 0xffffu) == spv::OpExecutionMode && words[at + 2] == spv::ExecutionModeEarlyFragmentTests);
+        Require(declared == pixel.earlyZ, "the EarlyFragmentTests mode does not follow the decoded early Z of DB_SHADER_CONTROL " + std::to_string(shaderControl));
+        return declared;
+    };
+    Require(early(0x10u, false) && early(0x10u, true), "EARLY_Z_THEN_LATE_Z without kill lost its early tests");
+    Require(!early(0x50u, false), "a killing shader tests early on a draw that writes depth or stencil");
+    Require(early(0x50u, true), "a killing shader does not test early on a draw that writes neither depth nor stencil");
+    Require(!early(0x40u, true) && !early(0x51u, true) && !early(0x150u, true), "LATE_Z, Z export or mask export took early tests");
+    AgcDriver::Graphics::State state{};
+    Require(AgcDriver::Graphics::WritesNoDepthOrStencil(state), "a state without a depth target writes depth or stencil");
+    state.depth.emplace();
+    state.depthTest = true;
+    Require(AgcDriver::Graphics::WritesNoDepthOrStencil(state), "a depth test without a write counts as a write");
+    state.stencilTest = true;
+    state.stencilFront.writeMask = state.stencilBack.writeMask = 0xffu;
+    Require(AgcDriver::Graphics::WritesNoDepthOrStencil(state), "a stencil test that keeps every value counts as a write");
+    state.stencilBack.passOp = VK_STENCIL_OP_REPLACE;
+    Require(!AgcDriver::Graphics::WritesNoDepthOrStencil(state), "a replacing stencil face counts as no write");
+    state.stencilBack.writeMask = 0;
+    Require(AgcDriver::Graphics::WritesNoDepthOrStencil(state), "a stencil face with write mask 0 counts as a write");
+    state.depthWrite = true;
+    Require(!AgcDriver::Graphics::WritesNoDepthOrStencil(state), "a depth write counts as no write");
+}
+
 void conservativeZExportTests() {
     const std::array<std::pair<std::uint32_t, std::set<std::uint32_t>>, 4> cases{{
         {0x0021u, {spv::ExecutionModeDepthReplacing}},
@@ -2935,6 +2970,7 @@ int main() {
         ZExportTests();
         DepthBoundsBiasTests();
         conservativeZExportTests();
+        earlyTestsWithKillTests();
         orderedPixelShaderTests();
         faultStopFormTests();
         faultLoadGuardTests();
