@@ -164,7 +164,9 @@ static std::uint32_t DefineBdaDwordRead(SpirvEmitterState& state, const std::str
     const auto bytes = Select(state, u32, reading, constant(1u), constant(4u));
     const auto looked = BdaLookup(state, guest, bytes, BdaAbi::Read);
     const auto overflow = binary(spv::OpUGreaterThan, boolean, address, BdaConstant(state, std::numeric_limits<std::uint64_t>::max() - 4u));
-    const auto reason = Select(state, u32, reading, looked.reason, Select(state, u32, both(checking, overflow), constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Overflow)), constant(0u)));
+    // A cache check failure is recorded at whichever step meets it, the probe included.
+    const auto reported = state.bdaRangeCacheCheck ? binary(spv::OpLogicalOr, boolean, reading, binary(spv::OpIEqual, boolean, looked.reason, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::RangeCacheMismatch)))) : reading;
+    const auto reason = Select(state, u32, reported, looked.reason, Select(state, u32, both(checking, overflow), constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Overflow)), constant(0u)));
     const auto failed = binary(spv::OpINotEqual, boolean, reason, constant(0u));
     EmitIfCondition(state, failed, [&] {
         state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, reason, guest, bytes, instruction);

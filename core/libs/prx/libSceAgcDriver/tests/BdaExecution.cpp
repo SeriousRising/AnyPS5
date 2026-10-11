@@ -89,9 +89,9 @@ private:
 
 }
 
-// Each sequence runs with the range cache keeping one, two and four ranges and without it
-// (APS5_BDA_RANGE_CACHE_ENTRIES and APS5_NO_BDA_RANGE_CACHE=1 in the recompiler), with and without
-// stopping invocations: the output words, the whole fault buffer
+// Each sequence runs with the range cache keeping one, two and four ranges, each also with the cache
+// check, and without the cache (APS5_BDA_RANGE_CACHE_ENTRIES, APS5_BDA_RANGE_CACHE_CHECK=1 and
+// APS5_NO_BDA_RANGE_CACHE=1 in the recompiler), with and without stopping invocations: the output words, the whole fault buffer
 // (fault record and noted pages) and the data must be equal, and the cached runs must give the
 // stated values and fault.
 static void RunBdaRangeCacheTests(const Context& context) {
@@ -135,11 +135,11 @@ static void RunBdaRangeCacheTests(const Context& context) {
         Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         Buffer output(context, steps.size() * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         for (const bool stops : {true, false}) {
-            const auto run = [&](std::uint32_t rangeCacheEntries) {
+            const auto run = [&](std::uint32_t rangeCacheEntries, bool rangeCacheCheck = false) {
                 fill();
                 std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
                 for (std::size_t word = 0; word < steps.size(); ++word) std::memcpy(output.Bytes().data() + word * 4u, &Sentinel, 4u);
-                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCacheEntries, stops), {&table, &fault, &output});
+                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCacheEntries, stops, rangeCacheCheck), {&table, &fault, &output});
                 pipeline.Run(1);
                 Outcome outcome{std::vector<std::uint32_t>(steps.size()), {fault.Bytes().begin(), fault.Bytes().end()}, {writable.Bytes().begin(), writable.Bytes().end()}};
                 std::memcpy(outcome.values.data(), output.Bytes().data(), steps.size() * 4u);
@@ -148,7 +148,9 @@ static void RunBdaRangeCacheTests(const Context& context) {
             };
             const auto cached = run(1);
             const auto searched = run(0);
-            for (const auto entries : {1u, 2u, 4u}) Require((entries == 1u ? cached : run(entries)) == searched, "BDA range cache: " + name + (stops ? " (stopping)" : " (continuing)") + " with " + std::to_string(entries) + " kept ranges differs from the searched lookup");
+            for (const auto entries : {1u, 2u, 4u}) {
+                for (const bool checked : {false, true}) Require((entries == 1u && !checked ? cached : run(entries, checked)) == searched, "BDA range cache: " + name + (stops ? " (stopping)" : " (continuing)") + " with " + std::to_string(entries) + " kept ranges" + (checked ? " and the check" : "") + " differs from the searched lookup");
+            }
             if (expected == nullptr) continue;
             Abi::Fault report{};
             std::memcpy(&report, cached.fault.data(), sizeof(report));

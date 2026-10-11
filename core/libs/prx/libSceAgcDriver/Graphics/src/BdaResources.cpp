@@ -256,7 +256,15 @@ void BdaResources::CheckFault() const {
         Require(static_cast<std::uint32_t>(report.reason) == 0 && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.reserved == 0, "BDA fault record has data without publication");
         return;
     }
-    Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.reserved == 0, "incomplete or invalid BDA fault record");
+    const bool mismatch = report.reason == ShaderRecompiler::BdaAbi::FaultReason::RangeCacheMismatch;
+    Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && (report.reserved == 0 || mismatch), "incomplete or invalid BDA fault record");
+    if (mismatch) {
+        // APS5_BDA_RANGE_CACHE_CHECK: the access is refused, so the work's results are not valid.
+        std::ostringstream text;
+        text << "address range cache check failed: the range kept for address 0x" << std::hex << report.address << std::dec << " (" << report.bytes << " bytes) is not the one the page table gives, at instruction 0x" << std::hex << report.instruction << " of the stage " << std::dec << report.stage << " program whose code address ends in 0x" << std::hex << report.reserved << "; the page table changed while the work ran, or the cache is wrong";
+        std::fprintf(stderr, "[gpu] %s\n", text.str().c_str());
+        throw std::runtime_error(text.str());
+    }
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.

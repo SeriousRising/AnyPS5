@@ -16,8 +16,9 @@ struct BdaTestStep {
 inline constexpr std::uint32_t BdaTestStepPc = 0x2000;
 // One invocation runs the 32-bit steps in order; step i reports faults as instruction BdaTestStepPc + i
 // and puts its value (the store's operand, the atomic's old value) in output word i. The lookup
-// keeps `rangeCacheEntries` ranges (0 searches every time).
-std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops);
+// keeps `rangeCacheEntries` ranges (0 searches every time) and, with `rangeCacheCheck`, compares them
+// with a search at every lookup.
+std::vector<std::uint32_t> MakeBdaSequenceTestShader(std::span<const BdaTestStep> steps, std::uint32_t rangeCacheEntries, bool stops, bool rangeCacheCheck = false);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaContractTests();
 

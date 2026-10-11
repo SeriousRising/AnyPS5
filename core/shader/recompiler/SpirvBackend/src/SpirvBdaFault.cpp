@@ -58,7 +58,8 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
         store(4, bytes);
         store(5, ConstantU32(state, static_cast<std::uint32_t>(state.program.Resources().stage)));
         store(6, instruction);
-        store(7, ConstantU32(state, 0u));
+        const auto mismatch = static_cast<std::uint32_t>(BdaAbi::FaultReason::RangeCacheMismatch);
+        store(7, state.bdaRangeCacheCheck ? Select(state, TypeU32(state), Binary(state, spv::OpIEqual, TypeBool(state), reason, ConstantU32(state, mismatch)), ConstantU32(state, static_cast<std::uint32_t>(state.program.Resources().shaderHash)), ConstantU32(state, 0u)) : ConstantU32(state, 0u));
         const auto release = ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask);
         state.module.AddFunction(spv::OpAtomicStore, pointer, scope, release, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultState::Ready)));
     });

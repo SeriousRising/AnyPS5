@@ -27,7 +27,10 @@ struct Range {
 };
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor };
+// RangeCacheMismatch: the address lookup's range cache check (APS5_BDA_RANGE_CACHE_CHECK) found a kept
+// range that the page table no longer gives; `reserved` then holds the low dword of the program's
+// code address.
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, RangeCacheMismatch };
 
 struct Fault {
     FaultState state;
