@@ -112,7 +112,7 @@ void AnalyzeFlatBackedConditions(IrResourcePlan& plan) {
     }
 }
 
-bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
+bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources, std::vector<BdaAbi::BaseRequest>* bdaBases) {
     failureReason().clear();
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
     if (debug) {
@@ -215,6 +215,28 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
             if (!evaluated) {
                 return Fail(std::string(clean ? "clean " : "") + "SRT read at flat offset " + std::to_string(read.flatOffset) + ": " + DescribeValue(read.value, 4));
             }
+        }
+    }
+    if (bdaBases != nullptr) {
+        // After the flat loop, so that every SRT read a base is computed from is already evaluated:
+        // a base adds no guest memory read of its own (see IrBdaBase). A base that cannot be
+        // evaluated, or whose address or hull wraps, is left without bytes and is not translated.
+        bdaBases->assign(program.bdaBases.size(), {});
+        // shortcut: a base may be computed from a read this draw's control flow left inactive, and evaluating it here would perform that read; with any read inactive no base is translated (the shader's own lookup serves them). Upgrade to per-base read sets if the profile shows many draws losing their slots.
+        const bool everyReadActive = std::find(activeReads.begin(), activeReads.end(), std::uint8_t{0}) == activeReads.end();
+        for (std::size_t index = 0; evaluateFlat && everyReadActive && index < program.bdaBases.size(); ++index) {
+            const auto& base = program.bdaBases[index];
+            std::uint32_t low = 0;
+            std::uint32_t pairLow = 0;
+            std::uint32_t pairHigh = 0;
+            if (base.low == nullptr || base.pairHigh == nullptr || !evaluator.Evaluate(base.low, low) || !evaluator.Evaluate(base.pairHigh, pairHigh) || (base.pairLow != nullptr && !evaluator.Evaluate(base.pairLow, pairLow))) continue;
+            // As the emitter's GuestAddressBase computes it.
+            if (base.scalar) low &= ~3u;
+            const auto pair = (static_cast<std::uint64_t>(pairHigh) << 32u) | (base.pairLow != nullptr ? pairLow : low);
+            const auto address = base.pairLow != nullptr ? pair + low : pair;
+            const auto hull = address + static_cast<std::uint64_t>(base.first);
+            if (address < pair || (base.first < 0 ? hull > address : hull < address) || base.bytes == 0u || hull + base.bytes <= hull) continue;
+            (*bdaBases)[index] = {address, hull, base.bytes};
         }
     }
     results = std::move(evaluated);

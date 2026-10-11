@@ -8,6 +8,7 @@
 #include "IntermediateRepresentation/IrMetadata/ResourceInfo.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
+#include "BdaAbi.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -41,6 +42,22 @@ struct ResourceSnapshot {
     std::vector<std::uint32_t> flattenedSrt;
     std::vector<std::uint32_t> userData;
     UniformFill uniformFill;
+    // One per IrResourcePlan::bdaBases.
+    std::vector<BdaAbi::BaseRequest> bdaBases;
+};
+
+// A base address that two or more address-based dword reads share (see BdaBaseKey) and that is the
+// same for a whole draw or dispatch: its values pass SrtWalker::ValidateRuntimeValue and read guest
+// memory only through the plan's SRT reads. The CPU evaluates it for each draw and translates its
+// hull, the `bytes` bytes from the base address plus `first`. A full address has no pairLow.
+struct IrBdaBase {
+    IrValue* pairLow = nullptr;
+    IrValue* pairHigh = nullptr;
+    IrValue* low = nullptr;
+    bool scalar = false;
+    std::uint32_t residue = 0;
+    std::int64_t first = 0;
+    std::uint32_t bytes = 0;
 };
 
 struct UniformFillPlan {
@@ -72,6 +89,7 @@ struct IrResourcePlan {
     bool resourceTrackingComplete = false;
     ShaderInfo info;
     UniformFillPlan uniformFill;
+    std::vector<IrBdaBase> bdaBases;
 };
 
 }

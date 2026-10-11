@@ -52,6 +52,10 @@ std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan) {
     if (plan.uniformFill.fill.kind != UniformFillKind::None) {
         for (std::uint32_t i = 0; i < plan.uniformFill.fill.words; ++i) mark(plan.uniformFill.values[i]);
     }
+    // The CPU computes these base addresses from the slots' values (see IrBdaBase).
+    for (const auto& base : plan.bdaBases) {
+        for (IrValue* value : {base.pairLow, base.pairHigh, base.low}) mark(value);
+    }
     // The address cones: the arguments of every slot's raw read, never the read itself.
     for (const auto& read : plan.srtReads) {
         if (read.value == nullptr) continue;

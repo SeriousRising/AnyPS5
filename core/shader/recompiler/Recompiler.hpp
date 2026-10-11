@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "BdaAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include <array>
 #include <cstddef>
@@ -462,6 +463,11 @@ struct ShaderInvocation {
     std::vector<DescriptorBinding> bindings;
     std::vector<std::byte> pushConstants;
     std::vector<VertexAttribute> vertexAttributes;
+    // The bases of the program that the CPU translates (IrResourcePlan::bdaBases), as evaluated for
+    // this invocation, and the word of the program's stage in the directory of their slots
+    // (BdaAbi::BaseDirectoryWord).
+    std::vector<BdaAbi::BaseRequest> bdaBases;
+    std::uint32_t bdaBaseStage = 0;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {

@@ -445,7 +445,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
 
     std::vector<DescriptorValue> values;
     std::vector<std::uint8_t> activeSources;
-    walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources);
+    walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources, &snapshot.bdaBases);
 
     std::size_t cursor = 0;
     if (values.size() < plan.info.buffers.size()) {
@@ -810,6 +810,7 @@ void ownPlanValues(IrResourcePlan& plan) {
     for (auto& read : plan.srtReads) roots.push_back(&read.value);
     for (auto& block : plan.controlFlow) roots.push_back(&block.condition);
     for (auto& value : plan.uniformFill.values) roots.push_back(&value);
+    for (auto& base : plan.bdaBases) roots.insert(roots.end(), {&base.pairLow, &base.pairHigh, &base.low});
 
     std::unordered_map<const IrValue*, IrValue*> clones;
     std::vector<const IrValue*> order;
@@ -884,6 +885,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.info = source.info;
     PrepareImageModes(plan.info);
     plan.uniformFill = source.uniformFill;
+    plan.bdaBases = source.bdaBases;
     ownPlanValues(plan);
     const auto addSource = [&plan](std::uint32_t index) {
         if (index >= plan.descriptorSources.size()) {

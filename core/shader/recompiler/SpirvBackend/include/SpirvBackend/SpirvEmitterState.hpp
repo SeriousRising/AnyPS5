@@ -79,10 +79,27 @@ inline constexpr std::uint32_t BdaRangeCacheDefaultEntries = 0;
 // FindBdaSharedBases). `variable` is a Private u64: 0 until a member tries to translate the hull, the
 // `bytes` bytes from the base address plus `first`; then the hull's device address, or 1 when the
 // hull does not lie in one readable range at a 4-aligned device address.
+// With `cpuSlot` the CPU translates the base for each draw (IrResourcePlan::bdaBases[cpuSlot], whose
+// hull holds this one `cpuBack` bytes from its start), and the key's values give the base address.
+inline constexpr std::uint32_t NoBdaCpuSlot = 0xffffffffu;
+
 struct BdaSharedBase {
     std::uint32_t variable = 0;
     std::int64_t first = 0;
     std::uint32_t bytes = 0;
+    std::uint32_t cpuSlot = NoBdaCpuSlot;
+    std::uint32_t cpuBack = 0;
+    const IrValue* pairLow = nullptr;
+    const IrValue* pairHigh = nullptr;
+    const IrValue* low = nullptr;
+    bool scalar = false;
+};
+
+// What a block knows of a base the CPU translated: whether the draw's slot may be used (a bool) and
+// the device address of the slot's hull.
+struct BdaCpuBaseCheck {
+    std::uint32_t usable = 0;
+    std::uint32_t device = 0;
 };
 
 // A member of bdaSharedBases[base]: its first extracted dword lies `begin` bytes from the base address.
@@ -160,6 +177,11 @@ struct SpirvEmitterState {
     std::unordered_map<const IrBlock*, std::vector<std::uint32_t>> bdaSharedBaseResets;
     std::array<std::array<std::uint32_t, 2>, 2> bdaSharedDwordReadFunctions {};
     std::uint32_t bdaSharedProbeFunction = 0;
+    // The directory word of the program's stage (BdaAbi::BaseDirectoryWord), loaded where the program
+    // starts; 0 in a program with no base the CPU translates.
+    std::uint32_t bdaBaseDirectory = 0;
+    // The slots the block being emitted has already compared, by shared base.
+    std::unordered_map<std::uint32_t, BdaCpuBaseCheck> bdaCpuBaseChecks;
     std::uint32_t bdaStopValue = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
