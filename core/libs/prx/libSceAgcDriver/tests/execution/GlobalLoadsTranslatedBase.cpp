@@ -186,8 +186,10 @@ struct Case {
 
 alignas(16) std::array<std::uint32_t, 2> Table{};
 
+// A program for the direct table, which the device asks for unless APS5_NO_BDA_DIRECT is set, shares
+// no base address: the CPU then translates none, and the reads below walk the table.
 bool CpuBases() {
-    return std::getenv("APS5_NO_BDA_CPU_BASE") == nullptr;
+    return std::getenv("APS5_NO_BDA_CPU_BASE") == nullptr && std::getenv("APS5_NO_BDA_DIRECT") != nullptr;
 }
 
 std::uint64_t Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, const Case& test, std::uint32_t seed = 0) {
