@@ -3,9 +3,26 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <atomic>
 #include <exception>
 
 namespace AgcDriver::Graphics {
+
+namespace {
+
+std::atomic<std::uint64_t> mappedCount{0};
+std::atomic<std::uint64_t> mappedBytes{0};
+
+}
+
+MappedBufferUse MappedBufferUsage() {
+    return {mappedCount.load(std::memory_order_relaxed), mappedBytes.load(std::memory_order_relaxed)};
+}
+
+void NoteBufferUnmapped(VkDeviceSize bytes) noexcept {
+    mappedCount.fetch_sub(1, std::memory_order_relaxed);
+    mappedBytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
@@ -49,7 +66,11 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
-        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
+        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
+            mappedCount.fetch_add(1, std::memory_order_relaxed);
+            mappedBytes.fetch_add(allocationBytes, std::memory_order_relaxed);
+        }
         ready = true;
     } catch (...) {
         release();
@@ -66,7 +87,10 @@ void Buffer::release() noexcept {
         cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties});
         return;
     }
-    if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
+    if (mapping) {
+        context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
+        NoteBufferUnmapped(allocationBytes);
+    }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }

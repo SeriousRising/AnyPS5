@@ -260,13 +260,15 @@ void snapshotTests(const Context& context) {
     Require(held == first->AllocationBytes(), "a snapshot counted " + std::to_string(held) + " bytes, not its image allocation of " + std::to_string(first->AllocationBytes()));
     const std::weak_ptr<Texture> oldest = first;
     first.reset();
-    const auto capacity = static_cast<std::size_t>(Budget / held);
-    Require(capacity >= 2u && capacity + 1u < Surfaces, "a snapshot of the 256 KiB surface counts " + std::to_string(held) + " bytes, which the test's 1 MiB budget does not fit as planned");
+    const auto snapshot = TextureCacheUsage().sampledHostBytes;
+    Require(snapshot != 0, "a snapshot counted no host bytes for its copy of the surface");
+    const auto capacity = static_cast<std::size_t>(Budget / (held + snapshot));
+    Require(capacity >= 2u && capacity + 1u < Surfaces, "a snapshot of the 256 KiB surface counts " + std::to_string(held + snapshot) + " bytes, which the test's 1 MiB budget does not fit as planned");
     for (std::size_t surface = 1; surface < capacity; ++surface) Sampled(context, block.Surface(surface));
     Require(!oldest.expired() && TextureCacheUsage().sampledEntries == capacity, "the sampled texture cache did not keep " + std::to_string(capacity) + " snapshots within its budget");
     Sampled(context, block.Surface(capacity));
     Require(oldest.expired(), "the least recently used snapshot was not evicted past the budget");
-    Require(TextureCacheUsage().sampledBytes <= Budget, "the sampled texture cache holds more than its budget");
+    Require(TextureCacheUsage().sampledBytes + TextureCacheUsage().sampledHostBytes <= Budget, "the sampled texture cache holds more than its budget");
     ClearCachedTextures(context.device);
     constexpr std::uint32_t TinySide = 16;
     const auto tiny = Sampled(context, block.Surface(0), TinySide);

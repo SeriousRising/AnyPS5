@@ -32,6 +32,7 @@ bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::c
 struct TextureCacheUse {
     std::size_t sampledEntries = 0;
     std::uint64_t sampledBytes = 0;
+    std::uint64_t sampledHostBytes = 0;
     std::uint64_t storageBytes = 0;
 };
 TextureCacheUse TextureCacheUsage();
