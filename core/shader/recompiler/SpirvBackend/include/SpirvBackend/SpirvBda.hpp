@@ -6,6 +6,7 @@
 #include "BdaAbi.hpp"
 #include <array>
 #include <functional>
+#include <optional>
 
 namespace ShaderRecompiler {
 
@@ -13,6 +14,9 @@ std::uint32_t BdaConstant(SpirvEmitterState& state, std::uint64_t value);
 std::uint32_t BdaWord(SpirvEmitterState& state, std::uint32_t variable, std::uint32_t index);
 std::uint32_t BdaLoadWord(SpirvEmitterState& state, std::uint32_t index);
 std::uint32_t BdaLoadAddress(SpirvEmitterState& state, std::uint32_t index);
+// The 64-bit value of two dwords, as one cast: a driver's compiler does not see the pair in a
+// widening, a shift and an OR, and RADV then moves each half through registers of its own.
+std::uint32_t BdaAddressFromWords(SpirvEmitterState& state, std::uint32_t low, std::uint32_t high);
 struct BdaLookupResult {
     std::uint32_t address;
     std::uint32_t reason;
@@ -25,10 +29,28 @@ BdaLookupResult BdaLookup(SpirvEmitterState& state, std::uint32_t address, std::
 inline constexpr std::uint32_t BdaLookupSpan = 4u;
 // BdaLookup with the permission as a value, through lookup_bda_span with `span` (modules that share bases).
 BdaLookupResult BdaSpanLookup(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t permission, bool span = true);
+// What the direct table holds for an address (BdaAbi::DirectEntry): the leaf of its unit, and the
+// address's offset in that unit.
+struct BdaDirectLeaf {
+    std::uint32_t delta;
+    std::uint32_t bytes;
+    std::uint32_t flags;
+    std::uint32_t offset;
+};
+BdaDirectLeaf EmitBdaDirectWalk(SpirvEmitterState& state, std::uint32_t address);
+// Walks the leaf of `base` + `immediate` where the function stands, for the dword reads of that
+// base that follow (see BdaDirectHint; `reads` is left as it is).
+void WalkBdaDirectHint(SpirvEmitterState& state, BdaDirectHint& hint, std::uint32_t base, std::int32_t immediate);
 // Validates the page table's header for lookup_bda and empties its range cache; emitted at the start
 // of the program's function.
 void PrepareBdaLookups(SpirvEmitterState& state);
 void DefineBdaFaultFunction(SpirvEmitterState& state);
+// What a direct dword read records as its reason, with its base address for the address and its
+// immediate for the bytes: publish_bda_fault then works out the fault (see DefineBdaFaultFunction).
+inline constexpr std::uint32_t BdaDirectReadFault = 0x80000000u;
+// Publishes the fault the invocation recorded, if any, in a program that keeps it until its end (one
+// for the direct table); emitted wherever an invocation ends. Nothing in other programs.
+void PublishBdaFault(SpirvEmitterState& state);
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state);
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);
 void ReturnBdaFailureIf(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);
@@ -76,7 +98,11 @@ struct BdaSharedTry {
     std::uint32_t back;
     std::uint32_t bytes;
 };
-std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false, const BdaSharedTry* shared = nullptr);
+// In a program for the direct table `address` is the base without the read's immediate, which is
+// `offset`, and `hint` a leaf walked ahead for that base, or null.
+std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false, const BdaSharedTry* shared = nullptr, const BdaDirectHint* hint = nullptr);
+// The values `inst` computes its base address from, when it has the form of an address-based read.
+std::optional<BdaDirectKey> BdaDirectKeyOf(const IrValue& inst, const MemoryInfo& mem);
 // Groups the program's address-based dword reads by base address (the values it is computed from,
 // the kind of address and the immediates' residue modulo 4); a base with two reads or more is shared.
 // Nothing is emitted. APS5_NO_BDA_SHARED_BASE=1 finds none, so that every read looks its own bytes up.
@@ -107,6 +133,7 @@ std::array<std::uint32_t, 4> EmitBdaCpuBaseDwordReads(SpirvValueEmitContext& ctx
 // Forgets, where `block` starts, the translations of the bases computed from a value it defines.
 void ResetBdaSharedBases(SpirvEmitterState& state, const IrBlock* block);
 bool BdaByteReadsForced();
+bool BdaDirectImmediate(std::int32_t immediate);
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 

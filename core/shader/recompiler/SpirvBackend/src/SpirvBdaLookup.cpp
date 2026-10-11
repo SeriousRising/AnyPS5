@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <utility>
 #include <vector>
@@ -276,6 +277,163 @@ std::uint32_t DefineBdaLookupCore(SpirvEmitterState& state, bool span = false) {
     return function;
 }
 
+}
+
+// The direct table's leaf for `address`, walked where the function stands: one entry is loaded a
+// level, and a program has no more levels than the table's builder makes. An address outside the
+// root's units, or any address under an invalid header (the root count is then 0), gets a leaf
+// without bytes at offset 0 and loads nothing.
+BdaDirectLeaf EmitBdaDirectWalk(SpirvEmitterState& state, std::uint32_t address) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto load = [&](std::uint32_t type, std::uint32_t pointer) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, type, value, pointer);
+        return value;
+    };
+    const auto phi = [&](std::uint32_t type, std::uint32_t value, std::uint32_t from, std::uint32_t otherwise, std::uint32_t before) {
+        const auto merged = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, type, merged, value, from, otherwise, before);
+        return merged;
+    };
+    const auto relative = binary(spv::OpISub, u64, address, load(u64, state.bdaDirectBase));
+    const auto unit = binary(spv::OpShiftRightLogical, u64, relative, Unary(state, spv::OpUConvert, u64, load(u32, state.bdaDirectShift)));
+    const auto inRoot = binary(spv::OpULessThan, boolean, unit, Unary(state, spv::OpUConvert, u64, load(u32, state.bdaDirectCount)));
+    const auto firstEntry = Unary(state, spv::OpUConvert, u32, unit);
+    const auto firstOffset = binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, relative), load(u32, state.bdaDirectMask));
+    // The delta and flags of a leaf without bytes are not read; its offset is, and is 0.
+    const auto noAddress = state.module.AllocateId();
+    state.module.AddFunction(spv::OpUndef, u64, noAddress);
+    const auto noWord = state.module.AllocateId();
+    state.module.AddFunction(spv::OpUndef, u32, noWord);
+    const auto before = state.currentLabel;
+    const auto header = state.module.AllocateId();
+    const auto body = state.module.AllocateId();
+    const auto continuation = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    const auto walked = state.module.AllocateId();
+    const auto nextEntry = state.module.AllocateId();
+    const auto nextOffset = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, walked, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, inRoot, header, walked);
+    EmitLabel(state, header);
+    const auto entry = phi(u32, firstEntry, before, nextEntry, continuation);
+    const auto offset = phi(u32, firstOffset, before, nextOffset, continuation);
+    state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
+    state.module.AddFunction(spv::OpBranch, body);
+    EmitLabel(state, body);
+    const auto word = binary(spv::OpIAdd, u32, constant(sizeof(BdaAbi::DirectHeader) / 4u), binary(spv::OpShiftLeftLogical, u32, entry, constant(2u)));
+    std::array<std::uint32_t, 4> words{};
+    for (std::uint32_t index = 0; index < words.size(); ++index) words[index] = BdaLoadWord(state, index != 0u ? binary(spv::OpIAdd, u32, word, constant(index)) : word);
+    const auto descends = binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, words[3], constant(BdaAbi::DirectDescend)), constant(0u));
+    // An entry that descends holds its first child, the children's shift and their mask.
+    state.module.AddFunction(spv::OpIAdd, u32, nextEntry, words[0], binary(spv::OpShiftRightLogical, u32, offset, words[1]));
+    state.module.AddFunction(spv::OpBitwiseAnd, u32, nextOffset, offset, words[2]);
+    state.module.AddFunction(spv::OpBranchConditional, descends, continuation, merge);
+    EmitLabel(state, continuation);
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, merge);
+    const auto delta = BdaAddressFromWords(state, words[0], words[1]);
+    state.module.AddFunction(spv::OpBranch, walked);
+    EmitLabel(state, walked);
+    return {phi(u64, delta, merge, noAddress, before), phi(u32, words[2], merge, constant(0u), before), phi(u32, words[3], merge, noWord, before), phi(u32, offset, merge, constant(0u), before)};
+}
+
+void WalkBdaDirectHint(SpirvEmitterState& state, BdaDirectHint& hint, std::uint32_t base, std::int32_t immediate) {
+    const auto u32 = TypeU32(state);
+    const auto leaf = EmitBdaDirectWalk(state, immediate != 0 ? Binary(state, spv::OpIAdd, TypeScalarU64(state), base, BdaConstant(state, static_cast<std::uint64_t>(static_cast<std::int64_t>(immediate)))) : base);
+    const auto limit = Select(state, u32, Binary(state, spv::OpUGreaterThan, TypeBool(state), leaf.bytes, ConstantU32(state, 3u)), Binary(state, spv::OpISub, u32, leaf.bytes, ConstantU32(state, 3u)), ConstantU32(state, 0u));
+    hint = {hint.reads, true, leaf.delta, leaf.bytes, leaf.flags, limit, leaf.offset, immediate};
+}
+
+namespace {
+
+// lookup_bda for the direct table: the same result and the same reasons in the same order (the
+// header, overflow of the access, a first byte that is not mapped, a last byte past the mapping,
+// the permission), from the leaf of the address instead of a search. A mapping's device addresses
+// are valid by the table's construction (BdaDirectTable refuses the ranges for which the
+// search reports InvalidTable or a device overflow).
+std::uint32_t DefineBdaDirectLookup(SpirvEmitterState& state) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto pair = state.module.Type(spv::OpTypeVector, u64, 2u);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto zero = BdaConstant(state, 0u);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, "lookup_bda");
+    state.module.AddFunction(spv::OpFunction, pair, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, pair, u64, u32, u32));
+    const auto address = state.module.AllocateId();
+    const auto bytes = state.module.AllocateId();
+    const auto permission = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, u64, address);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, bytes);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, permission);
+    EmitLabel(state, state.module.AllocateId());
+    const auto invalid = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, u32, invalid, state.bdaTableInvalid);
+    const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+    const auto overflowed = binary(spv::OpLogicalOr, boolean, binary(spv::OpIEqual, boolean, bytes, constant(0u)), binary(spv::OpULessThanEqual, boolean, end, address));
+    const auto leaf = EmitBdaDirectWalk(state, address);
+    // The offset is below 1 << 30 and no access is that long.
+    const auto past = binary(spv::OpUGreaterThan, boolean, binary(spv::OpIAdd, u32, leaf.offset, bytes), leaf.bytes);
+    const auto held = binary(spv::OpBitwiseOr, u32, binary(spv::OpBitwiseAnd, u32, leaf.flags, constant(BdaAbi::DirectWritable)), constant(BdaAbi::Read));
+    static_assert(BdaAbi::DirectWritable == BdaAbi::Write);
+    const auto reasons = [&](std::uint32_t condition, BdaAbi::FaultReason reason, std::uint32_t otherwise) { return Select(state, u64, condition, BdaConstant(state, static_cast<std::uint32_t>(reason)), otherwise); };
+    auto reason = reasons(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, held, permission), permission), BdaAbi::FaultReason::Permission, zero);
+    reason = reasons(past, BdaAbi::FaultReason::Unmapped, reason);
+    reason = reasons(overflowed, BdaAbi::FaultReason::Overflow, reason);
+    reason = reasons(binary(spv::OpINotEqual, boolean, invalid, constant(0u)), BdaAbi::FaultReason::InvalidTable, reason);
+    const auto looked = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, pair, looked, Select(state, u64, binary(spv::OpIEqual, boolean, reason, zero), binary(spv::OpIAdd, u64, address, leaf.delta), zero), reason);
+    state.module.AddFunction(spv::OpReturnValue, looked);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
+
+// PrepareBdaLookups for the direct table: the header is valid when the buffer holds exactly what it
+// announces.
+void PrepareBdaDirectLookups(SpirvEmitterState& state) {
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto differs = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpINotEqual, boolean, left, right); };
+    const auto either = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalOr, boolean, left, right); };
+    constexpr std::uint32_t headerWords = sizeof(BdaAbi::DirectHeader) / 4u;
+    state.module.AddFunction(spv::OpStore, state.bdaTableInvalid, constant(1u));
+    state.module.AddFunction(spv::OpStore, state.bdaDirectBase, BdaConstant(state, 0u));
+    for (const auto variable : {state.bdaDirectShift, state.bdaDirectMask, state.bdaDirectCount}) state.module.AddFunction(spv::OpStore, variable, constant(0u));
+    const auto length = state.module.AllocateId();
+    state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
+    EmitIfCondition(state, binary(spv::OpUGreaterThanEqual, boolean, length, constant(headerWords)), [&] {
+        const auto shift = BdaLoadWord(state, constant(1u));
+        const auto count = BdaLoadWord(state, constant(2u));
+        const auto entries = BdaLoadWord(state, constant(3u));
+        const auto ranges = BdaLoadWord(state, constant(6u));
+        // Counts that would wrap the length below are not a table's.
+        auto invalid = differs(BdaLoadWord(state, constant(0u)), constant(BdaAbi::DirectVersion));
+        invalid = either(invalid, differs(BdaLoadWord(state, constant(7u)), constant(0u)));
+        invalid = either(invalid, binary(spv::OpUGreaterThan, boolean, shift, constant(BdaAbi::DirectMaxRootShift)));
+        invalid = either(invalid, binary(spv::OpUGreaterThan, boolean, count, entries));
+        invalid = either(invalid, binary(spv::OpUGreaterThan, boolean, binary(spv::OpBitwiseOr, u32, entries, ranges), constant(0x03ffffffu)));
+        invalid = either(invalid, differs(length, binary(spv::OpIAdd, u32, constant(headerWords), binary(spv::OpIAdd, u32, binary(spv::OpShiftLeftLogical, u32, entries, constant(2u)), binary(spv::OpShiftLeftLogical, u32, ranges, constant(3u))))));
+        state.module.AddFunction(spv::OpStore, state.bdaTableInvalid, Select(state, u32, invalid, constant(1u), constant(0u)));
+        state.module.AddFunction(spv::OpStore, state.bdaDirectBase, BdaLoadAddress(state, constant(4u)));
+        state.module.AddFunction(spv::OpStore, state.bdaDirectShift, shift);
+        state.module.AddFunction(spv::OpStore, state.bdaDirectMask, binary(spv::OpISub, u32, binary(spv::OpShiftLeftLogical, u32, constant(1u), shift), constant(1u)));
+        state.module.AddFunction(spv::OpStore, state.bdaDirectCount, Select(state, u32, invalid, constant(0u), count));
+    });
+}
+
+}
+
+namespace {
+
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
 std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
     const auto u32 = TypeU32(state);
@@ -374,6 +532,14 @@ void PrepareBdaLookups(SpirvEmitterState& state) {
     const auto either = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpLogicalOr, boolean, left, right); };
     // The header words are read only when the buffer holds them.
     if (state.bdaStopped != 0u) state.module.AddFunction(spv::OpStore, state.bdaStopped, ConstantBool(state, false));
+    if (state.bdaDirect) {
+        state.module.AddFunction(spv::OpStore, state.bdaPendingFault[0], constant(0u));
+        state.module.AddFunction(spv::OpStore, state.bdaPendingFault[1], BdaConstant(state, 0u));
+        state.module.AddFunction(spv::OpStore, state.bdaPendingFault[2], constant(0u));
+        state.module.AddFunction(spv::OpStore, state.bdaPendingFault[3], constant(0u));
+        PrepareBdaDirectLookups(state);
+        return;
+    }
     state.module.AddFunction(spv::OpStore, state.bdaTableInvalid, constant(1));
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
@@ -398,12 +564,20 @@ void PrepareBdaLookups(SpirvEmitterState& state) {
 
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (!state.program.Info().usesDma) return;
+    if (state.bdaDirect) {
+        const auto word = [&](std::uint32_t type) { return state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, type), spv::StorageClassPrivate); };
+        state.bdaTableInvalid = word(TypeU32(state));
+        state.bdaDirectBase = word(TypeScalarU64(state));
+        state.bdaDirectShift = word(TypeU32(state));
+        state.bdaDirectMask = word(TypeU32(state));
+        state.bdaDirectCount = word(TypeU32(state));
+    }
     DefineBdaFaultFunction(state);
     if (state.bdaStopDeferred) state.bdaStopped = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
-    state.bdaLookupFunction = DefineBdaLookupCore(state);
+    state.bdaLookupFunction = state.bdaDirect ? DefineBdaDirectLookup(state) : DefineBdaLookupCore(state);
     if (state.bdaSharedBase) state.bdaSpanLookupFunction = DefineBdaLookupCore(state, true);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
-    if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
+    if (!BdaByteReadsForced() && !state.bdaDirect) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);
     for (auto& base : state.bdaSharedBases) base.variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state)), spv::StorageClassPrivate);
     if (state.program.Info().bdaWrites) {

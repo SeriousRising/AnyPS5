@@ -4,14 +4,18 @@
 #include "Optimization/BdaSharedBases.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include <algorithm>
+#include <bit>
 #include <compare>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -300,6 +304,173 @@ static std::uint32_t DefineBdaSharedProbe(SpirvEmitterState& state) {
     return function;
 }
 
+// (u64 base, u32 immediate, u32 instruction, ...) -> (u32 dword, u32 stopped), for the direct table:
+// one walk gives the mapping of the first byte of the dword at base + immediate, and the dword is
+// loaded where its four bytes lie in that mapping: as a dword at a 4-aligned device address, and
+// otherwise as four bytes, which Vulkan lets a program load at any address. A dword that ends in the
+// mapping that follows at once is put together from the last four bytes of the first and the first
+// four of the second, where the leaf has their device addresses (BdaAbi::DirectSeamShift).
+// The five values after the instruction are a leaf walked ahead for the base (BdaDirectHint: delta,
+// bytes, flags, limit, and the dword's offset there); with a limit of 0 the read walks for itself.
+// Anything else is a fault. The read records only its base, immediate and instruction
+// (BdaDirectReadFault): every helper is inlined at every site, so what failed is worked out where
+// the invocation ends, and the dword of a faulting read is 0. `stop` 1 returns 1 for a faulting
+// read; 2 sets the invocation's pending stop instead, which costs a read that succeeds nothing.
+static std::uint32_t DefineBdaDirectDwordRead(SpirvEmitterState& state, const std::string& name, std::uint32_t stop, bool coherent) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto pair = TypeU32Vector(state, 2);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, name);
+    state.module.AddFunction(spv::OpFunction, pair, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, pair, u64, u32, u32, u64, u32, u32, u32, u32));
+    const std::array<std::uint32_t, 8> types{u64, u32, u32, u64, u32, u32, u32, u32};
+    std::array<std::uint32_t, 8> parameters{};
+    for (std::size_t index = 0; index < parameters.size(); ++index) {
+        parameters[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
+    }
+    const auto [base, immediate, instruction, hintDelta, hintBytes, hintFlags, hintLimit, hintOffset] = parameters;
+    EmitLabel(state, state.module.AllocateId());
+    const auto loadDword = [&](std::uint32_t device) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, device);
+        const auto loaded = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, loaded, pointer, BdaAccessMask(coherent), 4u);
+        return loaded;
+    };
+    const auto address = binary(spv::OpIAdd, u64, base, Unary(state, spv::OpSConvert, u64, immediate));
+    // The leaf walked ahead for the base holds the dword when its offset there is below the limit.
+    const auto hinted = binary(spv::OpULessThan, boolean, hintOffset, hintLimit);
+    const auto hintLabel = state.currentLabel;
+    const auto walkLabel = state.module.AllocateId();
+    const auto found = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, found, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, hinted, found, walkLabel);
+    EmitLabel(state, walkLabel);
+    const auto walked = EmitBdaDirectWalk(state, address);
+    const auto walkEnd = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, found);
+    EmitLabel(state, found);
+    const auto either = [&](std::uint32_t type, std::uint32_t hint, std::uint32_t own) {
+        const auto merged = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, type, merged, hint, hintLabel, own, walkEnd);
+        return merged;
+    };
+    const BdaDirectLeaf leaf{either(u64, hintDelta, walked.delta), either(u32, hintBytes, walked.bytes), either(u32, hintFlags, walked.flags), either(u32, hintOffset, walked.offset)};
+    // The ways out, tried in order, each under the ones before it; the last has no condition.
+    struct Way {
+        std::uint32_t value, stopped, from;
+    };
+    std::vector<Way> ways;
+    std::vector<std::uint32_t> joins;
+    const auto way = [&](const std::function<std::uint32_t()>& condition, const std::function<std::uint32_t()>& emit, std::uint32_t stopped = 0u) {
+        if (condition) {
+            const auto taken = condition();
+            const auto label = state.module.AllocateId();
+            const auto otherwise = state.module.AllocateId();
+            joins.push_back(state.module.AllocateId());
+            state.module.AddFunction(spv::OpSelectionMerge, joins.back(), spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, taken, label, otherwise);
+            EmitLabel(state, label);
+            const auto value = emit();
+            ways.push_back({value, constant(stopped), state.currentLabel});
+            state.module.AddFunction(spv::OpBranch, joins.back());
+            EmitLabel(state, otherwise);
+            return;
+        }
+        const auto value = emit();
+        ways.push_back({value, constant(stopped), state.currentLabel});
+    };
+    std::uint32_t device = 0;
+    // The offset is below 1 << 30. `whole` is true on the first two ways and false on the others.
+    const auto whole = binary(spv::OpULessThan, boolean, binary(spv::OpIAdd, u32, leaf.offset, constant(3u)), leaf.bytes);
+    const auto wholeLabel = state.module.AllocateId();
+    const auto partLabel = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, whole, wholeLabel, partLabel);
+    EmitLabel(state, wholeLabel);
+    way([&] {
+        device = binary(spv::OpIAdd, u64, address, leaf.delta);
+        return binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, device), constant(3u)), constant(0u));
+    }, [&] { return loadDword(device); });
+    way({}, [&] {
+        const auto byteType = state.module.Type(spv::OpTypeInt, 8u, 0u);
+        const auto bytesType = state.module.Type(spv::OpTypeVector, byteType, 4u);
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, bytesType), pointer, device);
+        const auto loaded = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, bytesType, loaded, pointer, BdaAccessMask(coherent), 1u);
+        // Without the Int8 capability a byte may only be widened.
+        const auto wide = Unary(state, spv::OpUConvert, TypeU32Vector(state, 4), loaded);
+        auto dword = constant(0u);
+        for (std::uint32_t byte = 0; byte < 4u; ++byte) {
+            const auto part = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, part, wide, byte);
+            dword = byte == 0u ? part : binary(spv::OpBitwiseOr, u32, dword, binary(spv::OpShiftLeftLogical, u32, part, constant(byte * 8u)));
+        }
+        return dword;
+    });
+    const auto close = [&](std::size_t from) {
+        // The joins close innermost first; each takes the way taken at its level and the ones below it.
+        auto value = ways.back().value;
+        auto stopped = ways.back().stopped;
+        for (std::size_t level = joins.size(); level-- != from;) {
+            const auto below = state.currentLabel;
+            state.module.AddFunction(spv::OpBranch, joins[level]);
+            EmitLabel(state, joins[level]);
+            const auto merged = state.module.AllocateId();
+            state.module.AddFunction(spv::OpPhi, u32, merged, ways[level].value, ways[level].from, value, below);
+            value = merged;
+            const auto flag = state.module.AllocateId();
+            state.module.AddFunction(spv::OpPhi, u32, flag, ways[level].stopped, ways[level].from, stopped, below);
+            stopped = flag;
+        }
+        joins.resize(from);
+        return Way{value, stopped, state.currentLabel};
+    };
+    const auto wholeWay = close(0);
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, partLabel);
+    ways.clear();
+    std::uint32_t room = 0;
+    std::uint32_t seam = 0;
+    way([&] {
+        // The bytes of the dword in the first mapping, 1 to 3: a leaf with a seam ends in its unit or just past it.
+        room = binary(spv::OpISub, u32, leaf.bytes, leaf.offset);
+        seam = binary(spv::OpShiftRightLogical, u32, leaf.flags, constant(BdaAbi::DirectSeamShift));
+        return binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThan, boolean, leaf.offset, leaf.bytes), binary(spv::OpINotEqual, boolean, seam, constant(0u)));
+    }, [&] {
+        const auto word = binary(spv::OpIAdd, u32, constant(sizeof(BdaAbi::DirectHeader) / 4u), binary(spv::OpShiftLeftLogical, u32, seam, constant(2u)));
+        std::array<std::uint32_t, 4> words{};
+        for (std::uint32_t index = 0; index < words.size(); ++index) words[index] = BdaLoadWord(state, index != 0u ? binary(spv::OpIAdd, u32, word, constant(index)) : word);
+        const auto before = loadDword(BdaAddressFromWords(state, words[0], words[1]));
+        const auto after = loadDword(BdaAddressFromWords(state, words[2], words[3]));
+        const auto bits = binary(spv::OpShiftLeftLogical, u32, room, constant(3u));
+        return binary(spv::OpBitwiseOr, u32, binary(spv::OpShiftRightLogical, u32, before, binary(spv::OpISub, u32, constant(32u), bits)), binary(spv::OpShiftLeftLogical, u32, after, bits));
+    });
+    way({}, [&] {
+        state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, constant(BdaDirectReadFault), base, immediate, instruction);
+        if (stop == 2u) state.module.AddFunction(spv::OpStore, state.bdaStopped, ConstantBool(state, true));
+        return constant(0u);
+    }, stop == 1u ? 1u : 0u);
+    const auto partWay = close(0);
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, u32, value, wholeWay.value, wholeWay.from, partWay.value, partWay.from);
+    const auto stopped = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, u32, stopped, wholeWay.stopped, wholeWay.from, partWay.stopped, partWay.from);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, pair, result, value, stopped);
+    state.module.AddFunction(spv::OpReturnValue, result);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
+
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
     const auto& memory = state.program.Resources().memoryInfo;
     const bool coherentAccesses = std::any_of(memory.begin(), memory.end(), [](const MemoryInfo& info) { return info.coherent; });
@@ -307,12 +478,26 @@ void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
         for (const bool coherent : {false, true}) {
             if ((stop && !state.bdaStopsInvocations) || (coherent && !coherentAccesses)) continue;
             const auto suffix = std::string(stop ? "_stop" : "") + (coherent ? "_coherent" : "");
+            if (state.bdaDirect && !BdaByteReadsForced()) {
+                state.bdaDirectDwordReadFunctions[stop ? 1u : 0u][coherent] = DefineBdaDirectDwordRead(state, "read_bda_dword_direct" + suffix, stop ? 1u : 0u, coherent);
+                if (stop && state.bdaStopped != 0u) state.bdaDirectDwordReadFunctions[2u][coherent] = DefineBdaDirectDwordRead(state, "read_bda_dword_direct_flag" + std::string(coherent ? "_coherent" : ""), 2u, coherent);
+                continue;
+            }
             state.bdaDwordReadFunctions[stop][coherent] = DefineBdaDwordRead(state, "read_bda_dword_bytes" + suffix, false, stop, coherent);
             if (!BdaByteReadsForced()) state.bdaProbedDwordReadFunctions[stop][coherent] = DefineBdaDwordRead(state, "read_bda_dword" + suffix, true, stop, coherent);
             if (state.bdaSharedBase) state.bdaSharedDwordReadFunctions[stop][coherent] = DefineBdaDwordRead(state, "read_bda_dword_shared" + suffix, true, stop, coherent, true);
         }
     }
     if (state.bdaSharedBase) state.bdaSharedProbeFunction = DefineBdaSharedProbe(state);
+}
+
+// Whether a direct dword read may add `immediate` to its base address itself, unchecked: the direct
+// table maps no address within BdaAbi::DirectMargin of either end of the address space, so a sum
+// that wraps is not mapped and the read finds the wrap where it finds the fault, and neither is the
+// address a leaf was walked ahead for with another such immediate, whose leaf then holds no dword.
+bool BdaDirectImmediate(std::int32_t immediate) {
+    constexpr auto limit = static_cast<std::int32_t>(BdaAbi::DirectMargin / 2u);
+    return immediate >= -limit && immediate <= limit;
 }
 
 // APS5_BDA_BYTE_READS=1 restores one lookup and one byte load per byte for every read.
@@ -340,7 +525,7 @@ std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, s
 
 void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& target) {
     if (!program.Info().usesDma) return;
-    if (target.bdaAbiVersion != BdaAbi::Version) throw std::runtime_error("unsupported BDA ABI version");
+    if (!BdaAbi::TableVersion(target.bdaAbiVersion)) throw std::runtime_error("unsupported BDA ABI version");
     for (const auto capability : {spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess}) {
         if (std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), static_cast<std::uint32_t>(capability)) == target.supportedCapabilities.end()) throw std::runtime_error("BDA requires unsupported SPIR-V capability " + std::to_string(capability));
     }
@@ -453,7 +638,7 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
 // unaligned mirror or a wrapping span falls back to the byte path. That path repeats, per extracted
 // dword in order, the address, overflow check and byte lookups of a separate dword load, so every
 // fault is recorded exactly as one; the probe records none, and a span it accepts cannot fault.
-std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword, const BdaSharedTry* shared) {
+std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword, const BdaSharedTry* shared, const BdaDirectHint* hint) {
     auto& state = ctx.state;
     if (dwords == 0u || dwords > 4u) ctx.Fail(inst, "unsupported BDA read width");
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
@@ -491,6 +676,31 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
             StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, TypeBool(state), stopped, ConstantU32(state, 0u)));
         }
     };
+    if (state.bdaDirect && !BdaByteReadsForced()) {
+        // Each dword checks its own immediate where the table lets it (BdaDirectImmediate), and
+        // walks the table for itself unless the leaf walked ahead for the base holds it.
+        const std::uint32_t stop = !state.bdaStopsInvocations ? 0u : state.bdaStopDeferred ? 2u : 1u;
+        const auto function = state.bdaDirectDwordReadFunctions[stop][BdaCoherent(state, inst)];
+        if (function == 0) ctx.Fail(inst, "BDA dword read function is missing");
+        const auto folded = [&](std::uint32_t dword) { return BdaDirectImmediate(static_cast<std::int32_t>(offset + dword * 4u)); };
+        for (std::uint32_t dword = first; dword <= last; ++dword) {
+            if (!isUsed(dword)) continue;
+            if (!folded(dword)) addresses[dword] = dwordAddress(dword);
+            const auto read = state.module.AllocateId();
+            const bool hinted = hint != nullptr && folded(dword);
+            const auto zero = ConstantU32(state, 0u);
+            const auto distance = static_cast<std::uint32_t>(static_cast<std::int32_t>(offset + dword * 4u) - (hinted ? hint->immediate : 0));
+            const auto place = hinted && distance != 0u ? Binary(state, spv::OpIAdd, TypeU32(state), hint->offset, ConstantU32(state, distance)) : hinted ? hint->offset : zero;
+            state.module.AddFunction(spv::OpFunctionCall, TypeU32Vector(state, 2), read, function, folded(dword) ? address : addresses[dword], ConstantU32(state, folded(dword) ? offset + dword * 4u : 0u), instruction, hinted ? hint->delta : BdaConstant(state, 0u), hinted ? hint->bytes : zero, hinted ? hint->flags : zero, hinted ? hint->limit : zero, place);
+            values[dword] = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), values[dword], read, 0u);
+            if (stop != 1u) continue;
+            const auto stopped = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stopped, read, 1u);
+            StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, TypeBool(state), stopped, ConstantU32(state, 0u)));
+        }
+        return values;
+    }
     addresses[first] = dwordAddress(first);
     if (state.bdaProbeFunction == 0) {
         readBytes(values);
@@ -629,8 +839,39 @@ const BdaSharedRead* SharedBdaRead(const SpirvEmitterState& state, const IrValue
     return found != state.bdaSharedReads.end() ? &found->second : nullptr;
 }
 
+std::optional<BdaDirectKey> BdaDirectKeyOf(const IrValue& inst, const MemoryInfo& mem) {
+    if (inst.ArgumentCount() < 3u || inst.Argument(1) == nullptr) return std::nullopt;
+    const bool scalar = mem.kind == ResourceKind::ScalarAddress;
+    const IrValue* low = inst.Argument(1)->Resolve();
+    if (mem.addressIsFull) {
+        if (inst.Argument(2) == nullptr) return std::nullopt;
+        return BdaDirectKey{nullptr, inst.Argument(2)->Resolve(), low, scalar};
+    }
+    const IrValue* handle = inst.Argument(0) != nullptr ? inst.Argument(0)->Resolve() : nullptr;
+    if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u || handle->Argument(0) == nullptr || handle->Argument(1) == nullptr) return std::nullopt;
+    return BdaDirectKey{handle->Argument(0)->Resolve(), handle->Argument(1)->Resolve(), low, scalar};
+}
+
 void ResetBdaSharedBases(SpirvEmitterState& state, const IrBlock* block) {
     state.bdaCpuBaseChecks.clear();
+    state.bdaDirectHints.clear();
+    // Two lanes per invocation would need a leaf for each.
+    if (state.bdaDirect && state.laneCount == 1u && !BdaByteReadsForced()) {
+        const auto& memory = state.program.Resources().memoryInfo;
+        for (const auto* inst : block->Instructions()) {
+            std::uint32_t dwords = 0;
+            switch (inst->Opcode()) {
+                case IrOpcode::LoadAddressU32: dwords = 1u; break;
+                case IrOpcode::LoadAddressU32x2: dwords = 2u; break;
+                case IrOpcode::LoadAddressU32x3: dwords = 3u; break;
+                case IrOpcode::LoadAddressU32x4: dwords = 4u; break;
+                default: continue;
+            }
+            const auto index = inst->Flags<MemoryFlags>().index;
+            if (index >= memory.size()) continue;
+            if (const auto key = BdaDirectKeyOf(*inst, memory[index])) state.bdaDirectHints[*key].reads += static_cast<std::uint32_t>(std::popcount(UsedBdaDwords(*inst, dwords)));
+        }
+    }
     const auto found = state.bdaSharedBaseResets.find(block);
     if (found == state.bdaSharedBaseResets.end()) return;
     for (const auto base : found->second) state.module.AddFunction(spv::OpStore, state.bdaSharedBases[base].variable, BdaConstant(state, 0u));
@@ -640,7 +881,7 @@ void FindBdaSharedBases(SpirvEmitterState& state) {
     static const bool refused = std::getenv("APS5_NO_BDA_SHARED_BASE") != nullptr;
     const auto& program = state.program;
     // Two lanes per invocation would need a translation for each.
-    if (refused || !program.Info().usesDma || state.laneCount != 1u || BdaByteReadsForced()) return;
+    if (refused || state.bdaDirect || !program.Info().usesDma || state.laneCount != 1u || BdaByteReadsForced()) return;
     const auto groups = CollectBdaBaseGroups(program);
     std::unordered_map<const IrValue*, const IrBlock*> definedIn;
     for (const auto* block : program.BlockOrder()) {

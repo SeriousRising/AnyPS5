@@ -1,8 +1,10 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -26,27 +28,22 @@ std::uint32_t BdaLoadWord(SpirvEmitterState& state, std::uint32_t index) {
     return value;
 }
 
+std::uint32_t BdaAddressFromWords(SpirvEmitterState& state, std::uint32_t low, std::uint32_t high) {
+    const auto words = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), words, low, high);
+    return Unary(state, spv::OpBitcast, TypeScalarU64(state), words);
+}
+
 std::uint32_t BdaLoadAddress(SpirvEmitterState& state, std::uint32_t index) {
     const auto low = Unary(state, spv::OpUConvert, TypeScalarU64(state), BdaLoadWord(state, index));
     const auto high = Unary(state, spv::OpUConvert, TypeScalarU64(state), BdaLoadWord(state, Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, 1u))));
     return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), low, Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state), high, BdaConstant(state, 32u)));
 }
 
-void DefineBdaFaultFunction(SpirvEmitterState& state) {
-    const auto u32 = TypeU32(state);
-    const auto u64 = TypeScalarU64(state);
-    state.bdaFaultFunction = state.module.AllocateId();
-    state.module.AddName(state.bdaFaultFunction, "record_bda_fault");
-    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.bdaFaultFunction, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, TypeVoid(state), u32, u64, u32, u32));
-    const auto reason = state.module.AllocateId();
-    const auto address = state.module.AllocateId();
-    const auto bytes = state.module.AllocateId();
-    const auto instruction = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionParameter, u32, reason);
-    state.module.AddFunction(spv::OpFunctionParameter, u64, address);
-    state.module.AddFunction(spv::OpFunctionParameter, u32, bytes);
-    state.module.AddFunction(spv::OpFunctionParameter, u32, instruction);
-    EmitLabel(state, state.module.AllocateId());
+namespace {
+
+// Publishes a fault in the fault buffer, unless another invocation's is there already.
+void EmitBdaFaultPublication(SpirvEmitterState& state, std::uint32_t reason, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
     const auto pointer = BdaWord(state, state.faultBufferVariable, ConstantU32(state, 0u));
     const auto previous = state.module.AllocateId();
     const auto scope = ConstantU32(state, spv::ScopeDevice);
@@ -68,8 +65,87 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
         const auto release = ConstantU32(state, spv::MemorySemanticsReleaseMask | spv::MemorySemanticsUniformMemoryMask);
         state.module.AddFunction(spv::OpAtomicStore, pointer, scope, release, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultState::Ready)));
     });
+}
+
+}
+
+// A program for the direct table keeps its first fault in Private variables and publishes it where
+// the invocation ends (PublishBdaFault): every helper call is inlined, and the publication at each
+// read site was most of what a site cost. The fault published is the one that was recorded first,
+// as before; another invocation's may now reach the buffer earlier.
+void DefineBdaFaultFunction(SpirvEmitterState& state) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    state.bdaFaultFunction = state.module.AllocateId();
+    state.module.AddName(state.bdaFaultFunction, "record_bda_fault");
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.bdaFaultFunction, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, TypeVoid(state), u32, u64, u32, u32));
+    const std::array<std::uint32_t, 4> types{u32, u64, u32, u32};
+    std::array<std::uint32_t, 4> parameters{};
+    for (std::size_t index = 0; index < parameters.size(); ++index) {
+        parameters[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
+    }
+    EmitLabel(state, state.module.AllocateId());
+    if (!state.bdaDirect) {
+        EmitBdaFaultPublication(state, parameters[0], parameters[1], parameters[2], parameters[3]);
+        state.module.AddFunction(spv::OpReturn);
+        state.module.AddFunction(spv::OpFunctionEnd);
+        return;
+    }
+    for (std::size_t index = 0; index < parameters.size(); ++index) state.bdaPendingFault[index] = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, types[index]), spv::StorageClassPrivate);
+    const auto load = [&](std::size_t index) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, types[index], value, state.bdaPendingFault[index]);
+        return value;
+    };
+    EmitIfCondition(state, Binary(state, spv::OpIEqual, TypeBool(state), load(0), ConstantU32(state, 0u)), [&] {
+        for (std::size_t index = 0; index < parameters.size(); ++index) state.module.AddFunction(spv::OpStore, state.bdaPendingFault[index], parameters[index]);
+    });
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
+    state.bdaPublishFunction = state.module.AllocateId();
+    state.module.AddName(state.bdaPublishFunction, "publish_bda_fault");
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.bdaPublishFunction, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, TypeVoid(state)));
+    EmitLabel(state, state.module.AllocateId());
+    const auto recorded = load(0);
+    EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), recorded, ConstantU32(state, 0u)), [&] {
+        // A direct dword read left its base address, immediate and instruction (BdaDirectReadFault):
+        // what failed is worked out here, once, with a walk of its own.
+        const auto boolean = TypeBool(state);
+        const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+        const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+        const auto both = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); };
+        const auto either = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalOr, boolean, left, right); };
+        const auto reasonOf = [&](BdaAbi::FaultReason reason) { return constant(static_cast<std::uint32_t>(reason)); };
+        const auto base = load(1);
+        const auto immediate = load(2);
+        const auto offsetBy = Unary(state, spv::OpSConvert, u64, immediate);
+        const auto address = binary(spv::OpIAdd, u64, base, offsetBy);
+        const auto leaf = EmitBdaDirectWalk(state, address);
+        const auto room = Select(state, u32, binary(spv::OpULessThan, boolean, leaf.offset, leaf.bytes), binary(spv::OpISub, u32, leaf.bytes, leaf.offset), constant(0u));
+        // A wrapped address is below a positive immediate, and at or above 2^64 minus a negative one's size.
+        const auto wrapped = both(binary(spv::OpINotEqual, boolean, immediate, constant(0u)), binary(spv::OpLogicalNotEqual, boolean, binary(spv::OpSLessThan, boolean, immediate, constant(0u)), binary(spv::OpULessThan, boolean, address, offsetBy)));
+        const auto overflow = binary(spv::OpUGreaterThan, boolean, address, BdaConstant(state, std::numeric_limits<std::uint64_t>::max() - 4u));
+        const auto invalid = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, invalid, state.bdaTableInvalid);
+        const auto broken = either(overflow, binary(spv::OpINotEqual, boolean, invalid, constant(0u)));
+        const auto split = both(binary(spv::OpINotEqual, boolean, room, constant(0u)), binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, leaf.flags, constant(BdaAbi::DirectFollowed)), constant(0u)));
+        // In the order the byte path met them: the immediate, the dword's wrap, the table, the bytes.
+        auto reason = Select(state, u32, split, reasonOf(BdaAbi::FaultReason::Split), reasonOf(BdaAbi::FaultReason::Unmapped));
+        reason = Select(state, u32, broken, reasonOf(BdaAbi::FaultReason::InvalidTable), reason);
+        reason = Select(state, u32, either(wrapped, overflow), reasonOf(BdaAbi::FaultReason::Overflow), reason);
+        const auto whole = either(broken, split);
+        const auto failed = Select(state, u64, wrapped, base, binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, Select(state, u32, whole, constant(0u), room))));
+        const auto bytes = Select(state, u32, wrapped, constant(0u), Select(state, u32, either(overflow, both(split, Unary(state, spv::OpLogicalNot, boolean, broken))), constant(4u), constant(1u)));
+        const auto direct = binary(spv::OpIEqual, boolean, recorded, constant(BdaDirectReadFault));
+        EmitBdaFaultPublication(state, Select(state, u32, direct, reason, recorded), Select(state, u64, direct, failed, base), Select(state, u32, direct, bytes, immediate), load(3));
+    });
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+}
+
+void PublishBdaFault(SpirvEmitterState& state) {
+    if (state.bdaPublishFunction != 0u) state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaPublishFunction);
 }
 
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
@@ -102,6 +178,7 @@ void EndBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
     state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
     state.module.AddFunction(spv::OpBranchConditional, condition, failed, next);
     EmitLabel(state, failed);
+    PublishBdaFault(state);
     if (state.bdaStopValue != 0) {
         state.module.AddFunction(spv::OpReturnValue, state.bdaStopValue);
     } else {

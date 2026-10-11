@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvBda.hpp"
+#include "Optimization/BdaSharedBases.hpp"
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
@@ -165,47 +166,63 @@ std::uint32_t LoadSubword(SpirvValueEmitContext& ctx, const IrValue& inst, const
     });
 }
 
-std::uint32_t ConstantDeviceAddress(SpirvEmitterState& state, std::uint64_t value) {
-    return state.module.Constant(spv::OpConstant, TypeScalarU64(state), static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(value >> 32u));
-}
-
-std::uint32_t DeviceAddressFromWords(SpirvEmitterState& state, std::uint32_t low, std::uint32_t high) {
-    const auto low64 = Unary(state, spv::OpUConvert, TypeScalarU64(state), low);
-    const auto high64 = Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state), Unary(state, spv::OpUConvert, TypeScalarU64(state), high), ConstantDeviceAddress(state, 32u));
-    return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), low64, high64);
-}
-
-std::uint32_t GuestAddressBase(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
+// `checked` false leaves out the fault of a sum that wraps: the value is the same.
+std::uint32_t GuestAddressBase(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, bool checked = true) {
     auto& state = ctx.state;
     auto low = ctx.Arg(inst, 1);
     if (mem.kind == ResourceKind::ScalarAddress) {
         low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, ~3u));
     }
     if (mem.addressIsFull) {
-        return DeviceAddressFromWords(state, low, ctx.Arg(inst, 2));
+        return BdaAddressFromWords(state, low, ctx.Arg(inst, 2));
     }
     const IrValue* argument = inst.Argument(0);
     const IrValue* handle = argument != nullptr ? argument->Resolve() : nullptr;
     if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u) {
         ctx.Fail(inst, "has no address base pair");
     }
-    const auto base = DeviceAddressFromWords(state, ctx.Arg(*handle, 0), ctx.Arg(*handle, 1));
-    return AddBdaAddress(ctx, inst, base, Unary(state, spv::OpUConvert, TypeScalarU64(state), low), false);
+    const auto base = BdaAddressFromWords(state, ctx.Arg(*handle, 0), ctx.Arg(*handle, 1));
+    const auto offset = Unary(state, spv::OpUConvert, TypeScalarU64(state), low);
+    return checked ? AddBdaAddress(ctx, inst, base, offset, false) : Binary(state, spv::OpIAdd, TypeScalarU64(state), base, offset);
 }
 
-std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
-    const auto address = GuestAddressBase(ctx, inst, mem);
+std::int32_t GuestImmediate(const MemoryInfo& mem) {
     auto immediate = static_cast<std::int32_t>(mem.offset);
     if (mem.kind == ResourceKind::ScalarAddress) {
         immediate = static_cast<std::int32_t>(static_cast<std::uint32_t>(immediate) & ~3u);
     }
-    return AddBdaImmediate(ctx, inst, address, immediate);
+    return immediate;
+}
+
+std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
+    return AddBdaImmediate(ctx, inst, GuestAddressBase(ctx, inst, mem), GuestImmediate(mem));
+}
+
+// The leaf walked ahead for the base of `inst`, a dword read of a program for the direct table whose
+// first dword lies `immediate` bytes from the base: walked here, outside the read's activity
+// condition, when the block reads the base more than once and has not walked for it yet. The walk
+// faults nothing and loads only the table, so it may run for an address no lane reads. Null when
+// the read walks for itself.
+const BdaDirectHint* DirectHint(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::int32_t immediate) {
+    auto& state = ctx.state;
+    const auto key = BdaDirectKeyOf(inst, mem);
+    const auto found = key.has_value() ? state.bdaDirectHints.find(*key) : state.bdaDirectHints.end();
+    if (found == state.bdaDirectHints.end() || found->second.reads < 2u) return nullptr;
+    auto& hint = found->second;
+    if (!hint.walked) {
+        if (!BdaDirectImmediate(immediate)) return nullptr;
+        WalkBdaDirectHint(state, hint, GuestAddressBase(ctx, inst, mem, false), immediate);
+    }
+    return &hint;
 }
 
 std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t bits) {
     const auto* shared = bits == 32u ? SharedBdaRead(ctx.state, inst) : nullptr;
     const auto* translated = shared != nullptr ? EmitBdaCpuBaseCheck(ctx, shared->base) : nullptr;
+    const auto* hint = bits == 32u ? DirectHint(ctx, inst, mem, GuestImmediate(mem)) : nullptr;
     return EmitValueOrZeroIfCondition(ctx.state, ActiveArgument(ctx, inst), [&]() {
+        // A direct dword read takes its immediate apart from the base (see BdaDirectImmediate).
+        if (bits == 32u && ctx.state.bdaDirect) return EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), static_cast<std::uint32_t>(GuestImmediate(mem)), 1u, false, nullptr, hint)[0];
         if (shared == nullptr) return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
         const auto& base = ctx.state.bdaSharedBases[shared->base];
         const auto own = [&] { return EmitBdaSharedDwordReads(ctx, inst, base, shared->begin, shared->tries, GuestAddress(ctx, inst, mem), 0u, 1u); };
@@ -364,8 +381,9 @@ std::uint32_t LoadBdaWide(SpirvValueEmitContext& ctx, const IrValue& inst, const
     auto& state = ctx.state;
     const auto* shared = SharedBdaRead(state, inst);
     const auto* translated = shared != nullptr ? EmitBdaCpuBaseCheck(ctx, shared->base) : nullptr;
+    const auto* hint = DirectHint(ctx, inst, mem, static_cast<std::int32_t>(mem.offset + ExtractedBdaDwords(inst, components, false).first * 4u));
     return EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), TypeU32Composite(state, components), ConstantU32CompositeZero(state, components), [&]() {
-        if (shared == nullptr) return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components));
+        if (shared == nullptr) return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components, false, nullptr, hint));
         const auto& base = state.bdaSharedBases[shared->base];
         const auto own = [&] { return EmitBdaSharedDwordReads(ctx, inst, base, shared->begin, shared->tries, GuestAddressBase(ctx, inst, mem), mem.offset, components); };
         return ConstructU32Composite(state, components, translated != nullptr ? EmitBdaCpuBaseDwordReads(ctx, inst, base, shared->begin, components, *translated, own) : own());

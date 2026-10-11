@@ -181,7 +181,8 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     resourceTracker.Track(program);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
-    PlanBdaBases(program);
+    // A program for the direct table shares no base address.
+    if (request.target.bdaAbiVersion != BdaAbi::DirectVersion) PlanBdaBases(program);
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
 
     return program;
