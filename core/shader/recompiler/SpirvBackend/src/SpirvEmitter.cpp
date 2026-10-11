@@ -264,6 +264,9 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
+    // Debug aid: APS5_NO_BDA_RANGE_CACHE=1 searches the page table at every address lookup, as before.
+    static const bool bdaRangeCache = std::getenv("APS5_NO_BDA_RANGE_CACHE") == nullptr;
+    state.bdaRangeCache = bdaRangeCache;
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;

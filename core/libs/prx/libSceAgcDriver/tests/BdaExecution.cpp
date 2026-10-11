@@ -4,6 +4,8 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -87,6 +89,108 @@ private:
 
 }
 
+// Each sequence runs with the range cache and without it (APS5_NO_BDA_RANGE_CACHE=1 in the
+// recompiler), with and without stopping invocations: the output words, the whole fault buffer
+// (fault record and noted pages) and the data must be equal, and the cached run must give the
+// stated values and fault.
+static void RunBdaRangeCacheTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    constexpr std::uint64_t guest = 0x7fff12340000ULL;
+    constexpr std::uint32_t Sentinel = 0xdeadbeef;
+    constexpr auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer writable(context, 32, usage);
+    Buffer readOnly(context, 16, usage);
+    Require(writable.DeviceAddress() % 4u == 0u && readOnly.DeviceAddress() % 4u == 0u, "BDA range cache: the test buffers are not dword-aligned");
+    // [guest, +16) writable, [+16, +32) read-only and adjacent, a gap, [+64, +80) the writable buffer's second half.
+    const std::vector<Abi::Range> sorted{
+        {guest, guest + 16, writable.DeviceAddress(), Abi::Read | Abi::Write, 0},
+        {guest + 16, guest + 32, readOnly.DeviceAddress(), Abi::Read, 0},
+        {guest + 64, guest + 80, writable.DeviceAddress() + 16, Abi::Read | Abi::Write, 0}};
+    const auto fill = [&] {
+        for (std::size_t byte = 0; byte < writable.Bytes().size(); ++byte) writable.Bytes()[byte] = static_cast<std::byte>(byte + 1u);
+        for (std::size_t byte = 0; byte < readOnly.Bytes().size(); ++byte) readOnly.Bytes()[byte] = static_cast<std::byte>(byte + 0x81u);
+    };
+    const auto low = [](std::uint32_t byte) { return (byte + 1u) | (byte + 2u) << 8u | (byte + 3u) << 16u | (byte + 4u) << 24u; };
+    struct Expected {
+        std::vector<std::uint32_t> values;
+        Abi::FaultReason reason = static_cast<Abi::FaultReason>(0);
+        std::uint64_t address = 0;
+        std::uint32_t bytes = 0;
+        std::uint32_t step = 0;
+        // Whether the fault ends a stopping invocation: a faulting read does, a store or atomic is skipped.
+        bool ends = true;
+    };
+    struct Outcome {
+        std::vector<std::uint32_t> values;
+        std::vector<std::byte> fault;
+        std::vector<std::byte> data;
+        bool operator==(const Outcome&) const = default;
+    };
+    const auto check = [&](const std::string& name, const std::vector<Abi::Range>& ranges, std::uint32_t count, const std::vector<BdaTestStep>& steps, const Expected* expected) {
+        Buffer table(context, sizeof(Abi::Header) + ranges.size() * sizeof(Abi::Range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const Abi::Header header{Abi::Version, count, sizeof(Abi::Range), 0};
+        std::memcpy(table.Bytes().data(), &header, sizeof(header));
+        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(Abi::Range));
+        Buffer fault(context, Abi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        Buffer output(context, steps.size() * 4u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        for (const bool stops : {true, false}) {
+            const auto run = [&](bool rangeCache) {
+                fill();
+                std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+                for (std::size_t word = 0; word < steps.size(); ++word) std::memcpy(output.Bytes().data() + word * 4u, &Sentinel, 4u);
+                Pipeline pipeline(context, MakeBdaSequenceTestShader(steps, rangeCache, stops), {&table, &fault, &output});
+                pipeline.Run(1);
+                Outcome outcome{std::vector<std::uint32_t>(steps.size()), {fault.Bytes().begin(), fault.Bytes().end()}, {writable.Bytes().begin(), writable.Bytes().end()}};
+                std::memcpy(outcome.values.data(), output.Bytes().data(), steps.size() * 4u);
+                outcome.data.insert(outcome.data.end(), readOnly.Bytes().begin(), readOnly.Bytes().end());
+                return outcome;
+            };
+            const auto cached = run(true);
+            Require(cached == run(false), "BDA range cache: " + name + (stops ? " (stopping)" : " (continuing)") + " differs from the searched lookup");
+            if (expected == nullptr) continue;
+            Abi::Fault report{};
+            std::memcpy(&report, cached.fault.data(), sizeof(report));
+            const bool faults = static_cast<std::uint32_t>(expected->reason) != 0u;
+            if (faults) {
+                Require(report.state == Abi::FaultState::Ready && report.reason == expected->reason && report.address == expected->address && report.bytes == expected->bytes && report.instruction == BdaTestStepPc + expected->step, "BDA range cache: " + name + " did not publish its fault");
+            } else {
+                Require(report.state == Abi::FaultState::Empty, "BDA range cache: " + name + " published a fault");
+            }
+            Require(cached.values == (faults && stops && expected->ends ? std::vector<std::uint32_t>(steps.size(), Sentinel) : expected->values), "BDA range cache: " + name + (stops ? " (stopping)" : " (continuing)") + " produced incorrect values");
+        }
+    };
+    using Step = BdaTestStep;
+    const auto high = [](std::uint32_t byte) { return (byte + 0x81u) | (byte + 0x82u) << 8u | (byte + 0x83u) << 16u | (byte + 0x84u) << 24u; };
+    Expected expected{{low(0), low(16), low(4), low(20), high(0), low(8)}};
+    check("reads alternating between ranges", sorted, 3, {{Step::Read, guest}, {Step::Read, guest + 64}, {Step::Read, guest + 4}, {Step::Read, guest + 68}, {Step::Read, guest + 16}, {Step::Read, guest + 8}}, &expected);
+    expected = {{high(4), 0}, Abi::FaultReason::Unmapped, guest + 32, 1, 1};
+    check("a read just past the cached range's end", sorted, 3, {{Step::Read, guest + 20}, {Step::Read, guest + 32}}, &expected);
+    expected = {{high(8), high(14) & 0xffffu, high(12)}, Abi::FaultReason::Unmapped, guest + 32, 1, 1};
+    check("a read across the cached range's end into the gap", sorted, 3, {{Step::Read, guest + 24}, {Step::Read, guest + 30}, {Step::Read, guest + 28}}, &expected);
+    expected = {{high(0), 0x55u, high(0)}, Abi::FaultReason::Permission, guest + 20, 4, 1, false};
+    check("a store into a read-only range after a cached read", sorted, 3, {{Step::Read, guest + 16}, {Step::Store, guest + 20, 0x55u}, {Step::Read, guest + 16}}, &expected);
+    expected = {{high(4), 0, high(4)}, Abi::FaultReason::Permission, guest + 24, 4, 1, false};
+    check("an atomic in a read-only range after a cached read", sorted, 3, {{Step::Read, guest + 20}, {Step::AtomicAdd, guest + 24, 1u}, {Step::Read, guest + 20}}, &expected);
+    expected = {{low(0), (low(14) & 0xffffu) | (high(0) & 0xffffu) << 16u, high(4), low(12)}};
+    check("a dword straddling two ranges", sorted, 3, {{Step::Read, guest}, {Step::Read, guest + 14}, {Step::Read, guest + 20}, {Step::Read, guest + 12}}, &expected);
+    expected = {{low(0), low(1), low(7), high(2), low(4)}};
+    check("unaligned dwords", sorted, 3, {{Step::Read, guest}, {Step::Read, guest + 1}, {Step::Read, guest + 7}, {Step::Read, guest + 18}, {Step::Read, guest + 4}}, &expected);
+    expected = {{low(4), 0xa5a5a5a5u, low(8), 0xa5a5a5a5u, low(8) + 3u, low(20), low(8) + 3u}};
+    check("a store and an atomic after a cached read", sorted, 3, {{Step::Read, guest + 4}, {Step::Store, guest + 4, 0xa5a5a5a5u}, {Step::AtomicAdd, guest + 8, 3u}, {Step::Read, guest + 4}, {Step::Read, guest + 8}, {Step::Read, guest + 68}, {Step::AtomicAdd, guest + 8, 1u}}, &expected);
+    expected = {{0, low(0)}, Abi::FaultReason::Unmapped, guest - 4, 1, 0};
+    check("reads below the first range", sorted, 3, {{Step::Read, guest - 4}, {Step::Read, guest}}, &expected);
+    expected = {{0, 0}, Abi::FaultReason::InvalidTable, guest, 1, 0};
+    check("an invalid table", sorted, 2, {{Step::Read, guest}, {Step::Read, guest + 4}}, &expected);
+    // The search does not require sorted begins; the cache keeps the bounds of the steps it took, so
+    // it must agree on any table.
+    for (const auto& order : {std::array{2u, 0u, 1u}, std::array{1u, 2u, 0u}, std::array{2u, 1u, 0u}, std::array{0u, 2u, 1u}}) {
+        const std::vector<Abi::Range> unsorted{sorted[order[0]], sorted[order[1]], sorted[order[2]]};
+        std::vector<Step> steps;
+        for (const auto offset : {0u, 64u, 16u, 4u, 68u, 20u, 14u, 30u, 76u, 12u, 40u, 8u}) steps.push_back({Step::Read, guest + offset});
+        check("an unsorted table", unsorted, 3, steps, nullptr);
+    }
+}
+
 void RunBdaExecutionTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
@@ -165,4 +269,5 @@ void RunBdaExecutionTests(const Context& context) {
     }
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
+    RunBdaRangeCacheTests(context);
 }

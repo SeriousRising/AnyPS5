@@ -26,6 +26,8 @@
 #include <iostream>
 #include <functional>
 #include <map>
+#include <set>
+#include <cstdlib>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -2514,6 +2516,8 @@ void verifyBdaInlinedSize() {
     std::uint32_t current = 0u;
     std::uint32_t entry = 0u;
     std::size_t readSites = 0;
+    std::set<std::uint32_t> privateVariables;
+    std::set<std::uint32_t> keptByLookup;
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto length = words[cursor] >> 16u;
         require(length != 0 && length <= words.size() - cursor, "BDA inlined size: truncated SPIR-V instruction");
@@ -2521,6 +2525,8 @@ void verifyBdaInlinedSize() {
         if (op == spv::OpName) names[words[cursor + 1]] = reinterpret_cast<const char*>(&words[cursor + 2]);
         if (op == spv::OpEntryPoint) entry = words[cursor + 2];
         if (op == spv::OpFunction) current = words[cursor + 2];
+        if (op == spv::OpVariable && current == 0u && words[cursor + 3] == spv::StorageClassPrivate) privateVariables.insert(words[cursor + 2]);
+        if (op == spv::OpLoad && names[current] == "lookup_bda" && privateVariables.contains(words[cursor + 3])) keptByLookup.insert(words[cursor + 3]);
         if (current != 0u) {
             ++functions[current].instructions;
             if (op == spv::OpFunctionCall) {
@@ -2540,6 +2546,9 @@ void verifyBdaInlinedSize() {
         return total;
     };
     const auto total = measure(entry);
+    // The range cache is seven per-invocation variables; the optimizer must leave them Private (as
+    // locals of lookup_bda they would be lost between calls and the cache would never hit).
+    require(keptByLookup.size() == (std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : 7u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
     require(total * 8u <= InlinedBefore, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than an eighth of the " + std::to_string(InlinedBefore) + " they took").c_str());
 }
