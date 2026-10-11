@@ -3337,6 +3337,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     const auto timingKey = record.programAddress != 0 ? record.programAddress : record.shader->program->variantId;
     if (Graphics::Recorder::GpuTimingEnabled() && !Graphics::Recorder::HasAddressSites(timingKey)) Graphics::Recorder::NoteAddressSites(timingKey, Graphics::ProgramAddressSites(record.shader->program->spirv.Words()));
+    if (Graphics::Recorder::GpuTimingEnabled()) {
+        if (!Graphics::Recorder::HasComputeShape(timingKey)) Graphics::Recorder::NoteComputeShape(timingKey, Graphics::ProgramComputeShape(record.shader->program->spirv.Words()));
+        if (argumentImport != nullptr) Graphics::Recorder::NoteDispatch(timingKey, 0, 0, 0);
+        else Graphics::Recorder::NoteDispatch(timingKey, record.x, record.y, record.z);
+    }
     const auto gpuTiming = recorder.BeginGpuTiming(timingKey);
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);

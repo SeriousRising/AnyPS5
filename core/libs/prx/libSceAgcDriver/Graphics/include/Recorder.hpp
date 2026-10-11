@@ -496,6 +496,25 @@ public:
     // false when the key has none recorded yet.
     static bool HasAddressSites(std::uint64_t key);
     static void NoteAddressSites(std::uint64_t key, const AddressSites& sites);
+    // What a compute module does, for the [gputime-compute] line (see ProgramComputeShape): its
+    // local size and, outside the address-based access helpers, its loops, texel fetches, samples
+    // and gathers, storage image reads and writes, and atomics.
+    struct ComputeShape {
+        std::array<std::uint32_t, 3> localSize{};
+        std::uint32_t loops = 0;
+        std::uint32_t fetches = 0;
+        std::uint32_t samples = 0;
+        std::uint32_t imageReads = 0;
+        std::uint32_t imageWrites = 0;
+        std::uint32_t atomics = 0;
+        auto operator<=>(const ComputeShape&) const = default;
+    };
+    // The shape of the compute program timed under `key`; false when the key has none recorded yet.
+    static bool HasComputeShape(std::uint64_t key);
+    static void NoteComputeShape(std::uint64_t key, const ComputeShape& shape);
+    // One dispatch of the program timed under `key` over x*y*z workgroups (zeros: an indirect one,
+    // whose counts the CPU does not know), for the same line.
+    static void NoteDispatch(std::uint64_t key, std::uint32_t x, std::uint32_t y, std::uint32_t z);
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
