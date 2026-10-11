@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -235,9 +236,71 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 }
 
+// BdaResources::TranslateHull against the lookup of one byte, done as lookup_bda does it: a hull the
+// CPU translates must be one whose every byte the shader would find in the same range, at the
+// device address the CPU gives.
+void testHullTranslation() {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    using Ranges = std::vector<Abi::Range>;
+    const auto byte = [](const Ranges& ranges, std::uint64_t address) -> std::uint64_t {
+        std::size_t low = 0;
+        std::size_t high = ranges.size();
+        while (low < high) {
+            const auto midpoint = low + (high - low) / 2;
+            if (address < ranges[midpoint].begin) high = midpoint;
+            else low = midpoint + 1;
+        }
+        if (low == 0) return 0;
+        const auto& range = ranges[low - 1];
+        if (range.reserved != 0 || range.begin >= range.end || address >= range.end || (range.permissions & Abi::Read) == 0 || range.deviceAddress == 0) return 0;
+        return address + (range.deviceAddress - range.begin);
+    };
+    const Ranges sorted{{0x1000, 0x2000, 0x10000, Abi::Read, 0}, {0x2000, 0x3000, 0x40000, Abi::Read | Abi::Write, 0}, {0x5000, 0x6000, 0x50002, Abi::Read, 0}, {0x6000, 0x7000, 0x60000, Abi::Write, 0}, {0x7000, 0x8000, 0, Abi::Read, 0}, {0x8000, 0x9000, 0x70000, Abi::Read, 1}};
+    const auto translate = [&](const Ranges& ranges, std::uint64_t address, std::uint32_t bytes) { return BdaResources::TranslateHull(ranges, address, bytes); };
+    Require(translate(sorted, 0x1000, 0x1000) == 0x10000 && translate(sorted, 0x1ff0, 16) == 0x10ff0 && translate(sorted, 0x2004, 4) == 0x40004, "a hull inside one range must translate to its device address");
+    Require(translate(sorted, 0x1ff0, 20) == 0 && translate(sorted, 0x2ffc, 8) == 0, "a hull across a range's end must not translate, into the next range or into a gap");
+    Require(translate(sorted, 0x3000, 4) == 0 && translate(sorted, 0x800, 4) == 0 && translate(sorted, 0x9000, 4) == 0, "a hull in a gap, below every range or above the last must not translate");
+    Require(translate(sorted, 0x5000, 4) == 0 && translate(sorted, 0x6000, 4) == 0 && translate(sorted, 0x7000, 4) == 0 && translate(sorted, 0x8000, 4) == 0, "a hull at an unaligned device address, in a range that cannot be read, has no device address or has invalid words must not translate");
+    Require(translate(sorted, 0x1000, 0) == 0 && translate(sorted, ~std::uint64_t{0} - 1u, 4) == 0 && translate({}, 0x1000, 4) == 0, "an empty or wrapping hull, or an empty table, must not translate");
+    const Ranges wrapping{{0x1000, 0x2000, ~std::uint64_t{0} - 0x7ffu, Abi::Read, 0}};
+    Require(translate(wrapping, 0x1000, 0x800) == 0 && translate(wrapping, 0x1900, 4) == 0, "a hull whose device addresses wrap must not translate");
+    std::uint64_t state = 0x243f6a8885a308d3ull;
+    const auto next = [&] {
+        state ^= state << 13u;
+        state ^= state >> 7u;
+        state ^= state << 17u;
+        return state;
+    };
+    std::size_t accepted = 0;
+    for (std::uint32_t table = 0; table < 200; ++table) {
+        Ranges ranges;
+        for (std::uint64_t begin = 0x1000; ranges.size() < 3u + table % 9u; begin += 0x100u * (1u + next() % 4u)) {
+            const auto size = 0x40u * (1u + next() % 8u);
+            ranges.push_back({begin, begin + size, 0x100000u * (ranges.size() + 1u) + 4u * (next() % 16u), next() % 8u == 0 ? Abi::Write : Abi::Read, 0});
+        }
+        // Every other table is not sorted: the search then selects what its steps select.
+        if (table % 2u == 1u) std::swap(ranges[next() % ranges.size()], ranges[next() % ranges.size()]);
+        for (std::uint32_t hull = 0; hull < 400; ++hull) {
+            const auto address = 0xf00u + 4u * (next() % 0x400u);
+            const auto bytes = 4u * static_cast<std::uint32_t>(1u + next() % 0x30u);
+            const auto device = translate(ranges, address, bytes);
+            bool same = byte(ranges, address) != 0;
+            for (std::uint32_t offset = 0; offset < bytes && same; ++offset) same = byte(ranges, address + offset) == byte(ranges, address) + offset;
+            if (device == 0) {
+                Require(table % 2u == 1u || !same, "a hull in one readable range of a sorted table did not translate");
+                continue;
+            }
+            ++accepted;
+            Require(same && device == byte(ranges, address), "a translated hull has a byte that the lookup finds elsewhere");
+        }
+    }
+    Require(accepted > 1000, "too few hulls translated to compare");
+}
+
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
+    testHullTranslation();
     alignas(64) std::array<std::uint32_t, 16> guest{};
     guest[0] = 123;
     const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
