@@ -30,7 +30,8 @@ std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst);
 // A flagged invocation must leave no trace, so this holds only for one-lane pixel and compute
 // programs whose effects are all suppressed for it (address-based stores and atomics, void buffer
 // and image stores) or discarded with it (pixel exports), and whose only views of other invocations
-// are a ballot, where a flagged invocation counts as absent, and a DPP operand: one that skips
+// are a ballot, where a flagged invocation counts as absent, v_readfirstlane_b32, which takes its
+// lane from such a ballot, and a DPP operand: one that skips
 // inactive lanes reads zero from a flagged lane, as it did from one that had ended, and a
 // fetch-inactive one reads what the flagged lane computed, where a lane that had ended gave nothing
 // defined.
