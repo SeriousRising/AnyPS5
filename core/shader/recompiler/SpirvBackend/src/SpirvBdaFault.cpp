@@ -3,8 +3,10 @@
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ShaderRecompiler {
 
@@ -160,13 +162,21 @@ bool BdaStopCanBeDeferred(const SpirvEmitterState& state) {
     if (perSite || !program.Info().usesDma || !state.bdaStopsInvocations || (stage != IrShaderStage::Pixel && stage != IrShaderStage::Compute)) return false;
     // APS5_TRACE_BDA=1 names what keeps a program on one stop per read site.
     static const bool traced = std::getenv("APS5_TRACE_BDA") != nullptr;
-    const auto refuse = [&](const char* reason) {
-        if (traced) std::fprintf(stderr, "[gpu] shader 0x%llx stage %u ends a faulting invocation at each address read: %s\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(stage), reason);
-        return false;
+    // Untraced, the first reason ends the search; traced, the line names every one, so that a program
+    // is not found refused for the next reason once the first is lifted.
+    std::set<std::string> reasons;
+    const auto refuse = [&](std::string_view reason) { reasons.emplace(reason); };
+    const auto refused = [&] {
+        if (reasons.empty()) return false;
+        std::string text;
+        for (const auto& reason : reasons) text += (text.empty() ? "" : ", ") + reason;
+        if (traced) std::fprintf(stderr, "[gpu] shader 0x%llx stage %u ends a faulting invocation at each address read: %s\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(stage), text.c_str());
+        return true;
     };
-    if (state.laneCount != 1u) return refuse("two lanes per invocation");
+    if (state.laneCount != 1u) refuse("two lanes per invocation");
     for (const auto* block : program.BlockOrder()) {
         for (const auto* instruction : block->Instructions()) {
+            if (!traced && !reasons.empty()) return false;
             const auto opcode = instruction->Opcode();
             switch (opcode) {
                 case IrOpcode::DppMoveU32:
@@ -178,7 +188,8 @@ bool BdaStopCanBeDeferred(const SpirvEmitterState& state) {
                 case IrOpcode::SwizzleU32:
                 case IrOpcode::PermuteU32:
                 case IrOpcode::BpermuteU32:
-                    return refuse(std::string(IrOpcodeName(opcode)).c_str());
+                    refuse(IrOpcodeName(opcode));
+                    continue;
                 default:
                     break;
             }
@@ -214,14 +225,14 @@ bool BdaStopCanBeDeferred(const SpirvEmitterState& state) {
                     continue;
                 case IrOpcode::Discard:
                 case IrOpcode::SetAttribute:
-                    if (stage == IrShaderStage::Pixel) continue;
-                    return refuse(std::string(IrOpcodeName(opcode)).c_str());
+                    if (stage != IrShaderStage::Pixel) refuse(IrOpcodeName(opcode));
+                    continue;
                 default:
-                    return refuse(std::string(IrOpcodeName(opcode)).c_str());
+                    refuse(IrOpcodeName(opcode));
             }
         }
     }
-    return true;
+    return !refused();
 }
 
 }
