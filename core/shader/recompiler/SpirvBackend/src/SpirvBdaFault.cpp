@@ -155,6 +155,11 @@ void EmitUnlessBdaStopped(SpirvEmitterState& state, const std::function<void()>&
     EmitIfCondition(state, UnlessBdaStopped(state, ConstantBool(state, true)), emit);
 }
 
+bool BdaStoppedInvocationSkips(const IrValue& instruction) {
+    const auto opcode = instruction.Opcode();
+    return instruction.Type() == IrType::Void && (BufferAccessOf(opcode) == BufferAccess::Write || ImageOpcodeInfoOf(opcode).access == ImageAccess::Write || SharedAccessOf(opcode) == SharedAccess::Write);
+}
+
 bool BdaStopCanBeDeferred(const SpirvEmitterState& state) {
     static const bool perSite = std::getenv("APS5_BDA_STOP_PER_SITE") != nullptr;
     const auto& program = state.program;
@@ -191,7 +196,7 @@ bool BdaStopCanBeDeferred(const SpirvEmitterState& state) {
                     break;
             }
             if (!IrOpcodeHasSideEffects(opcode) || AddressOpcodeInfoOf(opcode).access != AddressAccess::None) continue;
-            if (instruction->Type() == IrType::Void && (BufferAccessOf(opcode) == BufferAccess::Write || ImageOpcodeInfoOf(opcode).access == ImageAccess::Write)) continue;
+            if (BdaStoppedInvocationSkips(*instruction)) continue;
             switch (opcode) {
                 case IrOpcode::SetRegister:
                 case IrOpcode::Branch:

@@ -804,8 +804,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
                 // The stores BdaStopCanBeDeferred counts on being skipped; address-based ones are
                 // refused by their lookup.
-                const bool stores = inst->Type() == IrType::Void && (BufferAccessOf(inst->Opcode()) == BufferAccess::Write || ImageOpcodeInfoOf(inst->Opcode()).access == ImageAccess::Write);
-                if (stores) EmitUnlessBdaStopped(state, [&] { EmitStructuredInstruction(lane, functionState, *inst); });
+                if (BdaStoppedInvocationSkips(*inst)) EmitUnlessBdaStopped(state, [&] { EmitStructuredInstruction(lane, functionState, *inst); });
                 else EmitStructuredInstruction(lane, functionState, *inst);
             }
         }
