@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -29,6 +30,10 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);
+// The Recorder::DrawTimingDetail traits of a fragment module, read off its instructions: a declared
+// EarlyFragmentTests mode, a DepthReplacing mode, and, in the entry point or a function some call
+// names, a kill and a store or atomic update through a buffer or image pointer (or an image write).
+std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv);
 
 struct MeshArguments {
     std::uint32_t groups;
