@@ -6,6 +6,7 @@
 #include <source_location>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -484,6 +485,31 @@ public:
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
+    // What one draw-class range rendered, for the [gputime-draws] line: the pass's target and the
+    // pixel program of the draw that began it (its variant id, SPIR-V words and traits, with the
+    // draw's depth test and depth write).
+    struct DrawTimingDetail {
+        static constexpr std::uint8_t EarlyTests = 1, WritesMemory = 2, Kills = 4, ExportsDepth = 8, TestsDepth = 16, WritesDepth = 32;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        VkFormat color = VK_FORMAT_UNDEFINED;
+        std::uint32_t colors = 0;
+        VkFormat depth = VK_FORMAT_UNDEFINED;
+        std::uint64_t pixelProgram = 0;
+        std::uint32_t pixelWords = 0;
+        std::uint8_t pixelTraits = 0;
+        auto operator<=>(const DrawTimingDetail&) const = default;
+    };
+    // One draw of the range `timing`, or of the open pass's range when it continues one.
+    void NoteTimedDraw(std::uint32_t timing, const DrawTimingDetail& detail);
+    struct DrawTimingRow {
+        DrawTimingDetail detail;
+        std::uint64_t passes = 0;
+        std::uint64_t draws = 0;
+        double ms = 0;
+    };
+    // The rows gathered since the last [gputime] report.
+    static std::vector<DrawTimingRow> DrawGpuTimes();
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
@@ -555,6 +581,12 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        struct TimedDraw {
+            std::uint32_t index;
+            DrawTimingDetail detail;
+            std::uint32_t draws;
+        };
+        std::vector<TimedDraw> timedDraws;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;

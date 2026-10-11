@@ -1766,6 +1766,7 @@ std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
+std::map<Recorder::DrawTimingDetail, Recorder::DrawTimingRow> timingDraws;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -1954,6 +1955,75 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+void Recorder::NoteTimedDraw(std::uint32_t timing, const DrawTimingDetail& detail) {
+    if (open == nullptr) return;
+    const auto index = timing != NoTiming ? timing : open->renderPass.timing;
+    if (index == NoTiming) return;
+    auto& draws = open->timedDraws;
+    if (!draws.empty() && draws.back().index == index) ++draws.back().draws;
+    else draws.push_back({index, detail, 1});
+}
+
+std::vector<Recorder::DrawTimingRow> Recorder::DrawGpuTimes() {
+    std::lock_guard lock(timingMutex);
+    std::vector<DrawTimingRow> rows;
+    for (const auto& [detail, row] : timingDraws) rows.push_back(row);
+    return rows;
+}
+
+namespace {
+
+// Under timingMutex: the draw class's GPU time by target and by pixel program, largest first.
+void reportDrawTimes(double perPresent) {
+    if (timingDraws.empty()) return;
+    using Detail = Recorder::DrawTimingDetail;
+    using Row = Recorder::DrawTimingRow;
+    const auto table = [&](const std::function<Detail(const Detail&)>& part, std::size_t limit, const std::function<std::string(const Detail&)>& name) {
+        std::map<Detail, Row> rows;
+        for (const auto& [detail, row] : timingDraws) {
+            auto& total = rows[part(detail)];
+            total.passes += row.passes;
+            total.draws += row.draws;
+            total.ms += row.ms;
+        }
+        std::vector<std::pair<Detail, Row>> sorted(rows.begin(), rows.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        std::string line;
+        double restMs = 0;
+        for (std::size_t i = 0; i < sorted.size(); ++i) {
+            if (i >= limit) {
+                restMs += sorted[i].second.ms;
+                continue;
+            }
+            char text[96];
+            std::snprintf(text, sizeof(text), " x%llu/%llu %.1fms (%.2f)", static_cast<unsigned long long>(sorted[i].second.passes), static_cast<unsigned long long>(sorted[i].second.draws), sorted[i].second.ms, sorted[i].second.ms * perPresent);
+            line += " [" + name(sorted[i].first) + text + "]";
+        }
+        if (sorted.size() > limit) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " [%zu others %.1fms]", sorted.size() - limit, restMs);
+            line += text;
+        }
+        return line;
+    };
+    const auto targets = table([](const Detail& detail) { return Detail{detail.width, detail.height, detail.color, detail.colors, detail.depth}; }, 12, [](const Detail& detail) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%ux%u color %dx%u depth %d", detail.width, detail.height, static_cast<int>(detail.color), detail.colors, static_cast<int>(detail.depth));
+        return std::string(text);
+    });
+    const auto programs = table([](const Detail& detail) { return Detail{0, 0, VK_FORMAT_UNDEFINED, 0, VK_FORMAT_UNDEFINED, detail.pixelProgram, detail.pixelWords, detail.pixelTraits}; }, 16, [](const Detail& detail) {
+        char text[96];
+        std::string traits;
+        for (std::size_t bit = 0; bit < 6; ++bit) traits += (detail.pixelTraits >> bit & 1u) != 0 ? "EWKZTD"[bit] : '-';
+        std::snprintf(text, sizeof(text), "0x%llx %uw %s", static_cast<unsigned long long>(detail.pixelProgram), detail.pixelWords, traits.c_str());
+        return std::string(text);
+    });
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime-draws] the draw class by pass (each loads and stores its attachments in the general layout), as [key xpasses/draws ms (ms per present)]; by render extent, first color VkFormat x color count and depth VkFormat:%s", targets.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("; by the pixel program of the pass's first draw (variant id, SPIR-V words, E declares early fragment tests, W stores to memory, K kills, Z exports depth, T the draw tests depth, D it writes depth):%s\n", programs.c_str());
+}
+
 }
 
 void Recorder::CountSamples() {
@@ -2400,6 +2470,13 @@ void Recorder::readGpuTiming(Batch& batch) {
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
+    for (const auto& draw : batch.timedDraws) {
+        auto& row = timingDraws[draw.detail];
+        row.detail = draw.detail;
+        ++row.passes;
+        row.draws += draw.draws;
+        row.ms += static_cast<double>(stamps[draw.index * 2 + 1] - stamps[draw.index * 2]) * period / 1e6;
+    }
     std::sort(intervals.begin(), intervals.end());
     std::uint64_t coveredTicks = 0, unionEnd = 0;
     for (const auto& [begin, end] : intervals) {
@@ -2430,6 +2507,8 @@ void Recorder::readGpuTiming(Batch& batch) {
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    reportDrawTimes(perPresent);
+    timingDraws.clear();
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;

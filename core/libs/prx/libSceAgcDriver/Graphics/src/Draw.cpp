@@ -17,6 +17,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -823,6 +824,86 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
             }
         }
     }
+}
+
+}
+
+std::uint8_t PixelProgramTraits(std::span<const std::uint32_t> spirv) {
+    using Detail = Recorder::DrawTimingDetail;
+    std::uint8_t modes = 0;
+    std::uint32_t function = 0;
+    std::unordered_map<std::uint32_t, std::uint8_t> inFunction;
+    std::vector<std::uint32_t> reached;
+    std::unordered_map<std::uint32_t, std::uint32_t> storageClass;
+    const auto written = [&](std::uint32_t pointer) {
+        const auto found = storageClass.find(pointer);
+        if (found == storageClass.end()) return;
+        const auto storage = found->second;
+        if (storage == spv::StorageClassStorageBuffer || storage == spv::StorageClassPhysicalStorageBuffer || storage == spv::StorageClassUniform || storage == spv::StorageClassImage) inFunction[function] |= Detail::WritesMemory;
+    };
+    for (std::size_t at = 5; at < spirv.size();) {
+        const auto* words = &spirv[at];
+        const auto count = words[0] >> 16u;
+        const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (count == 0 || at + count > spirv.size()) break;
+        at += count;
+        if (op == spv::OpEntryPoint && count >= 3) {
+            reached.push_back(words[2]);
+        } else if (op == spv::OpExecutionMode && count >= 3) {
+            if (words[2] == spv::ExecutionModeEarlyFragmentTests) modes |= Detail::EarlyTests;
+            if (words[2] == spv::ExecutionModeDepthReplacing) modes |= Detail::ExportsDepth;
+        } else if (op == spv::OpTypePointer && count >= 3) {
+            storageClass[words[1]] = words[2];
+        } else if (op == spv::OpFunction && count >= 3) {
+            function = words[2];
+        } else if (op == spv::OpFunctionCall && count >= 4) {
+            reached.push_back(words[3]);
+        } else if (op == spv::OpKill || op == spv::OpTerminateInvocation || op == spv::OpDemoteToHelperInvocation) {
+            inFunction[function] |= Detail::Kills;
+        } else if (op == spv::OpImageWrite) {
+            inFunction[function] |= Detail::WritesMemory;
+        } else if ((op == spv::OpStore || op == spv::OpAtomicStore || op == spv::OpCopyMemory) && count >= 2) {
+            written(words[1]);
+        } else if (op >= spv::OpAtomicExchange && op <= spv::OpAtomicXor && count >= 4) {
+            written(words[3]);
+        } else if (count >= 3) {
+            if (const auto type = storageClass.find(words[1]); type != storageClass.end()) storageClass[words[2]] = type->second;
+        }
+    }
+    for (const auto id : reached) {
+        if (const auto found = inFunction.find(id); found != inFunction.end()) modes |= found->second;
+    }
+    return modes;
+}
+
+namespace {
+
+Recorder::DrawTimingDetail drawTimingDetail(const State& state, std::span<const CompiledShader> shaders) {
+    Recorder::DrawTimingDetail detail;
+    detail.width = state.renderExtent.width;
+    detail.height = state.renderExtent.height;
+    detail.colors = static_cast<std::uint32_t>(state.colors.size());
+    if (!state.colors.empty()) detail.color = state.colors.front().format;
+    if (state.depth) detail.depth = state.depth->format;
+    for (const auto& shader : shaders) {
+        if (shader.stage != ShaderRecompiler::ShaderStage::Fragment || shader.program == nullptr) continue;
+        const auto& words = shader.program->spirv.Words();
+        detail.pixelProgram = shader.program->PipelineVariantId();
+        detail.pixelWords = static_cast<std::uint32_t>(words.size());
+        static std::mutex mutex;
+        static std::unordered_map<std::uint64_t, std::uint8_t> known;
+        std::lock_guard lock(mutex);
+        const auto found = detail.pixelProgram != 0 ? known.find(detail.pixelProgram) : known.end();
+        if (found != known.end()) {
+            detail.pixelTraits = found->second;
+        } else {
+            detail.pixelTraits = PixelProgramTraits(words);
+            if (detail.pixelProgram != 0) known.emplace(detail.pixelProgram, detail.pixelTraits);
+        }
+    }
+    if (state.depth && state.depthTest) detail.pixelTraits |= Recorder::DrawTimingDetail::TestsDepth;
+    if (state.depth && state.depthWrite) detail.pixelTraits |= Recorder::DrawTimingDetail::WritesDepth;
+    return detail;
 }
 
 }
@@ -1751,6 +1832,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (Recorder::GpuTimingEnabled()) recorder->NoteTimedDraw(drawTiming, drawTimingDetail(state, shaders));
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
