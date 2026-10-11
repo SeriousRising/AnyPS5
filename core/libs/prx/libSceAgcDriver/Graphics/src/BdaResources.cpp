@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaDirectTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
@@ -41,6 +42,8 @@ struct TableEntry {
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::weak_ptr<Buffer> buffer;
     std::uint64_t spaceSerial = 0;
+    // Whether the buffer holds the direct table of the ranges (BdaAbi::DirectVersion).
+    bool direct = false;
 };
 
 struct TableCache {
@@ -130,7 +133,8 @@ BdaResources::BdaResources(const Context& context) {
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool direct) : BdaResources(context) {
+    this->direct = direct;
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -140,6 +144,11 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
+    // A table served by the cache below has the size of the buffer that holds it.
+    const auto served = [&](std::shared_ptr<Buffer> shared) {
+        table = std::move(shared);
+        tableBytes = table->Bytes().size();
+    };
     auto& cache = Tables();
     std::uint64_t hash = 0;
     if (tableCacheEnabled()) {
@@ -151,11 +160,11 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
         if (serial != 0) {
             for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
-                if (it->spaceSerial != serial) continue;
+                if (it->spaceSerial != serial || it->direct != direct) continue;
                 if (auto shared = it->buffer.lock(); shared != nullptr) {
                     ++cache.hits;
                     ++cache.classes.spaceTables;
-                    table = std::move(shared);
+                    served(std::move(shared));
                     cache.entries.splice(cache.entries.begin(), cache.entries, it);
                     return;
                 }
@@ -169,7 +178,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             // Compare the hash before taking a strong reference: locking a non-matching entry's
             // buffer could make this thread its last owner (a concurrent reap releasing it) and
             // run the pool release under the cache mutex; expired() takes no reference.
-            if (it->hash != hash) {
+            if (it->hash != hash || it->direct != direct) {
                 if (it->buffer.expired()) {
                     it = cache.entries.erase(it);
                 } else {
@@ -188,7 +197,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 // An equal table of an earlier space (a rebuild that mapped the same ranges the
                 // same way): the next build of this space binds it by the serial.
                 if (serial != 0) it->spaceSerial = serial;
-                table = std::move(shared);
+                served(std::move(shared));
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
             }
@@ -196,10 +205,18 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
     }
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
-    std::memcpy(table->Bytes().data(), &header, sizeof(header));
-    if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    if (direct) {
+        const auto words = BdaDirectTable(ranges);
+        tableBytes = words.size() * sizeof(std::uint32_t);
+        Require(tableBytes <= context.limits.maxStorageBufferRange, "BDA direct table exceeds storage buffer range limit");
+        table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memcpy(table->Bytes().data(), words.data(), tableBytes);
+    } else {
+        table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
+        std::memcpy(table->Bytes().data(), &header, sizeof(header));
+        if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    }
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
@@ -207,7 +224,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial});
+        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial, direct});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }
@@ -277,11 +294,22 @@ void BdaResources::CheckFault() const {
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Permission && table != nullptr) {
         const auto bytes = table->Bytes();
-        ShaderRecompiler::BdaAbi::Header header{};
-        std::memcpy(&header, bytes.data(), sizeof(header));
-        for (std::uint32_t index = 0; index < header.count; ++index) {
+        // The ranges follow the header, or the direct table's entries.
+        std::size_t offset = sizeof(ShaderRecompiler::BdaAbi::Header);
+        std::uint32_t count = 0;
+        if (direct) {
+            ShaderRecompiler::BdaAbi::DirectHeader header{};
+            std::memcpy(&header, bytes.data(), sizeof(header));
+            offset = sizeof(header) + header.entries * sizeof(ShaderRecompiler::BdaAbi::DirectEntry);
+            count = header.ranges;
+        } else {
+            ShaderRecompiler::BdaAbi::Header header{};
+            std::memcpy(&header, bytes.data(), sizeof(header));
+            count = header.count;
+        }
+        for (std::uint32_t index = 0; index < count; ++index) {
             ShaderRecompiler::BdaAbi::Range range{};
-            std::memcpy(&range, bytes.data() + sizeof(header) + index * sizeof(range), sizeof(range));
+            std::memcpy(&range, bytes.data() + offset + index * sizeof(range), sizeof(range));
             if (report.address < range.begin || report.address >= range.end) continue;
             message << std::hex << "; the store hit 0x" << range.begin << "+0x" << range.end - range.begin << ", read-only in the BDA table: stores through GPU-selected descriptors and FLAT/GLOBAL addresses reach only writable ranges imported in place, not ones served by a mirror or a copy (past APS5_HOST_IMPORT_MIB, or refused by the driver)";
             break;

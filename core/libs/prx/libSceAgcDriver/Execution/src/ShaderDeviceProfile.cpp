@@ -31,7 +31,7 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     const auto* mesh = findFeatures<VkPhysicalDeviceMeshShaderFeaturesEXT>(deviceInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
     const auto* clock = findFeatures<VkPhysicalDeviceShaderClockFeaturesKHR>(deviceInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR);
     const auto* maintenance8 = findFeatures<VkPhysicalDeviceMaintenance8FeaturesKHR>(deviceInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR);
-    Require(target.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version, "shader device profile has an incompatible BDA ABI");
+    Require(ShaderRecompiler::BdaAbi::TableVersion(target.bdaAbiVersion), "shader device profile has an incompatible BDA ABI");
     Require(bda != nullptr && bda->bufferDeviceAddress == VK_TRUE && core.shaderInt64 == VK_TRUE, "shader runtime requires enabled bufferDeviceAddress and shaderInt64");
     Require(bytes != nullptr && bytes->storageBuffer8BitAccess == VK_TRUE, "shader runtime requires enabled storageBuffer8BitAccess");
     Require(core.vertexPipelineStoresAndAtomics == VK_TRUE && core.fragmentStoresAndAtomics == VK_TRUE, "shader runtime requires enabled graphics stores and atomics");

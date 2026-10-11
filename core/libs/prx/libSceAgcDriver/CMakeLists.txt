@@ -191,6 +191,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaDirectTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/State.cpp
@@ -972,6 +973,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ShaderAddressResources.cpp
         Graphics/src/GuestBufferMemory.cpp
         Graphics/src/BdaResources.cpp
+        Graphics/src/BdaDirectTable.cpp
         Graphics/src/BufferAddress.cpp
         Graphics/src/ShaderValidation.cpp
         Graphics/src/GuestTextureResource.cpp
@@ -1026,6 +1028,7 @@ add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         Graphics/src/Resources.cpp
         Graphics/src/PlaceholderImages.cpp
         Graphics/src/BufferAddress.cpp
+        Graphics/src/BdaDirectTable.cpp
 )
 
 target_include_directories(agc_driver_bda_device_tests PRIVATE

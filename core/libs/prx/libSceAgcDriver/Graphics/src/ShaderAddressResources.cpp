@@ -15,9 +15,13 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
             if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) ++tables;
             else ++faults;
         }
-        const bool faultOnly = tables == 0 && faults == 1 && shader.program->bdaAbiVersion == ShaderRecompiler::BdaAbi::Version;
+        const bool faultOnly = tables == 0 && faults == 1 && ShaderRecompiler::BdaAbi::TableVersion(shader.program->bdaAbiVersion);
         Require((tables == faults || faultOnly) && tables <= 1 && faults <= 1, "invalid BDA table and fault descriptors");
-        Require(shader.program->bdaAbiVersion == (faults == 0 ? 0u : ShaderRecompiler::BdaAbi::Version), "incompatible BDA ABI version");
+        Require(faults == 0 ? shader.program->bdaAbiVersion == 0u : ShaderRecompiler::BdaAbi::TableVersion(shader.program->bdaAbiVersion), "incompatible BDA ABI version");
+        // One table serves every program of the draw.
+        const bool direct = shader.program->bdaAbiVersion == ShaderRecompiler::BdaAbi::DirectVersion;
+        Require(tables == 0 || !usesBda || direct == bdaDirect, "the programs of one draw expect different BDA tables");
+        if (tables != 0) bdaDirect = direct;
         // Rect-list validation needs a fault buffer, but never accesses guest addresses.
         usesBda = usesBda || tables != 0;
         usesFaultBuffer = usesFaultBuffer || faults != 0;

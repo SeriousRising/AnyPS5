@@ -1604,7 +1604,7 @@ void ShaderResources::buildComplete() {
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, bdaDirect);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         phase(BuildPhase::Bda);
         if (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) {

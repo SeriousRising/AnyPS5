@@ -436,6 +436,8 @@ private:
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    // The programs that look addresses up were made for the direct table (BdaAbi::DirectVersion).
+    bool bdaDirect = false;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.

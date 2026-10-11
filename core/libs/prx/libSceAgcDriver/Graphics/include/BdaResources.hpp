@@ -17,7 +17,8 @@ LoopGuardReport LastLoopGuardReport();
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);
-    BdaResources(const Context& context, const GuestBufferMemory& memory);
+    // With `direct` the table is the direct one (BdaDirectTable), for programs made for it.
+    BdaResources(const Context& context, const GuestBufferMemory& memory, bool direct = false);
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
@@ -51,6 +52,7 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    bool direct = false;
 };
 
 }
