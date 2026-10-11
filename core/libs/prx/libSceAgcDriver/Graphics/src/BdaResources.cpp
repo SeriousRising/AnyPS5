@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -129,10 +130,116 @@ BdaResources::BdaResources(const Context& context) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+    // The slots of translated bases are reached only through the directory, which is cleared here and
+    // set by writeBases after the slots it names.
+    std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::BaseSlotsWord * sizeof(std::uint32_t));
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+namespace {
+
+struct BaseSlotCounters {
+    std::atomic<std::uint64_t> translated{0}, unusable{0}, programs{0}, refused{0};
+    std::atomic<std::int64_t> lastReport{0};
+    std::atomic<std::uint64_t> reportedTranslated{0}, reportedUnusable{0}, reportedPrograms{0}, reportedRefused{0};
+};
+
+BaseSlotCounters& BaseSlots() {
+    static BaseSlotCounters counters;
+    return counters;
+}
+
+// APS5_PROFILE_GPU: every 10 s, the slots filled since the last line. A program that then reads with
+// its own lookups all the same (its base address is not the one the CPU computed) is not counted:
+// only the GPU sees that.
+void reportBaseSlots() {
+    static const bool profile = std::getenv("APS5_PROFILE_GPU") != nullptr;
+    if (!profile) return;
+    auto& counters = BaseSlots();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto since = [](const std::atomic<std::uint64_t>& total, std::atomic<std::uint64_t>& reported) {
+        const auto value = total.load(std::memory_order_relaxed);
+        return static_cast<unsigned long long>(value - reported.exchange(value, std::memory_order_relaxed));
+    };
+    const auto translated = since(counters.translated, counters.reportedTranslated);
+    const auto unusable = since(counters.unusable, counters.reportedUnusable);
+    const auto programs = since(counters.programs, counters.reportedPrograms);
+    const auto refused = since(counters.refused, counters.reportedRefused);
+    std::fprintf(stderr, "[gpu] base addresses translated by the CPU (10 s): %llu slots with a device address and %llu unusable for %llu programs; %llu programs found no room for their slots\n", translated, unusable, programs, refused);
+}
+
+}
+
+std::uint64_t BdaResources::TranslateHull(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::uint64_t address, std::uint32_t bytes) {
+    const auto end = address + bytes;
+    if (bytes == 0 || end <= address) return 0;
+    // The search of lookup_bda, step for step: a table that is not sorted selects the same range.
+    std::size_t low = 0;
+    std::size_t high = ranges.size();
+    auto ceiling = ~std::uint64_t{0};
+    while (low < high) {
+        const auto midpoint = low + (high - low) / 2;
+        const auto visited = ranges[midpoint].begin;
+        if (address < visited) {
+            high = midpoint;
+            ceiling = std::min(ceiling, visited);
+        } else {
+            low = midpoint + 1;
+        }
+    }
+    if (low == 0) return 0;
+    const auto& range = ranges[low - 1];
+    if (range.reserved != 0 || range.begin >= range.end || end > range.end || (range.permissions & ShaderRecompiler::BdaAbi::Read) == 0 || range.deviceAddress == 0) return 0;
+    const auto device = address + (range.deviceAddress - range.begin);
+    if (device < range.deviceAddress || device + bytes <= device || end > ceiling || (device & 3u) != 0) return 0;
+    return device;
+}
+
+void BdaResources::writeBases(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::span<const StageBases> stages) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
+    auto& counters = BaseSlots();
+    std::uint32_t next = 0;
+    for (const auto& stage : stages) {
+        if (stage.bases.empty()) continue;
+        Require(stage.stage < Abi::BaseStages, "invalid stage for translated base addresses");
+        const bool taken = std::any_of(stages.data(), &stage, [&](const StageBases& other) { return other.stage == stage.stage && !other.bases.empty(); });
+        if (taken || stage.bases.size() > Abi::BaseSlotCapacity - next) {
+            // The programs read with their own lookups, as without the CPU's translation: two
+            // programs of one stage would read each other's slots, so neither gets a directory word.
+            static std::atomic<bool> noted{false};
+            if (!noted.exchange(true)) std::fprintf(stderr, "[gpu] a draw has two programs of one stage with base addresses for the CPU to translate, or more than %u such addresses; the programs without slots look their reads up themselves (noted once)\n", Abi::BaseSlotCapacity);
+            if (taken) words[Abi::BaseDirectoryWord + stage.stage] = 0;
+            counters.refused.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        std::uint64_t translated = 0;
+        for (std::size_t index = 0; index < stage.bases.size(); ++index) {
+            const auto& request = stage.bases[index];
+            const std::array<std::uint64_t, 2> slot{request.base, request.bytes != 0 ? TranslateHull(ranges, request.hull, request.bytes) : 0};
+            translated += slot[1] != 0;
+            std::memcpy(words + Abi::BaseSlotsWord + (next + index) * Abi::BaseSlotWords, slot.data(), sizeof(slot));
+        }
+        words[Abi::BaseDirectoryWord + stage.stage] = next + 1;
+        next += static_cast<std::uint32_t>(stage.bases.size());
+        counters.translated.fetch_add(translated, std::memory_order_relaxed);
+        counters.unusable.fetch_add(stage.bases.size() - translated, std::memory_order_relaxed);
+        counters.programs.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (next != 0) reportBaseSlots();
+}
+
+BdaResources::BaseSlotStats BdaResources::BaseSlotCounters() {
+    const auto& counters = BaseSlots();
+    return {counters.translated.load(std::memory_order_relaxed), counters.unusable.load(std::memory_order_relaxed), counters.programs.load(std::memory_order_relaxed), counters.refused.load(std::memory_order_relaxed)};
+}
+
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, std::span<const StageBases> stages) : BdaResources(context) {
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -142,6 +249,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
+    // Before the table is looked up or built: every path below binds a table that holds `ranges`.
+    writeBases(ranges, stages);
     auto& cache = Tables();
     std::uint64_t hash = 0;
     if (tableCacheEnabled()) {
