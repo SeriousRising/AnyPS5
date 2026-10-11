@@ -74,6 +74,16 @@ SDL and FreeType settings forced by the root `CMakeLists.txt` cannot be overridd
 
 Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newly created graphics or compute pipeline. This requires `VK_KHR_pipeline_executable_properties` and `pipelineExecutableInfo`; an unsupported device fails with an error. Statistic names and units are driver-specific. Capturing statistics can increase pipeline compilation cost. The setting is disabled by default.
 
+## Motion emulation
+
+Set `APS5_PAD_MOTION_EMULATION=1` to give a controller without an accelerometer or gyroscope emulated motion (a controller with both sensors is not affected). While the right stick click is held:
+
+- the right stick tilts the controller, up to 60 degrees at full deflection and at most 180 degrees per second: pulling the stick toward you raises the far edge (positive rotation about x), pushing it right lowers the right side (negative rotation about z). The gyroscope reports the rate while the angle changes and the accelerometer reports gravity (9.80665 m/s^2) in the tilted frame;
+- pressing the left stick click lifts the controller: 1 g more along the axis out of its face for 150 ms, then 1 g less for 150 ms, once per press;
+- the right stick and both stick clicks do not reach the title.
+
+Releasing the right stick click turns the controller back to level at the same rate. At rest it reports 1 g on +y and no rotation.
+
 ## Shader recompiler
 
 The shader recompilation logic in [core/shader/recompiler](../../core/shader/recompiler) is isolated from the rest of the project and is a pure function of its input data, designed for integration into any other project. The current CMake target also includes cache support and links a supplied runtime target, glslang, and optionally SPIRV-Tools.
