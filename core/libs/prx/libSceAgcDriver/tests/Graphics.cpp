@@ -4113,6 +4113,38 @@ std::size_t faultKills(std::initializer_list<std::uint32_t> between) {
     return kills - 1u;
 }
 
+// OpKill does not end a pixel on every driver (RADV compiles it to a demotion and runs the rest for
+// the helper), so no load by device address may sit where the path of a failed lookup rejoins: in
+// the entry point every such load is in a block entered by a conditional branch alone, never in the
+// merge block of a selection.
+void faultLoadGuardTests() {
+    const std::array<std::uint32_t, 5> capabilities{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    auto request = orderedPixelRequest(0x30600u, capabilities, OrderedBdaPixelCode);
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    const auto module = ShaderRecompiler::Recompile(request).spirv;
+    const auto words = module.Words();
+    std::set<std::uint32_t> merges, converted;
+    std::uint32_t entry = 0, function = 0, label = 0;
+    std::size_t loads = 0;
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        if (op == spv::OpEntryPoint) entry = words[at + 2];
+        if (op == spv::OpSelectionMerge) merges.insert(words[at + 1]);
+    }
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        if (op == spv::OpFunction) function = words[at + 2];
+        if (op == spv::OpLabel) label = words[at + 1];
+        if (op == spv::OpConvertUToPtr) converted.insert(words[at + 2]);
+        if (op != spv::OpLoad || function != entry || !converted.contains(words[at + 3])) continue;
+        ++loads;
+        Require(!merges.contains(label), "a pixel shader with BDA reads loads by device address in the merge block " + std::to_string(label) + ", which a pixel whose lookup failed reaches when OpKill does not end it");
+    }
+    Require(loads != 0u, "a pixel shader with a byte read by address has no load by device address in its entry point");
+}
+
 // Programs whose faulting address reads flag the pixel and discard it where the program returns (one
 // kill) instead of ending it at each of the five places a read can fault (see BdaStopCanBeDeferred).
 void faultStopFormTests() {
@@ -5055,6 +5087,7 @@ int main(int argc, char** argv) {
         ProvokingVertexTests();
         ProvokingVertexRenderPassTests();
         faultStopFormTests();
+        faultLoadGuardTests();
         ConservativeRasterizationTests();
         DisabledColorTests();
         OpaqueDestinationAlphaTests();
