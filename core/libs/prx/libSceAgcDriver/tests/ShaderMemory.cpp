@@ -1755,9 +1755,10 @@ void verifyBdaInlinedSize() {
         return total;
     };
     const auto total = measure(entry);
-    // The range cache is seven per-invocation variables; the optimizer must leave them Private (as
+    // The range cache is six per-invocation variables; the optimizer must leave them Private (as
     // locals of lookup_bda they would be lost between calls and the cache would never hit).
-    require(keptByLookup.size() == (std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : 7u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
+    require(keptByLookup.size() == (std::getenv("APS5_NO_BDA_RANGE_CACHE") != nullptr ? 0u : 6u), ("BDA range cache: lookup_bda reads " + std::to_string(keptByLookup.size()) + " per-invocation variables").c_str());
+    std::cout << "BDA inlined size: " << Reads << " address-based dword reads inline to " << total << " instructions\n";
     require(readSites == Reads, ("BDA inlined size: the shader has " + std::to_string(readSites) + " dword read sites, expected " + std::to_string(Reads)).c_str());
     require(total * 8u <= InlinedBefore, ("BDA inlined size: " + std::to_string(Reads) + " address-based dword reads inline to " + std::to_string(total) + " instructions, more than an eighth of the " + std::to_string(InlinedBefore) + " they took").c_str());
 }
