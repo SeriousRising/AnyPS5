@@ -97,7 +97,8 @@ private:
 // Each sequence also runs with its reads sharing base addresses (EmitBdaSharedDwordReads; off with
 // APS5_NO_BDA_SHARED_BASE=1 in the recompiler) by blocks of 16 bytes (a range of `sorted`), of 64 (two
 // ranges and the gap behind them) and of 4096 (every read of the sequence): searched, with two kept
-// ranges and the check, and with the invocation ended at the faulting read. All must equal the run
+// ranges and the check, with one and two kept ranges, where a kept range answers for a hull without
+// a search, and with the invocation ended at the faulting read. All must equal the run
 // in which every read looks its own bytes up.
 static void RunBdaRangeCacheTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
@@ -163,6 +164,7 @@ static void RunBdaRangeCacheTests(const Context& context) {
                 const auto differs = [&](const char* how) { return "BDA shared base: " + name + (stops ? " (stopping)" : " (continuing)") + " with reads sharing bases by " + std::to_string(sharedBytes) + " bytes" + how + " differs from every read looking its own bytes up"; };
                 Require(run(0, false, true, sharedBytes) == searched, differs(""));
                 Require(run(2, true, true, sharedBytes) == searched, differs(", two kept ranges and the check,"));
+                for (const auto entries : {1u, 2u}) Require(run(entries, false, true, sharedBytes) == searched, differs(entries == 1u ? " and one kept range" : " and two kept ranges"));
                 if (stops) Require(run(0, false, false, sharedBytes) == searched, differs(" and the invocation ended at the faulting read"));
             }
             if (expected == nullptr) continue;
@@ -222,6 +224,16 @@ static void RunBdaRangeCacheTests(const Context& context) {
     check("a base's reads of several sizes and alignments", sorted, 3, {{Step::Read, guest}, {Step::Read, guest + 4, 0, 2}, {Step::Read, guest + 12}, {Step::Read, guest + 1}, {Step::Read, guest + 5}, {Step::Read, guest + 8, 0, 3}, {Step::Read, guest, 0, 4}, {Step::Read, guest + 9}}, &expected);
     expected = {{high(4), high(8) + 3u * high(12), high(12), high(0)}, Abi::FaultReason::Unmapped, guest + 32, 1, 2};
     check("a base's wide read across a range's end into the gap", sorted, 3, {{Step::Read, guest + 20}, {Step::Read, guest + 24, 0, 2}, {Step::Read, guest + 28, 0, 2}, {Step::Read, guest + 16}}, &expected);
+    // A store keeps its range before a base's first read asks for the hull: a hull inside the kept
+    // range, and one that begins in it and ends in the next range (by blocks of 64 and 4096 bytes).
+    for (const auto& order : {std::array{0u, 1u, 2u}, std::array{2u, 0u, 1u}, std::array{1u, 2u, 0u}, std::array{2u, 1u, 0u}, std::array{0u, 2u, 1u}}) {
+        const std::vector<Abi::Range> table{sorted[order[0]], sorted[order[1]], sorted[order[2]]};
+        const bool inOrder = order[0] == 0u && order[1] == 1u;
+        expected = {{0xa5a5a5a5u, low(0), 0xa5a5a5a5u, low(12), low(8)}};
+        check("a base's reads inside the range a store kept", table, 3, {{Step::Store, guest + 4, 0xa5a5a5a5u}, {Step::Read, guest}, {Step::Read, guest + 4}, {Step::Read, guest + 12}, {Step::Read, guest + 8}}, inOrder ? &expected : nullptr);
+        expected = {{0x5a5a5a5au, low(8), high(0), 0x5a5a5a5au, high(4)}};
+        check("a base's reads from the range a store kept into the next", table, 3, {{Step::Store, guest + 12, 0x5a5a5a5au}, {Step::Read, guest + 8}, {Step::Read, guest + 16}, {Step::Read, guest + 12}, {Step::Read, guest + 20}}, inOrder ? &expected : nullptr);
+    }
     // More ranges than any cache keeps, each read twice in turn, then a store and reads behind it.
     {
         std::vector<Abi::Range> many;
