@@ -13,6 +13,9 @@ std::uint32_t BdaConstant(SpirvEmitterState& state, std::uint64_t value);
 std::uint32_t BdaWord(SpirvEmitterState& state, std::uint32_t variable, std::uint32_t index);
 std::uint32_t BdaLoadWord(SpirvEmitterState& state, std::uint32_t index);
 std::uint32_t BdaLoadAddress(SpirvEmitterState& state, std::uint32_t index);
+// Reads the direct table's header into the program's per-invocation variables; emitted at the start
+// of the entry point of a program made for the direct table. Nothing in other programs.
+void PrepareBdaDirectLookups(SpirvEmitterState& state);
 void DefineBdaFaultFunction(SpirvEmitterState& state);
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state);
 void DefineBdaSpanReadFunctions(SpirvEmitterState& state);

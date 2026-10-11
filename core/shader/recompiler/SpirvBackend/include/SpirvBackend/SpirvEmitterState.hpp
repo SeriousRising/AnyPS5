@@ -111,6 +111,17 @@ struct SpirvEmitterState {
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
     std::uint32_t bdaPagetableVariable = 0;
+    // The program is made for the direct table (BdaAbi::DirectVersion): a lookup walks it instead of
+    // searching the ranges.
+    bool bdaDirect = false;
+    // Private, set by PrepareBdaDirectLookups from the direct table's header: not zero when the header
+    // is invalid, the table's base (u64), root shift, (1 << root shift) - 1 and root count (0 when
+    // the header is invalid).
+    std::uint32_t bdaTableInvalid = 0;
+    std::uint32_t bdaDirectBase = 0;
+    std::uint32_t bdaDirectShift = 0;
+    std::uint32_t bdaDirectMask = 0;
+    std::uint32_t bdaDirectCount = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when

@@ -1067,6 +1067,7 @@ void EmitProgram(SpirvEmitterState& state) {
     }
     if (AlphaToCoverage(state)) StoreCoverage(state, ConstantI32(state, -1));
     if (state.bdaStopped != 0u) state.module.AddFunction(spv::OpStore, state.bdaStopped, ConstantBool(state, false));
+    PrepareBdaDirectLookups(state);
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }

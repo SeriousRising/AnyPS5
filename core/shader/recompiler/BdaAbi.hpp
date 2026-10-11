@@ -46,6 +46,48 @@ static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permission
 static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<Fault> && sizeof(Fault) == 32);
 static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24);
 
+// The direct table (DirectVersion). The ranges are also given as a tree the shader walks with one
+// load a level and no search: `rootCount` root entries, each for the 1 << rootShift guest bytes from
+// `base` on, then the entries they lead to, `entries` in all, then the `ranges` ranges the tree was
+// built from (for diagnostics; the shader does not read them). An entry is four dwords. A leaf
+// (flags without DirectDescend): the guest bytes of the entry's unit from its first byte up to
+// `bytes` (0: none; 0xffffffff: that many or more) are readable at their guest address plus the 64-bit
+// `delta` (low dword first), and writable with DirectWritable. An entry with DirectDescend has its
+// unit split into units of 1 << `shift` bytes, whose entries start at entry `child`; `mask` is
+// (1 << shift) - 1. A unit in which a mapping starts is always split, down to single bytes, so a
+// leaf never needs the offset of a first mapped byte. Touching ranges with the same delta and
+// permissions are one mapping.
+inline constexpr std::uint32_t DirectVersion = 2;
+inline constexpr std::uint32_t DirectDescend = 1;
+inline constexpr std::uint32_t DirectWritable = 2;
+inline constexpr std::uint32_t DirectMaxRootShift = 30;
+
+// Whether `version` is a table form programs are made for.
+constexpr bool TableVersion(std::uint32_t version) {
+    return version == Version || version == DirectVersion;
+}
+
+struct DirectHeader {
+    std::uint32_t version;
+    std::uint32_t rootShift;
+    std::uint32_t rootCount;
+    std::uint32_t entries;
+    std::uint64_t base;
+    std::uint32_t ranges;
+    std::uint32_t reserved;
+};
+
+struct DirectEntry {
+    // A leaf's delta, or child (low dword) and shift (high dword).
+    std::uint64_t delta;
+    // A leaf's bytes, or mask.
+    std::uint32_t bytes;
+    std::uint32_t flags;
+};
+
+static_assert(std::is_standard_layout_v<DirectHeader> && std::is_trivially_copyable_v<DirectHeader> && sizeof(DirectHeader) == 32 && offsetof(DirectHeader, base) == 16);
+static_assert(std::is_standard_layout_v<DirectEntry> && std::is_trivially_copyable_v<DirectEntry> && sizeof(DirectEntry) == 16 && offsetof(DirectEntry, bytes) == 8);
+
 inline constexpr std::uint32_t WrittenPageShift = 12;
 inline constexpr std::uint32_t WrittenChunkShift = 17;
 inline constexpr std::uint32_t WrittenChunkPages = 1u << (WrittenChunkShift - WrittenPageShift);
