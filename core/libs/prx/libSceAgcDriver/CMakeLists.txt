@@ -145,6 +145,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GuestBufferMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaResources.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BdaDirectTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferAddress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/State.cpp
@@ -517,6 +518,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/ShaderAddressResources.cpp
         Graphics/src/GuestBufferMemory.cpp
         Graphics/src/BdaResources.cpp
+        Graphics/src/BdaDirectTable.cpp
         Graphics/src/BufferAddress.cpp
         Graphics/src/ShaderValidation.cpp
         Graphics/src/GuestTextureResource.cpp
@@ -565,6 +567,7 @@ add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         Execution/src/BdaFeatures.cpp
         Graphics/src/Resources.cpp
         Graphics/src/BufferAddress.cpp
+        Graphics/src/BdaDirectTable.cpp
 )
 
 target_include_directories(agc_driver_bda_device_tests PRIVATE
@@ -657,7 +660,7 @@ if(BUILD_TESTING)
             string(REPLACE "|" ";" agcLookupMode "${agcLookupMode}")
             list(POP_FRONT agcLookupMode agcLookupName)
             add_test(NAME agc_driver_${agcLookupTest}_${agcLookupName} COMMAND agc_driver_${agcLookupTest}_tests)
-            set_tests_properties(agc_driver_${agcLookupTest}_${agcLookupName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcLookupMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            set_tests_properties(agc_driver_${agcLookupTest}_${agcLookupName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_BDA_DIRECT=1;${agcLookupMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
             if(WIN32)
                 set_tests_properties(agc_driver_${agcLookupTest}_${agcLookupName} PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
@@ -676,7 +679,7 @@ if(BUILD_TESTING)
             string(REPLACE "|" ";" agcBaseMode "${agcBaseMode}")
             list(POP_FRONT agcBaseMode agcBaseName)
             add_test(NAME ${agcBaseTest}_${agcBaseName} COMMAND ${agcBaseTest}_tests)
-            set_tests_properties(${agcBaseTest}_${agcBaseName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcBaseMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            set_tests_properties(${agcBaseTest}_${agcBaseName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_BDA_DIRECT=1;${agcBaseMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
             if(WIN32)
                 set_tests_properties(${agcBaseTest}_${agcBaseName} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
             endif()
@@ -687,7 +690,7 @@ if(BUILD_TESTING)
             string(REPLACE "|" ";" agcCpuBaseMode "${agcCpuBaseMode}")
             list(POP_FRONT agcCpuBaseMode agcCpuBaseName)
             add_test(NAME ${agcCpuBaseTest}_${agcCpuBaseName} COMMAND ${agcCpuBaseTest}_tests)
-            set_tests_properties(${agcCpuBaseTest}_${agcCpuBaseName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcCpuBaseMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            set_tests_properties(${agcCpuBaseTest}_${agcCpuBaseName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_BDA_DIRECT=1;${agcCpuBaseMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
             if(WIN32)
                 set_tests_properties(${agcCpuBaseTest}_${agcCpuBaseName} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
             endif()
@@ -702,7 +705,7 @@ if(BUILD_TESTING)
         string(REPLACE "|" ";" agcTranslatedMode "${agcTranslatedMode}")
         list(POP_FRONT agcTranslatedMode agcTranslatedName)
         add_test(NAME agc_driver_global_loads_translated_base_${agcTranslatedName} COMMAND agc_driver_global_loads_translated_base_tests)
-        set_tests_properties(agc_driver_global_loads_translated_base_${agcTranslatedName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcTranslatedMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(agc_driver_global_loads_translated_base_${agcTranslatedName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_BDA_DIRECT=1;${agcTranslatedMode}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         if(WIN32)
             set_tests_properties(agc_driver_global_loads_translated_base_${agcTranslatedName} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
@@ -827,6 +830,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/ShaderAddressResources.cpp
             Graphics/src/GuestBufferMemory.cpp
             Graphics/src/BdaResources.cpp
+            Graphics/src/BdaDirectTable.cpp
             Graphics/src/BufferAddress.cpp
             Graphics/src/ShaderValidation.cpp
             Graphics/src/GuestTextureResource.cpp

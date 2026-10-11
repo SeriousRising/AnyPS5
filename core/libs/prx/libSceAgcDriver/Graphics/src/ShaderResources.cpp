@@ -1287,7 +1287,7 @@ void ShaderResources::buildComplete() {
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, bdaBases);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, bdaBases, bdaDirect);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         bdaBases.clear();
         phase(BuildPhase::Bda);

@@ -2492,7 +2492,10 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
 
 ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     const auto& limits = state->properties.limits;
-    ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, ShaderRecompiler::BdaAbi::Version, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
+    // APS5_NO_BDA_DIRECT=1: programs search the sorted ranges for every address they read, as before
+    // the direct table.
+    static const bool searched = std::getenv("APS5_NO_BDA_DIRECT") != nullptr;
+    ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, searched ? ShaderRecompiler::BdaAbi::Version : ShaderRecompiler::BdaAbi::DirectVersion, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
     target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric;
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;

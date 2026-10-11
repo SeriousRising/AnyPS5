@@ -25,7 +25,8 @@ public:
     explicit BdaResources(const Context& context);
     // Fills a slot of the fault buffer for every base of `stages` from the ranges the page table
     // holds, so that a slot's device address is one the table gives for this build.
-    BdaResources(const Context& context, const GuestBufferMemory& memory, std::span<const StageBases> stages = {});
+    // With `direct` the table is the direct one (BdaDirectTable), for programs made for it.
+    BdaResources(const Context& context, const GuestBufferMemory& memory, std::span<const StageBases> stages = {}, bool direct = false);
     // What the shader's lookup gives a read of the `bytes` bytes at `address` asked for as one span
     // (lookup_bda_span with BdaLookupSpan): the device address of the first byte when the search of
     // `address` selects a range that holds all of them, is readable and has a device address that
@@ -75,6 +76,7 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    bool direct = false;
 };
 
 }
