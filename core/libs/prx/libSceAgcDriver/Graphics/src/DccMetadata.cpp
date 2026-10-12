@@ -297,6 +297,29 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
     return keys;
 }
 
+// A uniform fill the title recorded over the whole range, when it is the newest recorded write
+// there: the keys the range holds once it landed, known without waiting for it, as a fill
+// classified as a key fill is (NoteKeysFillOnGpu). No image follows a CMASK, or keys before their
+// surface's first use, so nothing classifies their fill. The answer joins the memo, for the
+// readers of the bytes. APS5_NO_KEYS_FILL_MEMO=1 waits for the fill, as before.
+std::optional<DccKeys> PendingFillKeys(Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_MEMO") != nullptr;
+    const auto end = begin + count;
+    if (disabled || AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    const auto newest = recorder.NewestWriteNote(begin, count);
+    for (const auto& write : recorder.PendingWritesOver(begin, count)) {
+        if (write.note != newest || write.value < 0 || write.begin > begin || write.end < end) continue;
+        const auto keys = ByteKeys(static_cast<std::uint8_t>(write.value));
+        auto& memo = Memo();
+        std::lock_guard lock(memo.mutex);
+        if (MemoRecorder(memo) != &recorder) return std::nullopt;
+        std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
+        memo.entries.push_back({begin, end, keys, newest});
+        return keys;
+    }
+    return std::nullopt;
+}
+
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
 // as a scan too.
 bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
@@ -462,6 +485,7 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count) {
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
+            if (const auto keys = PendingFillKeys(*recorder, metaAddress, count)) return *keys;
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
         }
