@@ -90,6 +90,7 @@ private:
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{0xe0382000, 0x80020005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000};
 alignas(256) constexpr std::array<std::uint32_t, 9> ReadCode{0xf4080304, 0xfa000000, 0x7e1e0280, 0xdc308000, 0x0a0c000f, 0xbf8c3f70, 0xf800180f, 0x0a0a0a0a, 0xbf810000};
 alignas(256) constexpr std::array<std::uint32_t, 13> CopyCode{0xf4080304, 0xfa000000, 0x7e1e0280, 0xdc308000, 0x0a0c000f, 0xbf8c3f70, 0x7e02020e, 0x7e04020f, 0xdc708000, 0x007d0a01, 0xf800180f, 0x0a0a0a0a, 0xbf810000};
+alignas(256) constexpr std::array<std::uint32_t, 5> StoreCode{0x7e040280, 0x7e0202f2, 0xe0701000, 0x80010102, 0xbf810000};
 alignas(256) std::array<std::array<float, 4>, 3> Triangle{{{-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}}};
 
 struct Program {
@@ -118,6 +119,33 @@ struct Program {
 
     Program(const Program&) = delete;
     Program& operator=(const Program&) = delete;
+};
+
+struct Kernel {
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        ShaderSpecialRegs specials{};
+    } header;
+
+    explicit Kernel(std::span<const std::uint32_t> code) {
+        const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+        header.shader.file_header = 0x34333231u;
+        header.shader.version = 0x18;
+        header.shader.header_size = sizeof(header);
+        header.shader.shader_size = static_cast<std::uint32_t>(code.size_bytes());
+        header.shader.code = code.data();
+        header.shader.sh_registers = header.registers.data();
+        header.shader.num_sh_registers = static_cast<std::uint8_t>(header.registers.size());
+        header.shader.specials = &header.specials;
+        header.specials.dispatch_modifier = 0x8000u;
+        header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 8u << 1u}}};
+        AgcDriverRegisterShader_nid_postfix(&header.shader);
+        AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
+    }
+
+    Kernel(const Kernel&) = delete;
+    Kernel& operator=(const Kernel&) = delete;
 };
 
 std::vector<ShaderRegister> ContextRegisters(std::uint64_t target) {
@@ -152,6 +180,15 @@ struct Commands {
         Context(0x390, static_cast<std::uint32_t>(address >> 40u));
     }
     void Condition(std::uint64_t address, std::uint32_t words) { Add({0xc0032200u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0u, words}); }
+    void Store(const Kernel& kernel, std::uint64_t address, std::uint32_t bytes) {
+        for (const auto reg : kernel.header.registers) ShaderRegister(reg.offset, reg.value);
+        for (std::uint32_t user = 0; user < 4; ++user) ShaderRegister(0x240u + user, 0);
+        ShaderRegister(0x244, static_cast<std::uint32_t>(address));
+        ShaderRegister(0x245, static_cast<std::uint32_t>(address >> 32u) & 0xffffu);
+        ShaderRegister(0x246, bytes);
+        ShaderRegister(0x247, 0x31016facu);
+    }
+    void Dispatch() { Add({0xc0031500u, 1, 1, 1, 0x8041u}); }
     void Draw() { Add({0xc0012d00u, static_cast<std::uint32_t>(Triangle.size()), 2u}); }
     void Submit() {
         Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -167,6 +204,7 @@ struct Scene {
     Program vertex{2, VertexCode, 4};
     Program read{1, ReadCode, 10};
     Program copy{1, CopyCode, 10};
+    Kernel store{StoreCode};
     std::vector<ShaderRegister> context = ContextRegisters(target.Address());
     std::uint32_t serial = 0;
 
@@ -317,6 +355,25 @@ void Conditions(Scene& scene) {
     Require(scene.ResultWord(50) == 0x43000002u && scene.ResultWord(51) == 0x43000003u, "draw ahead: an executed conditional block did not draw");
 }
 
+void Stores(Scene& scene) {
+    constexpr std::uint32_t draws = 40;
+    for (std::uint32_t i = 0; i < Values; ++i) scene.memory.SetWord(ValuesOffset + i * 4u, 0x45000000u + i);
+    for (std::uint32_t round = 0; round < 12; ++round) {
+        for (std::uint32_t i = 1; i <= draws; ++i) scene.SetTable(i, scene.Value(round * draws + i), scene.Result(64 + i));
+        Commands commands;
+        scene.State(commands, scene.copy);
+        commands.Store(scene.store, scene.Table(0), (draws / 2 + 1) * TableBytes);
+        for (std::uint32_t i = 1; i <= draws; ++i) {
+            commands.Dispatch();
+            commands.Table(scene.Table(i));
+            commands.Draw();
+        }
+        scene.Finish(commands);
+        for (std::uint32_t i = 1; i <= draws; ++i) Require(scene.ResultWord(64 + i) == 0x45000000u + round * draws + i, "draw ahead: a draw under a range a dispatch stores to did not read its own table");
+        Require(scene.memory.Word(0) == 0x3f800000u, "draw ahead: the dispatch before the draws did not store");
+    }
+}
+
 void Stress(Scene& scene, std::uint32_t rounds) {
     constexpr std::uint32_t pool = 24;
     std::mt19937 random(0x5eed);
@@ -391,7 +448,7 @@ void Stress(Scene& scene, std::uint32_t rounds) {
     }
 }
 
-void Benchmark(Scene& scene, std::uint32_t batches) {
+void Benchmark(Scene& scene, std::uint32_t batches, bool stores) {
     constexpr std::uint32_t frames = 3, draws = 650;
     for (std::uint32_t i = 0; i < Values; ++i) scene.memory.SetWord(ValuesOffset + i * 4u, i % 2 == 0 ? 0x3f800000u : 0u);
     std::uint64_t issued = 0;
@@ -400,14 +457,17 @@ void Benchmark(Scene& scene, std::uint32_t batches) {
         for (std::uint32_t frame = 0; frame < frames; ++frame) {
             Commands commands;
             scene.State(commands, scene.read);
+            if (stores) commands.Store(scene.store, scene.Table(frame * draws + draws / 2), (draws - draws / 2) * TableBytes);
             for (std::uint32_t i = 0; i < draws; ++i) {
+                if (i == draws / 2) continue;
+                if (stores && i > draws / 2) commands.Dispatch();
                 commands.Table(scene.Table(frame * draws + i));
                 commands.Draw();
             }
             if (frame + 1 == frames) scene.Finish(commands);
             else commands.Submit();
         }
-        issued += frames * draws;
+        issued += frames * (draws - 1);
     };
     for (std::uint32_t serial = 0; serial < 4; ++serial) batch(serial);
     issued = 0;
@@ -418,7 +478,7 @@ void Benchmark(Scene& scene, std::uint32_t batches) {
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     const double busy = static_cast<double>(std::clock() - cpu) / CLOCKS_PER_SEC;
     const auto after = AgcDriver::DrawAheadCounts();
-    std::printf("draw ahead %s: %llu draws in %.2f s, %.1f us a draw, %.2f cores busy, %llu prepared ahead, %llu hit\n", std::getenv("APS5_NO_DRAW_AHEAD") != nullptr ? "off" : "on", static_cast<unsigned long long>(issued), seconds, seconds * 1e6 / static_cast<double>(issued), busy / seconds, static_cast<unsigned long long>(after.prepared - before.prepared), static_cast<unsigned long long>(after.hits - before.hits));
+    std::printf("draw ahead %s%s: %llu draws in %.2f s, %.1f us a draw, %.2f cores busy, %llu prepared ahead, %llu hit\n", std::getenv("APS5_NO_DRAW_AHEAD") != nullptr ? "off" : "on", stores ? ", half of the tables under a range a dispatch before each draw stores to" : "", static_cast<unsigned long long>(issued), seconds, seconds * 1e6 / static_cast<double>(issued), busy / seconds, static_cast<unsigned long long>(after.prepared - before.prepared), static_cast<unsigned long long>(after.hits - before.hits));
 }
 
 }
@@ -429,16 +489,17 @@ int main(int argc, char** argv) {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
-        Require(argc == 1 || (argc == 3 && std::string(argv[1]) == "bench"), "draw ahead: expected no arguments, or bench and a number of batches");
+        Require(argc == 1 || (argc == 3 && (std::string(argv[1]) == "bench" || std::string(argv[1]) == "bench-stores")), "draw ahead: expected no arguments, or bench or bench-stores and a number of batches");
         {
             Scene scene;
             if (argc == 3) {
-                Benchmark(scene, static_cast<std::uint32_t>(std::atoi(argv[2])));
+                Benchmark(scene, static_cast<std::uint32_t>(std::atoi(argv[2])), std::string(argv[1]) == "bench-stores");
             } else {
                 Chain(scene);
                 Registers(scene);
                 Labels(scene);
                 Conditions(scene);
+                Stores(scene);
                 Stress(scene, 48);
                 const auto counts = AgcDriver::DrawAheadCounts();
                 const bool off = std::getenv("APS5_NO_DRAW_AHEAD") != nullptr;
