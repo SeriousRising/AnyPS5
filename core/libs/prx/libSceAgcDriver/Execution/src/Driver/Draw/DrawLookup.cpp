@@ -99,6 +99,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         ++compared;
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                        if (result != EntryOutcome::Equal && submission.queue == 0 && variant->ahead.load(std::memory_order_relaxed) != 0) drawAhead.refused[static_cast<std::size_t>(result)].fetch_add(1, std::memory_order_relaxed);
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal) continue;
