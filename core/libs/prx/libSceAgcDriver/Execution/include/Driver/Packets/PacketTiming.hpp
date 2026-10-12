@@ -1,6 +1,9 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_PACKETTIMING_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_PACKETTIMING_HPP
 
+#include <chrono>
+#include <string>
+#include <vector>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include <array>
 #include <chrono>
@@ -28,6 +31,8 @@ struct PacketProfile {
 
     std::array<std::pair<std::uint64_t, double>, static_cast<std::size_t>(DispatchOutcome::Count)> dispatchOutcomes{};
 };
+
+std::vector<std::string> HitchLines(std::chrono::steady_clock::time_point now, double inFlightWaitMs);
 
 struct PacketTimer {
     bool enabled; std::uint32_t key; std::uint32_t queue; PacketProfile& profile; std::chrono::steady_clock::time_point start;
