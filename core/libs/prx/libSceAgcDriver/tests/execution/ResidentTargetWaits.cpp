@@ -23,6 +23,17 @@ struct Cost {
     std::uint64_t pages = 0;
 };
 
+// Every half equal bit for bit, but a NaN for a NaN: the way through the image and back to guest
+// memory does not keep a NaN's payload, whoever stored it.
+bool SameHalves(std::uint64_t held, std::uint64_t expected) {
+    for (std::uint32_t shift = 0; shift < 64; shift += 16) {
+        const auto a = static_cast<std::uint16_t>(held >> shift), b = static_cast<std::uint16_t>(expected >> shift);
+        const auto nan = [](std::uint16_t half) { return (half & 0x7c00u) == 0x7c00u && (half & 0x3ffu) != 0; };
+        if (nan(b) ? !nan(a) : a != b) return false;
+    }
+    return true;
+}
+
 void Print(const char* shape, const Cost& cost) {
     std::printf("%s: first draw of a frame %.3f ms, each later draw %.4f ms, %.2f batches waited for a frame, %llu pages walked a frame\n", shape, cost.firstMs / Frames, cost.restMs / (Frames * (DrawsPerFrame - 1)), static_cast<double>(cost.waits) / Frames, static_cast<unsigned long long>(cost.pages / Frames));
 }
@@ -50,6 +61,9 @@ int main(int count, char** arguments) {
         WatchedBlock keys(Blocks(keyBytes));
         WatchedBlock masked(Blocks(layout.Bytes()));
         WatchedBlock cmask(Blocks(cmaskBytes));
+        const AgcDriver::Graphics::ColorTargetLayout wideLayout(Extent.width, Extent.height, AgcDriver::Graphics::ColorTileMode::RenderTarget, 8);
+        WatchedBlock wide(Blocks(wideLayout.Bytes()));
+        WatchedBlock wideCmask(Blocks(cmaskBytes));
         struct Idle {
             AgcDriver::VulkanDevice& device;
             ~Idle() { device.WaitIdle(); }
@@ -181,6 +195,43 @@ int main(int count, char** arguments) {
         cleared.clearWords = {0x0badf00du, 0u};
         Check(scene.Draw(cleared, false, left) && recorder->Submissions() != submissions, "resident target waits: a draw did not wait for a write of unknown content into its CMASK");
         Check(scene.Holds(cleared, left, 0x0badf00du, 0u) && expanded(cmask, cmaskBytes), "resident target waits: a CMASK clear behind a write of unknown content did not leave the clear words of its target, or left the CMASK cleared");
+
+        // Clear words no image clear is known to store bit for bit (denormal and NaN halves) are
+        // copied into the image, not stored by the CPU and uploaded.
+        const bool copyClear = std::getenv("APS5_NO_COPY_CLEAR") == nullptr;
+        auto floats = scene.color;
+        floats.address = wide.Address();
+        floats.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        floats.elementBytes = 8;
+        floats.bytes = wideLayout.Bytes();
+        floats.cmaskAddress = wideCmask.Address();
+        floats.cmaskBytes = cmaskBytes;
+        std::memset(wideCmask.Data(), 0xff, cmaskBytes);
+        Check(scene.Draw(floats, true, 0), "resident target waits: the draw into the half-float target was not recorded");
+        const auto storedBefore = AgcDriver::Graphics::CpuStoredClears();
+        cost = frames(floats, [&](std::uint32_t) { Require(device->FillBuffer(wideCmask.Address(), cmaskBytes, zeros), "resident target waits: the CMASK fill was not recorded"); }, false);
+        // The clear words of the first three frames are denormal halves.
+        Print("CMASK clear of a half-float target, three frames in eight to denormal halves", cost);
+        const auto cpuClears = AgcDriver::Graphics::CpuStoredClears() - storedBefore;
+        Check(copyClear ? cost.waits == 0 && cpuClears == 0 : cpuClears == 3, copyClear ? "resident target waits: a draw waited to clear its target to denormal halves, or the CPU stored the clear" : "resident target waits: the switch did not store the clears to denormal halves by the CPU");
+        for (const std::uint64_t texel : {0x800103ff3c000001ull, 0x3c00fe007c017e01ull}) {
+            floats.clearWords = {static_cast<std::uint32_t>(texel), static_cast<std::uint32_t>(texel >> 32u)};
+            Check(device->FillBuffer(wideCmask.Address(), cmaskBytes, zeros), "resident target waits: the CMASK fill was not recorded");
+            const auto stored = AgcDriver::Graphics::CpuStoredClears();
+            submissions = recorder->Submissions();
+            Check(scene.Draw(floats, false, left), "resident target waits: the draw into the half-float target was not recorded");
+            if (copyClear) Check(AgcDriver::Graphics::CpuStoredClears() == stored && recorder->Submissions() == submissions, "resident target waits: a clear to denormal or NaN halves was stored by the CPU, or waited for");
+            else Check(AgcDriver::Graphics::CpuStoredClears() == stored + 1, "resident target waits: the switch did not store a clear to denormal or NaN halves by the CPU");
+            StorageTexture::FlushPending(floats.address, floats.bytes, nullptr, "test");
+            device->WaitIdle();
+            std::vector<std::uint64_t> texels(static_cast<std::size_t>(Extent.width) * Extent.height);
+            AgcDriver::Graphics::ReadColorTarget(floats, std::as_writable_bytes(std::span(texels)));
+            bool exact = expanded(wideCmask, cmaskBytes);
+            for (std::uint32_t y = 0; exact && y < Extent.height; ++y) {
+                for (std::uint32_t x = 0; exact && x < Extent.width; ++x) exact = SameHalves(texels[static_cast<std::size_t>(y) * Extent.width + x], x < left ? texel : 0u);
+            }
+            Check(exact, "resident target waits: a clear to denormal or NaN halves did not leave those bits in its target, or left the CMASK cleared");
+        }
         for (const auto& failure : failures) std::cerr << failure << '\n';
         if (!failures.empty()) return 1;
         std::puts("resident target waits tests passed");
