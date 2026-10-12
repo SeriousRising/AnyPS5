@@ -587,6 +587,7 @@ struct RegisteredPreparation {
     std::optional<ShaderRecompiler::RecompileRequest> request;
     std::vector<std::uint64_t> abiKey;
     std::shared_ptr<VulkanDevice> prebuildDevice;
+    std::optional<ShaderRecompiler::ShaderPixelStageInfo> testsOnlyPixel;
 };
 
 std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
@@ -653,6 +654,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         if (registration && count != 0) return nullptr;
         pixel = Graphics::DecodePixelStageInfo(state.context, {});
         wave = pixel->wave32 ? 32u : 64u;
+        if (const auto testsOnly = Graphics::DecodePixelStageInfo(state.context, {}, false, true); testsOnly.earlyZ != pixel->earlyZ) plan->testsOnlyPixel = testsOnly;
     } else {
         const auto routing = RegisterValue(state.context, 0x2d5);
         wave = (routing & 0x00400000u) != 0 ? 32u : 64u;
@@ -717,8 +719,15 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         request.context.compute->partialThreads = {1, 1, 1};
         append();
     } else if (request.context.pixel) {
+        const auto pushBytes = request.layout.pushConstantSizeBytes;
         request.layout.pushConstantSizeBytes = 0;
         append();
+        if (plan.testsOnlyPixel) {
+            request.context.pixel = plan.testsOnlyPixel;
+            append();
+            request.layout.pushConstantSizeBytes = pushBytes;
+            append();
+        }
     }
     return entries;
 }
