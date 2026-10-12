@@ -40,6 +40,14 @@ class Buffer;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+class DeviceQueueUse {
+public:
+    DeviceQueueUse();
+    ~DeviceQueueUse();
+    DeviceQueueUse(const DeviceQueueUse&) = delete;
+    DeviceQueueUse& operator=(const DeviceQueueUse&) = delete;
+};
+
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
@@ -549,6 +557,9 @@ public:
     // In-flight batches whose fence has not signaled (one status query each); under the mutex.
     std::size_t UnsignaledBatches() const;
     static bool FlipReadCheck();
+    static bool FlushThreads();
+    static void AllowReapThread();
+    bool ReapLeftToThread() const;
 
 private:
     struct Batch {
@@ -716,6 +727,9 @@ private:
     PFN_vkBeginCommandBuffer beginCommandBuffer = nullptr;
     PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
+    static void wakeReapThread();
+    static void joinReapThread();
+    static void reapThreadMain();
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
     PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
     PFN_vkCmdEndQuery cmdEndQuery = nullptr;

@@ -52,6 +52,7 @@ void Driver::stop() {
 
 Driver::Driver() {
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
+    Graphics::Recorder::AllowReapThread();
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });
     } catch (...) {

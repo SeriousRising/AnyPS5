@@ -124,7 +124,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
 
     recordLabelsForPacket(localDevice.get(), queueId);
 
-    if (queueId == 0) localDevice->ReapRecorded();
+    if (queueId == 0) localDevice->ReapAtBoundary();
 
     const auto labelPending = [&](std::uint64_t address, std::size_t bytes) {
         for (auto dword = address & ~std::uint64_t{3}; dword < address + bytes; dword += 4) {

@@ -21,9 +21,11 @@
 #include <cstring>
 #include <exception>
 #include <iterator>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -170,8 +172,9 @@ std::string ThreadSyncReport() {
 // Unlocked timeline waits (WaitSerial): count and time, for the [recorder] line.
 std::atomic<std::uint64_t> unlockedWaits{0}, unlockedWaitedUs{0};
 // vkQueueSubmit calls and their time (APS5_PROFILE_DRAW; Submit runs under the GpuMutex).
-std::uint64_t submitCount = 0;
-double submitUs = 0, submitMaxUs = 0;
+std::atomic<std::uint64_t> submitCount{0}, submitNs{0}, submitMaxNs{0};
+std::atomic<int> submitFailure{VK_SUCCESS};
+void JoinSubmitThread();
 // Threads inside a timeline wait with the GpuMutex released (WaitSerial, syncThroughUnlocked): a
 // recorder's teardown, after its Sync() made every wait satisfiable, waits until they left the
 // semaphore before destroying it. Counted per recorder id (a small fixed array; the waiter cannot
@@ -1117,11 +1120,13 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 }
 
 Recorder::~Recorder() {
+    joinReapThread();
     try {
         Sync();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
+    JoinSubmitThread();
     if (activeRecorder == this) {
         activeRecorder = nullptr;
         pendingWrites.store(nullptr, std::memory_order_release);
@@ -2921,8 +2926,224 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
     return false;
 }
 
+namespace {
+
+// Flush threads: the vkQueueSubmit of a flushed batch is made by a submit thread, in the order the
+// batches were flushed, and finished batches are reaped by a reap thread (Recorder::reapThreadMain).
+// Neither thread is needed for correctness: a waiter waits on the batch's fence or timeline value,
+// which a batch still queued here reaches once the thread submitted it. Every other use of the
+// device queue takes a DeviceQueueUse first, which waits until the queued submits were made, so
+// the order of submissions on the queue is the order of the calls, as before.
+// APS5_NO_FLUSH_THREADS=1 submits and reaps on the calling threads as before.
+struct QueuedSubmit {
+    VkQueue queue;
+    PFN_vkQueueSubmit submit;
+    VkCommandBuffer commands;
+    VkFence fence;
+    VkSemaphore timeline;
+    std::uint64_t serial;
+};
+
+struct SubmitQueue {
+    std::mutex mutex;
+    std::condition_variable wake, drained;
+    std::deque<QueuedSubmit> items;
+    bool busy = false;
+    std::thread thread;
+    bool started = false;
+    bool stop = false;
+    std::mutex joinMutex;
+};
+
+SubmitQueue& SubmitThreadQueue() {
+    static SubmitQueue* const queue = new SubmitQueue;
+    return *queue;
+}
+
+std::mutex& DeviceQueueMutex() {
+    static std::mutex* const mutex = new std::mutex;
+    return *mutex;
+}
+
+VkResult SubmitNow(const QueuedSubmit& item) {
+    VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submission.commandBufferCount = 1;
+    submission.pCommandBuffers = &item.commands;
+    VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+    timelineInfo.signalSemaphoreValueCount = 1;
+    timelineInfo.pSignalSemaphoreValues = &item.serial;
+    if (item.timeline != VK_NULL_HANDLE) {
+        submission.pNext = &timelineInfo;
+        submission.signalSemaphoreCount = 1;
+        submission.pSignalSemaphores = &item.timeline;
+    }
+    std::lock_guard lock(DeviceQueueMutex());
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = item.submit(item.queue, 1, &submission, item.fence);
+    if (DrawProfiled()) {
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        submitCount.fetch_add(1, std::memory_order_relaxed);
+        submitNs.fetch_add(ns, std::memory_order_relaxed);
+        auto seen = submitMaxNs.load(std::memory_order_relaxed);
+        while (ns > seen && !submitMaxNs.compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
+        }
+    }
+    return result;
+}
+
+void SubmitThreadMain() {
+    CpuTopology::PinHelperThread("submit thread");
+    auto& queue = SubmitThreadQueue();
+    std::unique_lock lock(queue.mutex);
+    for (;;) {
+        queue.wake.wait(lock, [&] { return !queue.items.empty() || queue.stop; });
+        if (queue.items.empty()) return;
+        const auto item = queue.items.front();
+        queue.items.pop_front();
+        queue.busy = true;
+        lock.unlock();
+        const auto result = SubmitNow(item);
+        if (result != VK_SUCCESS) {
+            int none = VK_SUCCESS;
+            submitFailure.compare_exchange_strong(none, static_cast<int>(result));
+            std::fprintf(stderr, "[gpu] vkQueueSubmit of recorded batch %llu failed on the submit thread (Vulkan result %d); its waiters report it\n", static_cast<unsigned long long>(item.serial), static_cast<int>(result));
+        }
+        lock.lock();
+        queue.busy = false;
+        if (queue.items.empty()) queue.drained.notify_all();
+    }
+}
+
+bool QueueSubmit(const QueuedSubmit& item) {
+    auto& queue = SubmitThreadQueue();
+    try {
+        std::lock_guard lock(queue.mutex);
+        if (queue.stop) return false;
+        if (!queue.started) {
+            queue.thread = std::thread(&SubmitThreadMain);
+            queue.started = true;
+        }
+        queue.items.push_back(item);
+    } catch (...) {
+        return false;
+    }
+    queue.wake.notify_one();
+    return true;
+}
+
+void DrainSubmits() {
+    auto& queue = SubmitThreadQueue();
+    std::unique_lock lock(queue.mutex);
+    queue.drained.wait(lock, [&] { return queue.items.empty() && !queue.busy; });
+}
+
+void JoinSubmitThread() {
+    auto& queue = SubmitThreadQueue();
+    std::lock_guard joining(queue.joinMutex);
+    std::thread worker;
+    {
+        std::lock_guard lock(queue.mutex);
+        if (!queue.started) return;
+        queue.stop = true;
+        worker = std::move(queue.thread);
+    }
+    queue.wake.notify_all();
+    worker.join();
+    std::lock_guard lock(queue.mutex);
+    queue.started = false;
+    queue.stop = false;
+}
+
+struct ReapThread {
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool wanted = false;
+    bool stop = false;
+    std::thread thread;
+    std::atomic<bool> started{false};
+    // Set by a caller whose every use of the recorder is under GuestMemory::GpuMutex (the
+    // driver): the reap thread takes the mutex and would race one that is not.
+    std::atomic<bool> allowed{false};
+    std::mutex joinMutex;
+    std::string failure;
+};
+
+ReapThread& ReapThreadState() {
+    static ReapThread* const state = new ReapThread;
+    return *state;
+}
+
+}
+
+bool Recorder::FlushThreads() {
+    static const bool enabled = std::getenv("APS5_NO_FLUSH_THREADS") == nullptr;
+    return enabled;
+}
+
+DeviceQueueUse::DeviceQueueUse() {
+    DrainSubmits();
+    DeviceQueueMutex().lock();
+}
+
+DeviceQueueUse::~DeviceQueueUse() {
+    DeviceQueueMutex().unlock();
+}
+
+void Recorder::AllowReapThread() {
+    ReapThreadState().allowed.store(true, std::memory_order_release);
+}
+
+bool Recorder::ReapLeftToThread() const {
+    return FlushThreads() && timeline != VK_NULL_HANDLE && activeRecorder == this && inFlight.size() < 8 && ReapThreadState().started.load(std::memory_order_acquire);
+}
+
+void Recorder::wakeReapThread() {
+    auto& state = ReapThreadState();
+    static const bool reapThread = std::getenv("APS5_NO_REAP_THREAD") == nullptr;
+    if (!reapThread || !state.allowed.load(std::memory_order_acquire)) return;
+    try {
+        std::lock_guard lock(state.mutex);
+        if (state.stop) return;
+        if (!state.started.load(std::memory_order_relaxed)) {
+            state.thread = std::thread(&Recorder::reapThreadMain);
+            state.started.store(true, std::memory_order_release);
+        }
+        state.wanted = true;
+    } catch (...) {
+        return;
+    }
+    state.wake.notify_one();
+}
+
+void Recorder::joinReapThread() {
+    auto& state = ReapThreadState();
+    std::lock_guard joining(state.joinMutex);
+    std::thread worker;
+    {
+        std::lock_guard lock(state.mutex);
+        if (!state.started.load(std::memory_order_relaxed)) return;
+        state.stop = true;
+        worker = std::move(state.thread);
+    }
+    state.wake.notify_all();
+    worker.join();
+    std::lock_guard lock(state.mutex);
+    state.started.store(false, std::memory_order_release);
+    state.stop = false;
+}
+
 void Recorder::Submit() {
     PerformanceTimer frameTiming("Recorder.Submit");
+    if (const auto failed = submitFailure.load(std::memory_order_acquire); failed != VK_SUCCESS) Check(static_cast<VkResult>(failed), "vkQueueSubmit recorder (submit thread)");
+    {
+        auto& reaping = ReapThreadState();
+        std::string failure;
+        {
+            std::lock_guard lock(reaping.mutex);
+            failure.swap(reaping.failure);
+        }
+        if (!failure.empty()) throw std::runtime_error("AGC graphics: the reap thread failed: " + failure);
+    }
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
@@ -2951,30 +3172,20 @@ void Recorder::Submit() {
     }
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
-    VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
-    VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
-    timelineInfo.signalSemaphoreValueCount = 1;
-    timelineInfo.pSignalSemaphoreValues = &serial;
-    if (timeline != VK_NULL_HANDLE) {
-        submission.pNext = &timelineInfo;
-        submission.signalSemaphoreCount = 1;
-        submission.pSignalSemaphores = &timeline;
-    }
     const auto submitStart = std::chrono::steady_clock::now();
-    Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
+    const QueuedSubmit queued{context.queue, function(queueSubmit, "vkQueueSubmit"), batch->commands, batch->fence, timeline, serial};
+    static const bool submitThread = std::getenv("APS5_NO_SUBMIT_THREAD") == nullptr;
+    if (!FlushThreads() || !submitThread || !QueueSubmit(queued)) {
+        DrainSubmits();
+        Check(SubmitNow(queued), "vkQueueSubmit recorder");
+    }
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
-        const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
-        ++submitCount;
-        submitUs += us;
-        submitMaxUs = std::max(submitMaxUs, us);
         if (auto* frame = PerformanceContext::Current()) frame->Add(frame->Get("Recorder", "submit"), batch->submittedAt - submitStart);
     }
     {
@@ -2985,6 +3196,7 @@ void Recorder::Submit() {
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (FlushThreads() && activeRecorder == this && timeline != VK_NULL_HANDLE) wakeReapThread();
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
@@ -3022,6 +3234,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     wait.pValues = &serial;
     auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
+        if (const auto failed = submitFailure.load(std::memory_order_acquire); failed != VK_SUCCESS) return static_cast<VkResult>(failed);
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
         std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), waited);
         result = waitSemaphores(device, &wait, 5'000'000'000ull);
@@ -3029,6 +3242,64 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     return result;
 }
 
+}
+
+void Recorder::reapThreadMain() {
+    CpuTopology::PinHelperThread("reap thread");
+    auto& state = ReapThreadState();
+    auto& mutex = GuestMemory::GpuMutex();
+    for (;;) {
+        {
+            std::unique_lock lock(state.mutex);
+            state.wake.wait(lock, [&] { return state.wanted || state.stop; });
+            if (state.stop) return;
+            state.wanted = false;
+        }
+        std::uint64_t awaited = 0;
+        for (;;) {
+            // Never a blocking lock: the recorder's teardown joins this thread, under the mutex or
+            // not, and the worker that holds the mutex most of the time must not queue behind it.
+            while (!mutex.try_lock()) {
+                std::unique_lock lock(state.mutex);
+                if (state.wake.wait_for(lock, std::chrono::microseconds(50), [&] { return state.stop; })) return;
+            }
+            std::uint64_t serial = 0;
+            VkDevice device = VK_NULL_HANDLE;
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            PFN_vkWaitSemaphoresKHR waitSemaphores = nullptr;
+            std::optional<UnlockedWaiter> waiter;
+            try {
+                if (auto* recorder = activeRecorder; recorder != nullptr && recorder->timeline != VK_NULL_HANDLE) {
+                    recorder->Reap();
+                    if (!recorder->inFlight.empty()) {
+                        waitSemaphores = recorder->context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+                        device = recorder->context.device;
+                        semaphore = recorder->timeline;
+                        waiter.emplace(recorder->id);
+                        serial = recorder->inFlight.front()->serial;
+                    }
+                }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[gpu] reap thread: %s; the next submit reports it\n", error.what());
+                std::lock_guard lock(state.mutex);
+                state.failure = error.what();
+            }
+            mutex.unlock();
+            if (serial == 0) break;
+            const auto result = serial == awaited ? VK_SUCCESS : WaitTimeline(device, semaphore, waitSemaphores, serial);
+            waiter.reset();
+            std::unique_lock lock(state.mutex);
+            // The timeline reached the batch but its fence did not read as signaled yet: not a
+            // reason to take the mutex from the worker again at once.
+            if (serial == awaited) state.wake.wait_for(lock, std::chrono::microseconds(100), [&] { return state.stop; });
+            awaited = serial;
+            if (state.stop) return;
+            if (result != VK_SUCCESS) {
+                if (state.failure.empty()) state.failure = "vkWaitSemaphoresKHR failed with Vulkan result " + std::to_string(static_cast<int>(result));
+                break;
+            }
+        }
+    }
 }
 
 void Recorder::WaitSerial(std::uint64_t serial) {
@@ -3417,7 +3688,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     const auto& h = holdCounters;
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@function+caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
-                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount.load()), submitCount.load() != 0 ? submitNs.load() / 1000.0 / static_cast<double>(submitCount.load()) : 0.0, submitMaxNs.load() / 1000.0);
                     const auto reads = Recorder::ReadCounts();
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
@@ -3426,11 +3697,16 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
+            if (const auto failed = submitFailure.load(std::memory_order_acquire); failed != VK_SUCCESS) {
+                result = static_cast<VkResult>(failed);
+                break;
+            }
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+            const DeviceQueueUse queueUse;
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }

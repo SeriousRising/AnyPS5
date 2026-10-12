@@ -94,7 +94,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         else if (!labelPacket && packetFlush) ++packetFlushes;
         else ++deadlineFlushes;
     } else if (reap) {
-        localDevice->ReapRecorded();
+        localDevice->ReapAtBoundary();
         steps.Mark(FlushReap);
         ++boundaryReaps;
     }
