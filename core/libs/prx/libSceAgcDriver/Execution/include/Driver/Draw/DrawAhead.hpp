@@ -48,6 +48,8 @@ struct DrawAhead {
     std::atomic<std::uint64_t> draws{0};
     std::array<std::atomic<std::uint64_t>, DrawAheadCountKinds> counts{};
     std::array<std::uint64_t, DrawAheadCountKinds> reported{};
+    std::array<std::atomic<std::uint64_t>, 9> refused{};
+    std::array<std::uint64_t, 9> refusedReported{};
     void Count(DrawAheadCount kind) { counts[kind].fetch_add(1, std::memory_order_relaxed); }
 };
 
