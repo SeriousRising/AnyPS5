@@ -171,6 +171,13 @@ void storeSingleTexels(const Context& context, const ColorTarget& color) {
     MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
 }
 
+void reportCpuClear(const ColorTarget& color, const char* refusal) {
+    static std::mutex reportMutex;
+    static std::set<std::pair<std::uint64_t, std::string>> reported;
+    std::lock_guard lock(reportMutex);
+    if (reported.size() < 32 && reported.emplace(color.address, refusal != nullptr ? refusal : "unknown").second) std::fprintf(stderr, "[gpu] color target 0x%llx (%ux%u, VkFormat %d): its fast clear is stored by the CPU and uploaded again, the image clear was refused: %s\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), refusal != nullptr ? refusal : "unknown");
+}
+
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
     if (ProvedCurrentDccKeys(color.dccAddress, color.bytes, resident.TargetKeyProof()) != DccKeys::ClearRegister) return;
@@ -190,6 +197,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
         MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
         return;
     }
+    reportCpuClear(color, refusal);
     storeClearTexels(context, color, texel);
     resident.Refresh();
 }
@@ -338,6 +346,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     const bool filled = state == CmaskState::Cleared && resident != nullptr && clearToTexel(*resident, texel, color.elementBytes, refusal);
     if (!filled) {
         storeCmaskClearTexels(color, layout, state == CmaskState::Cleared ? nullptr : &cleared, texel);
+        if (state == CmaskState::Cleared && resident != nullptr) reportCpuClear(color, refusal);
         if (resident != nullptr) resident->Refresh();
     }
     const std::vector<std::byte> expanded(bytes, std::byte{0xff});
