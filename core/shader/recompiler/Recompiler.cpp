@@ -960,7 +960,14 @@ bool ResultMemo() {
     return resultMemo;
 }
 
-constexpr std::size_t ResultMemoEntries = 256;
+std::size_t ResultMemoEntries() {
+    static const std::size_t entries = [] {
+        const char* text = std::getenv("APS5_RESULT_MEMO_ENTRIES");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{1024};
+    }();
+    return entries;
+}
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
@@ -996,7 +1003,7 @@ void reportResultMemo() {
     for (std::size_t word = 0; word <= ResultMemoUserWords; ++word) {
         if (const auto differs = counters.userWordDiffers[word].exchange(0, std::memory_order_relaxed); differs != 0) words += " " + (word == ResultMemoUserWords ? std::string("later or size") : std::to_string(word)) + ":" + std::to_string(differs);
     }
-    std::fprintf(stderr, "[recompile] result memo misses (10 s, %zu entries a program): %llu had been evicted from their program's memo, %llu were a variant's first; the others against the variant's newest entry differ in:%s; first differing user data word:%s\n", ResultMemoEntries, static_cast<unsigned long long>(counters.evictedBefore.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.firstOfVariant.exchange(0, std::memory_order_relaxed)), fields.c_str(), words.c_str());
+    std::fprintf(stderr, "[recompile] result memo misses (10 s, %zu entries a program): %llu had been evicted from their program's memo, %llu were a variant's first; the others against the variant's newest entry differ in:%s; first differing user data word:%s\n", ResultMemoEntries(), static_cast<unsigned long long>(counters.evictedBefore.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.firstOfVariant.exchange(0, std::memory_order_relaxed)), fields.c_str(), words.c_str());
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
 }
 
@@ -1121,7 +1128,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
             source.memo.push_front({variant->artifact.variantId, hash, shared, fields, profile ? std::vector<std::uint32_t>(snapshot.userData.begin(), snapshot.userData.end()) : std::vector<std::uint32_t>{}});
             source.memoIndex.emplace(index, source.memo.begin());
-            while (source.memo.size() > ResultMemoEntries) {
+            while (source.memo.size() > ResultMemoEntries()) {
                 const auto& last = source.memo.back();
                 if (profile) {
                     if (source.memoEvicted.size() >= 65536) source.memoEvicted.clear();
