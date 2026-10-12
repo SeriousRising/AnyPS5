@@ -394,6 +394,49 @@ int main() {
             const auto name = "deterministic DAG " + std::to_string(trial);
             requireOriginalDominanceSets(std::move(dag), name.c_str());
         }
+        for (const auto& edges : {std::vector<std::vector<std::uint32_t>>{{1, 3}, {2}, {0, 5}, {4}, {5, 0}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1, 6}, {2, 5}, {3}, {5, 4}, {5, 0}, {0}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1, 7}, {2, 6}, {3}, {4}, {6, 5}, {6, 0}, {0}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1, 7}, {2, 6}, {3, 2}, {4, 5}, {5, 6}, {6}, {0}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 5}, {3, 4}, {4}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 3}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2}, {1, 3}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 5}, {4, 3}, {4}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3, 6}, {5, 4}, {5}, {2}, {7}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2}, {3, 1}, {4, 2}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2}, {1, 3}, {2, 4}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 4}, {3, 5}, {1}, {6}, {6}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3}, {4, 5}, {3, 6}, {6}, {7}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 5}, {3, 4}, {4, 6}, {5}, {6, 7}, {1, 7}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 9}, {3, 4}, {5, 6}, {8}, {7}, {7}, {4, 8}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3, 4}, {5, 6}, {7}, {5, 4}, {7}, {1}, {}},
+                std::vector<std::vector<std::uint32_t>>{{1}, {2, 6}, {4, 3}, {4, 5}, {1}, {4}, {}}}) {
+            const auto conditionCount = std::count_if(edges.begin(), edges.end(), [](const auto& targets) { return targets.size() == 2u; });
+            for (unsigned mask = 0; mask < (1u << conditionCount); ++mask) {
+                auto oriented = edges;
+                unsigned condition = 0;
+                for (auto& targets : oriented) {
+                    if (targets.size() == 2u && (mask & (1u << condition++))) std::swap(targets[0], targets[1]);
+                }
+                const auto name = "loop selection joins, continues and nested exits with " + std::to_string(edges.size()) + " blocks, orientation " + std::to_string(mask);
+                requireStructuredLoop(oriented, name.c_str());
+            }
+        }
+        auto reorderedChain = makeGraph({{2}, {4}, {}, {1}, {0}});
+        reorderedChain.entryBlock = 3;
+        Structurizer{}.Structurize(reorderedChain);
+        requireExactPostDominators(reorderedChain, "a chain whose block ids do not follow control flow");
+        auto disconnected = makeGraph({{1}, {}, {3}, {4}, {}});
+        Structurizer{}.Structurize(disconnected);
+        requireExactPostDominators(disconnected, "a disconnected forward chain");
+        auto nonterminating = makeGraph({{1}, {2}, {1}});
+        try {
+            Structurizer{}.Structurize(nonterminating);
+            throw std::runtime_error("a nonterminating loop unexpectedly structurized");
+        } catch (const std::runtime_error& error) {
+            if (std::string(error.what()).find("has no structured merge/continue") == std::string::npos) throw;
+        }
+        requireExactPostDominators(nonterminating, "a nonterminating loop");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

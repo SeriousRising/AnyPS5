@@ -221,6 +221,43 @@ void verifySameExecutions(const std::string& prefix, const ControlFlowGraph& ori
     }
 }
 
+void verifyNestedSelectionExecutions() {
+    for (const auto& edges : {std::vector<std::vector<std::uint32_t>>{{1, 7}, {2, 6}, {3, 2}, {4, 5}, {5, 6}, {6}, {0}, {}},
+            std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3, 4}, {5, 6}, {7}, {5, 4}, {7}, {1}, {}},
+            std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3, 4}, {5, 6}, {7}, {5, 4}, {5, 7}, {1}, {}},
+            std::vector<std::vector<std::uint32_t>>{{1}, {2, 8}, {3, 4}, {5, 6}, {7}, {1, 4}, {7}, {1}, {}}}) {
+        const auto count = std::count_if(edges.begin(), edges.end(), [](const auto& targets) { return targets.size() == 2u; });
+        for (unsigned mask = 0; mask < (1u << count); ++mask) {
+            ControlFlowGraph original;
+            original.entryBlock = 0;
+            unsigned condition = 0;
+            for (std::uint32_t id = 0; id < edges.size(); ++id) {
+                BasicBlock block;
+                block.id = id;
+                block.instructionBegin = id * 2u;
+                block.instructionEnd = id * 2u + 2u;
+                block.successors = edges[id];
+                if (block.successors.size() == 2u && (mask & (1u << condition++))) std::swap(block.successors[0], block.successors[1]);
+                block.terminator.kind = block.successors.empty() ? TerminatorKind::Return : block.successors.size() == 1u ? TerminatorKind::Branch : TerminatorKind::ConditionalBranch;
+                block.terminator.condition = block.successors.size() == 2u ? BranchCondition::SccNonZero : BranchCondition::Always;
+                if (!block.successors.empty()) block.terminator.trueBlock = block.successors[0];
+                if (block.successors.size() == 2u) block.terminator.falseBlock = block.successors[1];
+                original.blocks.push_back(std::move(block));
+            }
+            for (const auto& block : original.blocks) {
+                for (const auto target : block.successors) original.FindBlock(target).predecessors.push_back(block.id);
+            }
+            auto graph = original;
+            Structurizer{}.Structurize(graph);
+            verifyStructured("nested-loop selection joins: ", graph);
+            verifySameExecutions("nested-loop selection joins: ", original, graph);
+            const auto normalized = GraphToString(graph);
+            Structurizer{}.Structurize(graph);
+            require(GraphToString(graph) == normalized, "nested-loop selection joins change on repeated structurization");
+        }
+    }
+}
+
 std::size_t clonedInstructions(const ControlFlowGraph& graph) {
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::size_t> copies;
     std::size_t cloned = 0;
@@ -1267,6 +1304,179 @@ done:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
          LongBranchBack, Split::None},
+        {"loop-local selection merge through an unconditional arm", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s9, 0
+  s_mov_b32 s10, 4
+loop:
+  s_cmp_lt_u32 s9, s10
+  s_cbranch_scc0 done
+  s_cmp_lt_u32 s9, s2
+  s_cbranch_scc0 latch
+  v_add_nc_u32 v1, 3, v1
+  s_branch inner
+inner:
+  s_cmp_eq_u32 s9, 1
+  s_cbranch_scc0 latch
+  v_add_nc_u32 v1, 7, v1
+  s_add_u32 s9, s9, 1
+  s_cmp_lt_u32 s9, s10
+  s_cbranch_scc1 loop
+latch:
+  v_add_nc_u32 v1, 11, v1
+  s_add_u32 s9, s9, 1
+  s_branch loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0x7e020280u, 0xbe890380u, 0xbe8a0384u, 0xbf0a0a09u, 0xbf84000du, 0xbf0a0209u, 0xbf840008u, 0x4a020283u, 0xbf820000u,
+             0xbf068109u, 0xbf840004u, 0x4a020287u, 0x80098109u, 0xbf0a0a09u, 0xbf85fff4u, 0x4a02028bu, 0x80098109u, 0xbf82fff1u}), Split::Clone},
+        {"loop-local selection join through a strictly nested loop", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s9, 0
+  s_mov_b32 s10, 4
+  s_mov_b32 s8, 3
+  s_mov_b32 s12, 3
+  s_mov_b32 s13, 2
+loop:
+  s_cmp_lt_u32 s9, s10
+  s_cbranch_scc0 done
+  s_mov_b32 s11, 0
+  s_cmp_lt_u32 s9, s8
+  s_cbranch_scc0 latch
+inner:
+  v_add_nc_u32 v1, 2, v1
+  s_add_u32 s11, s11, 1
+  s_cmp_lt_u32 s11, s12
+  s_cbranch_scc1 inner
+  s_cmp_eq_u32 s9, 1
+  s_cbranch_scc0 tail
+  v_add_nc_u32 v1, 3, v1
+  s_cmp_lt_u32 s9, s13
+  s_cbranch_scc0 latch
+tail:
+  v_add_nc_u32 v1, 7, v1
+  s_branch latch
+latch:
+  v_add_nc_u32 v1, 11, v1
+  s_add_u32 s9, s9, 1
+  s_branch loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0x7e020280u, 0xbe890380u, 0xbe8a0384u, 0xbe880383u, 0xbe8c0383u, 0xbe8d0382u, 0xbf0a0a09u, 0xbf840011u,
+             0xbe8b0380u, 0xbf0a0809u, 0xbf84000bu, 0x4a020282u, 0x800b810bu, 0xbf0a0c0bu, 0xbf85fffcu, 0xbf068109u,
+             0xbf840003u, 0x4a020283u, 0xbf0a0d09u, 0xbf840002u, 0x4a020287u, 0xbf820000u, 0x4a02028bu, 0x80098109u,
+             0xbf82ffedu}), Split::None},
+        {"conditional tail containing a strictly nested cycle", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s9, 0
+  s_mov_b32 s10, 4
+  s_mov_b32 s8, 3
+  s_mov_b32 s12, 3
+outer:
+  s_cmp_lt_u32 s9, s10
+  s_cbranch_scc0 done
+  s_mov_b32 s11, 0
+  s_cmp_lt_u32 s9, s8
+  s_cbranch_scc0 local
+  s_cmp_eq_u32 s9, 1
+  s_cbranch_scc0 alternate
+inner:
+  v_add_nc_u32 v1, 2, v1
+  s_add_u32 s11, s11, 1
+  s_cmp_lt_u32 s11, s12
+  s_cbranch_scc1 inner
+local:
+  v_add_nc_u32 v1, 3, v1
+  s_branch latch
+alternate:
+  v_add_nc_u32 v1, 7, v1
+  s_branch latch
+latch:
+  v_add_nc_u32 v1, 11, v1
+  s_add_u32 s9, s9, 1
+  s_branch outer
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0x7e020280u, 0xbe890380u, 0xbe8a0384u, 0xbe880383u, 0xbe8c0383u, 0xbf0a0a09u, 0xbf840010u, 0xbe8b0380u, 0xbf0a0809u, 0xbf840006u, 0xbf068109u, 0xbf840006u, 0x4a020282u, 0x800b810bu, 0xbf0a0c0bu, 0xbf85fffcu, 0x4a020283u, 0xbf820002u, 0x4a020287u, 0xbf820000u, 0x4a02028bu, 0x80098109u, 0xbf82ffeeu}), Split::Clone},
+        {"conditional repeat beside the inner merge of a nested selection in a loop", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, 0
+loop:
+  v_cmp_gt_u32 vcc, s8, v0
+  s_cbranch_vccz join
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccnz inner
+  v_cmp_gt_u32 vcc, 4, v0
+  s_cbranch_vccnz latch
+inner:
+  v_add_nc_u32 v1, 1, v1
+join:
+  v_add_nc_u32 v1, 2, v1
+  s_cmp_ge_u32 s8, 64
+  s_cbranch_scc1 done
+latch:
+  s_add_u32 s8, s8, 16
+  s_cmp_lt_u32 s8, 64
+  s_cbranch_scc1 loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850003u, 0x80089008u, 0xbf0ac008u, 0xbf85fff3u}), Split::None},
+        {"reconverging conditional tails before a loop repeat test", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, 0
+loop:
+  v_cmp_gt_u32 vcc, s8, v0
+  s_cbranch_vccz join
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccnz inner
+  v_cmp_gt_u32 vcc, 4, v0
+  s_cbranch_vccnz latch
+inner:
+  v_add_nc_u32 v1, 1, v1
+join:
+  v_add_nc_u32 v1, 2, v1
+  s_cmp_ge_u32 s8, 64
+  s_cbranch_scc1 done
+latch:
+  s_add_u32 s8, s8, 16
+  v_cmp_gt_u32 vcc, 4, v0
+  s_cbranch_vccnz right
+  v_add_nc_u32 v1, 1, v1
+  s_branch repeat
+right:
+  v_add_nc_u32 v1, 2, v1
+repeat:
+  s_cmp_lt_u32 s8, 64
+  s_cbranch_scc1 loop
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0xbe880380u, 0x7e020280u, 0x7d880008u, 0xbf860005u, 0x7d880088u, 0xbf870002u, 0x7d880084u, 0xbf870004u, 0x4a020281u, 0x4a020282u, 0xbf09c008u, 0xbf850008u, 0x80089008u, 0x7d880084u, 0xbf870002u, 0x4a020281u, 0xbf820001u, 0x4a020282u, 0xbf0ac008u, 0xbf85ffeeu}), Split::Clone},
+        {"nested loop exit sharing the outer merge", R"(
+  s_mov_b32 s8, 0
+  v_mov_b32 v1, v0
+  s_branch outer
+inner_exit:
+  v_add_nc_u32 v1, 1, v1
+  s_cmp_ge_u32 s8, 4
+  s_cbranch_scc1 done
+inner:
+  s_add_u32 s8, s8, 1
+  v_add_nc_u32 v1, 2, v1
+  s_cmp_ge_u32 s8, 2
+  s_cbranch_scc1 inner_exit
+outer:
+  v_add_nc_u32 v1, 8, v1
+  s_branch inner
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0xbe880380u, 0x7e020300u, 0xbf820007u, 0x4a020281u, 0xbf098408u, 0xbf850006u,
+                0x80088108u, 0x4a020282u, 0xbf098208u, 0xbf85fff9u, 0x4a020288u, 0xbf82fffau}), Split::Route},
     };
     int failures = 0;
     for (const auto& program : programs) {
@@ -1279,6 +1489,7 @@ done:
     }
     try {
         verifyNullSwappc();
+        verifyNestedSelectionExecutions();
         verifyLargeLoopExitFallback();
         verifyNestedExitForwarders();
     } catch (const std::exception& error) {
