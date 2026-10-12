@@ -111,6 +111,13 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
     MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
 }
 
+void reportCpuClear(const ColorTarget& color, const char* refusal) {
+    static std::mutex reportMutex;
+    static std::set<std::pair<std::uint64_t, std::string>> reported;
+    std::lock_guard lock(reportMutex);
+    if (reported.size() < 32 && reported.emplace(color.address, refusal != nullptr ? refusal : "unknown").second) std::fprintf(stderr, "[gpu] color target 0x%llx (%ux%u, VkFormat %d): its fast clear is stored by the CPU and uploaded again, the image clear was refused: %s\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), refusal != nullptr ? refusal : "unknown");
+}
+
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
     if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
@@ -130,6 +137,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
         MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
         return;
     }
+    reportCpuClear(color, refusal);
     storeClearTexels(context, color, texel);
     resident.Refresh();
 }
@@ -144,6 +152,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, Sto
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     if (resident == nullptr || !clearToTexel(*resident, texel, color.elementBytes, refusal)) {
+        if (resident != nullptr) reportCpuClear(color, refusal);
         StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
         writeTexels(color, texel);
         if (resident != nullptr) resident->Refresh();
