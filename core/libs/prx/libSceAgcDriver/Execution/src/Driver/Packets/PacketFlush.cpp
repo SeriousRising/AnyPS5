@@ -11,6 +11,8 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0};
+    static const bool profileSteps = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    LabelStepTimer steps(profileSteps);
     auto& deferred = deferredLabels();
     const bool queued = !deferred.labels.empty();
     const bool queuedTable = queued && QueuedLabelTable();
@@ -47,6 +49,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
     if (!submit && !record && !capped && !reap) {
         if (recordAtLock) ++recordTriesSkipped;
+        steps.Mark(FlushIdle);
         return;
     }
     if (reap) lastReapTry = now;
@@ -70,11 +73,14 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         ++triesFailed[record ? TryLabel : submit || capped ? TryFlush : TryReap];
         if (selfLocking && record) ++packetLockDeferred;
         else if (selfLocking && submit) ++packetSubmitDeferred;
+        steps.Mark(FlushTryFailed);
         return;
     }
+    steps.Mark(FlushLockWait);
     const auto localDevice = device.Load();
     if (record || recordAtLock) {
         recordDeferredLabels(localDevice.get(), queue);
+        steps.Mark(FlushRecord);
 
         if ((!labelPacket && packetFlush) || deferredDue) submit = true;
     }
@@ -83,11 +89,13 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
         localDevice->SubmitRecorded(queue == 0);
+        steps.Mark(FlushSubmit);
         if (capped) ++capFlushes;
         else if (!labelPacket && packetFlush) ++packetFlushes;
         else ++deadlineFlushes;
     } else if (reap) {
         localDevice->ReapRecorded();
+        steps.Mark(FlushReap);
         ++boundaryReaps;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
