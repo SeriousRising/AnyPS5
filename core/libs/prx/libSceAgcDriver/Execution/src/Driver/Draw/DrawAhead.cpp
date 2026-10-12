@@ -221,9 +221,16 @@ void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint
     std::shared_ptr<const DrawDecode> decode = entry != nullptr ? entry->decode : nullptr;
     if (decode == nullptr) decode = decodeDraw(queue, submission);
     const auto& graphics = decode->state;
-    const auto& programs = decode->programs;
+    auto programs = decode->programs;
     const auto& roles = decode->roles;
-    if (graphics.stages.mesh) return unsupported(AheadMesh);
+    static const bool meshes = std::getenv("APS5_NO_DRAW_AHEAD_MESH") == nullptr && std::getenv("APS5_NO_MESH_DRAW_KEY") == nullptr;
+    if (graphics.stages.mesh) {
+        if (!meshes) return unsupported(AheadMesh);
+        auto& words = programs.front().userData;
+        require(programs.front().firstUserSgpr == 0 && words.size() >= ShaderRecompiler::MeshIndexBufferUserWord + 4, "mesh program lacks the hidden user words");
+        const auto descriptor = Graphics::MeshIndexBufferDescriptor(drawParameters);
+        std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
+    }
     if (entry != nullptr && entry->stages.size() == programs.size()) {
         bool warm = true;
         std::vector<ShaderRecompiler::MemoryRegion> regions;
