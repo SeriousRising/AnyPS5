@@ -309,6 +309,7 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
 // Debug aid: APS5_NO_PENDING_FILL_KEYS=1 always waits, as before.
 std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
     static const bool disabled = std::getenv("APS5_NO_PENDING_FILL_KEYS") != nullptr;
+    static const bool joined = std::getenv("APS5_NO_JOINED_KEY_FILLS") == nullptr;
     if (disabled || !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
     auto writes = recorder.PendingWritesOver(begin, count);
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
@@ -321,6 +322,7 @@ std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, std::uint64_t b
     };
     for (const auto& write : writes) {
         if (unwritten.empty()) break;
+        if (!joined && (write.begin > begin || write.end < begin + count)) return std::nullopt;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
         bool decides = false;
         for (const auto& [from, to] : unwritten) {
@@ -338,14 +340,14 @@ std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, std::uint64_t b
         see(write.value);
     }
     for (const auto& [from, to] : unwritten) {
-        if (mixed) break;
+        if (mixed) return std::nullopt;
         const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
-        else mixed = true;
+        else return std::nullopt;
     }
-    if (mixed) return std::nullopt;
+    if (mixed && !unwritten.empty()) return std::nullopt;
     if (ScanProfileEnabled()) Scans().pendingFillKeys.fetch_add(1, std::memory_order_relaxed);
-    return ByteKeys(static_cast<std::uint8_t>(value));
+    return mixed ? DccKeys::Mixed : ByteKeys(static_cast<std::uint8_t>(value));
 }
 
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
