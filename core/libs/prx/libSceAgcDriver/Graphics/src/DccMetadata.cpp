@@ -513,10 +513,8 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool filled
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
-            if (filled) {
-                if (const auto keys = PendingFillKeys(*recorder, metaAddress, count)) return *keys;
-                if (ScanProfileEnabled()) Scans().pendingKeyWaits.fetch_add(1, std::memory_order_relaxed);
-            }
+            if (const auto keys = PendingFillKeys(*recorder, metaAddress, count)) return *keys;
+            if (filled && ScanProfileEnabled()) Scans().pendingKeyWaits.fetch_add(1, std::memory_order_relaxed);
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
         }
