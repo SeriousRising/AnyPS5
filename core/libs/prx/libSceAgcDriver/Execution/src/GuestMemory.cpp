@@ -1132,6 +1132,11 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, true);
 }
 
+bool CollectMemoCurrent(const CollectMemo& memo, std::uint64_t address, std::size_t bytes) {
+    constexpr std::uint64_t page = 4096;
+    return bytes != 0 && collectMemoEnabled() && threadCollectEpoch != 0 && memo.epoch == threadCollectEpoch && memo.unwatched == unwatchSerial.load(std::memory_order_acquire) && memo.begin <= (address & ~(page - 1)) && ((address + bytes + page - 1) & ~(page - 1)) <= memo.end;
+}
+
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, CollectMemo& memo) {
     return collectWrites(address, bytes, true, &memo);
 }

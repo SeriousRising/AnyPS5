@@ -244,6 +244,8 @@ struct DrawOutcome {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    RefreshParts lookupParts;
+    double lookupClearUs = 0;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -268,6 +270,8 @@ struct DrawProfile {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    RefreshParts lookupParts;
+    double lookupClearUs = 0;
     std::array<double, PhaseCount> totalsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
@@ -374,6 +378,10 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.partialLookups += outcome.partialLookups;
     profile.pagesWalked += outcome.pagesWalked;
     profile.lookupUs += outcome.lookupUs;
+    profile.lookupClearUs += outcome.lookupClearUs;
+    profile.lookupParts.refreshes += outcome.lookupParts.refreshes;
+    for (std::size_t i = 0; i < RefreshParts::PartCount; ++i) profile.lookupParts.us[i] += outcome.lookupParts.us[i];
+    for (std::size_t i = 0; i < RefreshParts::AnswerCount; ++i) profile.lookupParts.answers[i] += outcome.lookupParts.answers[i];
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -395,7 +403,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
-        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
+        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us; of that us: %llu refreshes, early answer %.0f, pending scan %.0f, collect %.0f, key proof %.0f, stamps %.0f, clear checks %.0f, the rest finding the image; early returns taken %llu, refused: no answer kept %llu, epoch or mapping moved %llu, pending images moved %llu, keys unsettled %llu, stamped %llu)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, static_cast<unsigned long long>(profile.lookupParts.refreshes), profile.lookupParts.us[RefreshParts::Early], profile.lookupParts.us[RefreshParts::Scan], profile.lookupParts.us[RefreshParts::Collect], profile.lookupParts.us[RefreshParts::Keys], profile.lookupParts.us[RefreshParts::Stamps], profile.lookupClearUs, static_cast<unsigned long long>(profile.lookupParts.answers[RefreshParts::Taken]), static_cast<unsigned long long>(profile.lookupParts.answers[RefreshParts::NoAnswer]), static_cast<unsigned long long>(profile.lookupParts.answers[RefreshParts::EpochMoved]), static_cast<unsigned long long>(profile.lookupParts.answers[RefreshParts::PendingMoved]), static_cast<unsigned long long>(profile.lookupParts.answers[RefreshParts::KeysUnsettled]), static_cast<unsigned long long>(profile.lookupParts.answers[RefreshParts::Stamped]));
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -441,6 +449,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.slowLookupUs = 0;
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = 0;
+    profile.lookupParts = {};
+    profile.lookupClearUs = 0;
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -944,9 +954,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    const auto partsBefore = profile ? ThreadRefreshParts() : RefreshParts{};
+    auto clearStart = lookupStart;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
+        if (profile) clearStart = std::chrono::steady_clock::now();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         static std::mutex reportMutex;
@@ -963,6 +976,11 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             outcome.slowLookupUs += lookupUs;
         }
         outcome.lookupUs += lookupUs;
+        outcome.lookupClearUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - clearStart).count();
+        const auto& parts = ThreadRefreshParts();
+        outcome.lookupParts.refreshes += parts.refreshes - partsBefore.refreshes;
+        for (std::size_t i = 0; i < RefreshParts::PartCount; ++i) outcome.lookupParts.us[i] += parts.us[i] - partsBefore.us[i];
+        for (std::size_t i = 0; i < RefreshParts::AnswerCount; ++i) outcome.lookupParts.answers[i] += parts.answers[i] - partsBefore.answers[i];
         outcome.pagesWalked += (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
