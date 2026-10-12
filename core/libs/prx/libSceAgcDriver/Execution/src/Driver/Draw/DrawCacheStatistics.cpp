@@ -21,7 +21,7 @@ void Driver::reportDrawCache(DrawEntryCounters& counters) {
         ahead[kind] = total - drawAhead.reported[kind];
         drawAhead.reported[kind] = total;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[draw-ahead] %s (10 s): %llu scans started, %llu draws prepared ahead, %llu draws hit with every stage prepared ahead; not prepared: %llu already cached, %llu the queue had reached, %llu read memory with GPU work pending, %llu indirect, mesh or rejected, %llu failed; %llu scans stopped at a packet they cannot follow\n", drawAheadEnabled() ? "on" : "off", ahead[AheadScans], ahead[AheadPrepared], ahead[AheadHits], ahead[AheadWarm], ahead[AheadPassed], ahead[AheadPending], ahead[AheadUnsupported], ahead[AheadErrors], ahead[AheadStops]);
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-ahead] %s (10 s): %llu scans started, %llu draws prepared ahead, %llu draws hit with every stage prepared ahead; of the prepared, reads over recorded GPU work: %llu served from known values, %llu read raw on evidence, %llu read without the wait they need in order, %llu under a pending or shadowed image (%llu of all these in vertex tables); not prepared: %llu already cached, %llu the queue had reached, %llu over recorded GPU work with that switched off, %llu indirect, mesh or rejected, %llu failed; %llu scans stopped at a packet they cannot follow\n", drawAheadEnabled() ? "on" : "off", ahead[AheadScans], ahead[AheadPrepared], ahead[AheadHits], ahead[AheadOverKnown], ahead[AheadOverRaw], ahead[AheadOverSync], ahead[AheadOverImage], ahead[AheadOverVertex], ahead[AheadWarm], ahead[AheadPassed], ahead[AheadPending], ahead[AheadUnsupported], ahead[AheadErrors], ahead[AheadStops]);
     counters = DrawEntryCounters{};
 }
 

@@ -14,7 +14,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-enum DrawAheadCount : std::size_t { AheadScans, AheadPrepared, AheadHits, AheadWarm, AheadPassed, AheadPending, AheadUnsupported, AheadErrors, AheadStops, DrawAheadCountKinds };
+enum DrawAheadCount : std::size_t { AheadScans, AheadPrepared, AheadHits, AheadWarm, AheadPassed, AheadPending, AheadUnsupported, AheadErrors, AheadStops, AheadOverKnown, AheadOverRaw, AheadOverSync, AheadOverImage, AheadOverVertex, DrawAheadCountKinds };
 
 struct DrawAhead {
     static constexpr std::size_t Running = std::numeric_limits<std::size_t>::max();
