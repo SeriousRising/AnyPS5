@@ -5,6 +5,7 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated) {
+    GuestMemory::HitchAdd(GuestMemory::HitchCost::Recompile, static_cast<std::uint64_t>(ms[PhaseRecompile] * 1e6));
     std::lock_guard lock(driverPhasesMutex);
     auto& totals = driverPhaseTotals[which];
     for (std::size_t i = 0; i < DriverPhaseCount; ++i) totals.ms[i] += ms[i];

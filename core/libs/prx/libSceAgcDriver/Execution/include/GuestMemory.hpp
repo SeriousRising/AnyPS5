@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
+#include <string>
+#include <chrono>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -232,6 +234,31 @@ private:
 // is written as 0), newest first, skipping `skip` frames above the caller; returns how many were
 // written. Stack unwinding, so only for rare, profiled events.
 std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned skip);
+
+// Hitch profile (APS5_PROFILE_DRAW=1): where queue 0's worker spent a long interval between two
+// presents. The worker adds its costs to cumulative counters as it goes (HitchAdd and the packet
+// calls do nothing on other threads or without the switch); HitchPresent, called by the presenter
+// at every present, takes the difference since the present before and returns the lines to print:
+// one for an interval over 100 ms (at most 20 a 10 s), and every 10 s the interval percentiles and
+// the counts over 50, 100 and 250 ms. A packet kind is its opcode, or 256 for a flip.
+enum class HitchCost : std::uint8_t { Recompile, PipelineCreate, MutexWait, GpuWait, Flush, Collect, Upload, WriteBack, Count };
+inline constexpr std::uint32_t HitchFlipKind = 256;
+bool HitchProfiled();
+void HitchWorker();
+void HitchAdd(HitchCost cost, std::uint64_t nanoseconds);
+void HitchPacketBegin(std::uint32_t kind);
+void HitchPacketEnd(std::uint32_t kind, std::uint64_t nanoseconds);
+std::vector<std::string> HitchPresent(std::chrono::steady_clock::time_point now, double inFlightWaitMs, std::string (*kindName)(std::uint32_t kind));
+struct HitchScope {
+    HitchCost cost;
+    std::chrono::steady_clock::time_point start;
+    explicit HitchScope(HitchCost cost) : cost(cost), start(HitchProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~HitchScope() {
+        if (HitchProfiled()) HitchAdd(cost, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
+    HitchScope(const HitchScope&) = delete;
+    HitchScope& operator=(const HitchScope&) = delete;
+};
 
 }
 

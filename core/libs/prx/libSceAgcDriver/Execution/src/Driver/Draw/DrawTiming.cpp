@@ -10,6 +10,7 @@ PendingDrawPhases& Driver::pendingDrawPhases() {
 }
 
 void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures) {
+    GuestMemory::HitchAdd(GuestMemory::HitchCost::Recompile, static_cast<std::uint64_t>(ms[DrawRowRecompile] * 1e6));
     std::lock_guard lock(drawPhasesMutex);
     auto& totals = drawPhaseTotals;
     for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) totals.ms[i] += ms[i];

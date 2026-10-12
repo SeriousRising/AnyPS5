@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <cstdlib>
 
@@ -137,7 +139,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     }
 }
 
+std::vector<std::string> HitchLines(std::chrono::steady_clock::time_point now, double inFlightWaitMs) {
+    return GuestMemory::HitchPresent(now, inFlightWaitMs, [](std::uint32_t kind) { return Pm4::Name(kind << 8u); });
+}
+
 void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
+    for (const auto& line : HitchLines(std::chrono::steady_clock::now(), waitedMs)) AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
     static std::vector<double> waits;
     static VulkanDevice::PresentStatistics previous{};
     static std::uint64_t previousFlips = 0, windowSerial = 0, previousUnsignaled = 0;

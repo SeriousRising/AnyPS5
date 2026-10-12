@@ -128,6 +128,7 @@ thread_local double threadWaitedMs = 0;
 
 void CountThreadSync(int source, double ms) {
     threadWaitedMs += ms;
+    GuestMemory::HitchAdd(GuestMemory::HitchCost::GpuWait, static_cast<std::uint64_t>(ms * 1e6));
     const auto tag = GuestMemory::GpuLockThreadTag();
     std::lock_guard lock(threadSyncsMutex);
     auto it = std::find_if(threadSyncs.begin(), threadSyncs.end(), [&](const ThreadSyncs& thread) { return thread.tag == tag; });
