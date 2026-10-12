@@ -1710,6 +1710,11 @@ unsigned long long CodeOffset(const void* address) {
 
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
+thread_local bool flushesLeftPending = false;
+}
+
+void LeaveGpuWritesPending() {
+    flushesLeftPending = true;
 }
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
@@ -1717,6 +1722,7 @@ void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
+    if (flushesLeftPending) return;
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
