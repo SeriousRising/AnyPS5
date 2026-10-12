@@ -434,6 +434,13 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     } else if (pixel) {
         request.layout.pushConstantSizeBytes = 0;
         append();
+        const auto testsOnly = Graphics::DecodePixelStageInfo(state.context, {}, snapshot.codeAddress == NullPixelProgramAddress(), true);
+        if (testsOnly.earlyZ != pixel->earlyZ) {
+            request.context.pixel = testsOnly;
+            append();
+            request.layout.pushConstantSizeBytes = 128;
+            append();
+        }
     }
     return entries;
 }
