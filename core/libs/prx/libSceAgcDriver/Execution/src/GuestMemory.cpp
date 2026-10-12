@@ -1681,7 +1681,11 @@ void AssertGpuLockHeld(const char* where) {
 
 void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
-        mutex.lock();
+        if (!mutex.try_lock()) {
+            waiting.fetch_add(1, std::memory_order_acq_rel);
+            mutex.lock();
+            waiting.fetch_sub(1, std::memory_order_acq_rel);
+        }
         acquired();
         return;
     }
@@ -1696,7 +1700,9 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
+        waiting.fetch_add(1, std::memory_order_acq_rel);
         mutex.lock();
+        waiting.fetch_sub(1, std::memory_order_acq_rel);
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (holders) {

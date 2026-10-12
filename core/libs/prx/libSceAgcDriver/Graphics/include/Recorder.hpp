@@ -594,6 +594,7 @@ private:
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
+        std::size_t nextCompletion = 0;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -780,6 +781,7 @@ private:
     static void wakeReapThread();
     static void joinReapThread();
     static void reapThreadMain();
+    bool reapYielding(std::uint64_t& retired);
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
     PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
     PFN_vkCmdEndQuery cmdEndQuery = nullptr;
