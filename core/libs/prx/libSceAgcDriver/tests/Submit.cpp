@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Query.hpp"
@@ -15,9 +16,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -478,6 +481,141 @@ void testMultiSubmissions() {
     }
 }
 
+std::array<std::uint32_t, 8> releaseLabel(volatile std::uint32_t* address, std::uint32_t value) {
+    auto words = endOfPipeLabel(address, value);
+    words[2] = 1u << 29u;
+    return words;
+}
+
+std::vector<std::uint32_t> emptyDispatch() {
+    alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        ShaderSpecialRegs specials{};
+    };
+    static Header header;
+    const auto codeAddress = reinterpret_cast<std::uintptr_t>(code.data());
+    header.shader.file_header = 0x34333231;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(Header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.registers = {{{0x20c, static_cast<std::uint32_t>(codeAddress >> 8u)}, {0x20d, static_cast<std::uint32_t>(codeAddress >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+    header.specials.dispatch_modifier = 0x8000u;
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    header.shader.specials = &header.specials;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    std::vector<std::uint32_t> words;
+    for (const auto reg : header.registers) words.insert(words.end(), {0xc0017600u, reg.offset, reg.value});
+    words.insert(words.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+    return words;
+}
+
+void testEndOfPipeInterruptBehindWorkWhileQueueWaits() {
+    alignas(64) static volatile std::uint32_t label = 0, gate = 0, done = 0;
+    KernelEqueue eq = 0;
+    check(sceKernelCreateEqueue(&eq, "AGC EOP behind work") == 0, "event queue creation failed");
+    auto owner = EqueuePin_nid_postfix(eq);
+    int tag = 0;
+    check(sceAgcDriverAddEqEvent(eq, 0, &tag) == 0, "graphics event registration failed");
+    auto words = emptyDispatch();
+    const auto rest = commands(endOfPipeLabel(&label, 1), waitEqual(&gate, 1), writeData(&done, 1));
+    words.insert(words.end(), rest.begin(), rest.end());
+    submit(0, words);
+    std::array<KernelEvent, 2> events{};
+    const auto start = std::chrono::steady_clock::now();
+    while (owner->GetTriggeredEvents(events.data(), 2) == 0) {
+        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), "an end-of-pipe interrupt behind recorded work never arrived while its queue waited");
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    check(label == 1, "an end-of-pipe interrupt arrived before its label landed");
+    check(events[0].udata == &tag && events[0].data == 1 && done == 0, "an end-of-pipe interrupt behind recorded work was delivered wrong");
+    check(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500), "an end-of-pipe interrupt behind recorded work waited for its queue");
+    gate = 1;
+    waitFor(&done, 1, "the queue never passed its wait after the interrupt");
+    AgcDriverWaitIdle_nid_postfix();
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "an end-of-pipe interrupt behind recorded work was delivered twice");
+    check(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "graphics event deletion failed");
+    owner.reset();
+    check(sceKernelDeleteEqueue(eq) == 0, "event queue deletion failed");
+}
+
+void testLabelsBetweenDispatches(bool interrupts, double seconds) {
+    const auto dispatch = emptyDispatch();
+    constexpr std::size_t blockBytes = 65536;
+#ifdef _WIN32
+    auto* block = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, blockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    auto* block = static_cast<std::uint32_t*>(std::aligned_alloc(blockBytes, blockBytes));
+#endif
+    check(block != nullptr, "cannot allocate the label block");
+    std::memset(block, 0, blockBytes);
+    GuestAllocations::Mutation().Add(block, blockBytes, true, true);
+    auto* labels = static_cast<volatile std::uint32_t*>(block);
+    constexpr std::uint32_t slots = 8, done = 64, units = 64;
+    KernelEqueue eq = 0;
+    check(sceKernelCreateEqueue(&eq, "AGC label runs") == 0, "event queue creation failed");
+    auto owner = EqueuePin_nid_postfix(eq);
+    int tag = 0;
+    check(sceAgcDriverAddEqEvent(eq, 0, &tag) == 0, "graphics event registration failed");
+    std::array<std::uint32_t, slots> expected{};
+    std::uint32_t serial = 0, frames = 0;
+    std::uint64_t packets = 0, raised = 0;
+    const auto frame = [&] {
+        std::vector<std::uint32_t> words;
+        const auto add = [&](const auto& packet) {
+            words.insert(words.end(), packet.begin(), packet.end());
+            ++packets;
+        };
+        words.insert(words.end(), dispatch.begin(), dispatch.end() - 5);
+        packets += 7;
+        for (std::uint32_t unit = 0; unit < units; ++unit) {
+            for (int work = 0; work < 2; ++work) {
+                add(std::array<std::uint32_t, 3>{0xc0017600u, 0x240, 0});
+                add(std::array<std::uint32_t, 3>{0xc0017600u, 0x241, 0});
+                add(std::span(dispatch).last(5));
+            }
+            add(std::array<std::uint32_t, 2>{0xc0004600u, 0x407});
+            for (std::uint32_t label = 0, count = 2 + unit % 2; label < count; ++label) {
+                const auto slot = ++serial % slots;
+                expected[slot] = serial;
+                const bool interrupt = interrupts && label + 1 == count;
+                add(interrupt ? endOfPipeLabel(labels + slot, serial) : releaseLabel(labels + slot, serial));
+                if (interrupt) ++raised;
+            }
+        }
+        add(releaseLabel(labels + done, ++frames));
+        submit(0, words);
+    };
+    const auto start = std::chrono::steady_clock::now();
+    do {
+        for (int queued = 0; queued < 4; ++queued) frame();
+        AgcDriverWaitIdle_nid_postfix();
+    } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < seconds);
+    waitFor(labels + done, frames, "the last label of a run of submissions never landed");
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    for (std::uint32_t slot = 0; slot < slots; ++slot) check(labels[slot] == expected[slot], "a label between dispatches did not keep its queue's last value");
+    std::array<KernelEvent, 2> events{};
+    std::uint64_t delivered = 0;
+    for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10); delivered < raised && std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(std::chrono::microseconds(100))) {
+        if (owner->GetTriggeredEvents(events.data(), 2) == 1) delivered += static_cast<std::uint64_t>(events[0].data);
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    check(delivered == raised && owner->GetTriggeredEvents(events.data(), 2) == 0, "labels between dispatches raised the wrong number of end-of-pipe interrupts");
+    if (seconds != 0) std::printf("labels between dispatches (%s): %u submissions, %llu packets, %.2f us a packet\n", interrupts ? "interrupt" : "plain", frames, static_cast<unsigned long long>(packets), elapsed * 1e6 / static_cast<double>(packets));
+    check(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "graphics event deletion failed");
+    owner.reset();
+    check(sceKernelDeleteEqueue(eq) == 0, "event queue deletion failed");
+    GuestAllocations::Mutation().Remove(block);
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    std::free(block);
+#endif
+}
+
 void testShaderHeaderAlignment() {
     alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
     struct Header {
@@ -591,10 +729,15 @@ void testWorkerFailure() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 3) {
+            testLabelsBetweenDispatches(std::string(argv[1]) == "interrupt", std::atof(argv[2]));
+            LibcRunShutdown_nid_postfix();
+            return 0;
+        }
         alignas(256) std::array<std::uint32_t, 64> rawCode{};
         rawCode.fill(0xbf800000);
         rawCode[0] = 0xbe8003ff;
@@ -673,6 +816,9 @@ int main() {
         testWaitFreeSubmissionBehindHeldOne();
         testWaitFreeSubmissionTheCpuWaitsFor();
         testMultiSubmissions();
+        testEndOfPipeInterruptBehindWorkWhileQueueWaits();
+        testLabelsBetweenDispatches(false, 0);
+        testLabelsBetweenDispatches(true, 0);
         testShaderHeaderAlignment();
         testHeaderWithoutProgramAddress();
         testRegisteredFloatMode();
