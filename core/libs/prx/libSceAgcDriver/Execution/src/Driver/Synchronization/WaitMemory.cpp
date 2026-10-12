@@ -138,8 +138,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         return;
     }
     if (heldAtSubmit) return;
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+    static const bool ownStoreEpoch = std::getenv("APS5_NO_OWN_LABEL_EPOCH_KEEP") != nullptr;
+    bool newest = false;
+    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &newest)) {
         if (writer != queue) notePendingWait(packet, queue, received);
+        else if (newest && !ownStoreEpoch && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes)) epochPoint.bump = false;
         return;
     }
 
