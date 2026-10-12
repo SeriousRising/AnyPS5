@@ -101,6 +101,14 @@ void Driver::execute(const Submission& submission) {
         }
     }
     PacketHistory recent{submission.commands};
+    struct AheadScope {
+        Driver& driver;
+        bool active;
+        ~AheadScope() {
+            if (active) driver.cancelDrawAhead();
+        }
+    } aheadScope{*this, submission.queue == 0 && drawAheadEnabled()};
+    if (aheadScope.active) beginDrawAhead();
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
@@ -261,6 +269,7 @@ void Driver::execute(const Submission& submission) {
         } else if (drawPacket) {
             landPendingWaits(submission.queue);
             bool drawn = false;
+            if (aheadScope.active) drawAheadAt(submission, queue, cursor);
             timed(&WorkerProfile::drawMs, [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
                 static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;

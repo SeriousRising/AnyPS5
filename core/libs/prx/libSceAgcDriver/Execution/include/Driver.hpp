@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_HPP
 
+#include <cstdint>
 #include <span>
 #include "SceTypes.hpp"
 #include "SceShaders.hpp"
@@ -8,6 +9,11 @@
 namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue);
+struct DrawAheadTotals {
+    std::uint64_t prepared;
+    std::uint64_t hits;
+};
+DrawAheadTotals DrawAheadCounts();
 
 }
 

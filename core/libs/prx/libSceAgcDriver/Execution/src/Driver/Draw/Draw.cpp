@@ -170,6 +170,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool verifyHit = false;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
 
+    if ((drawHit || verifyHit) && submission.queue == 0 && std::all_of(matched.begin(), matched.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr || variant->ahead.load(std::memory_order_relaxed) != 0; })) {
+        for (const auto& variant : matched) {
+            if (variant != nullptr) variant->ahead.fetch_sub(1, std::memory_order_relaxed);
+        }
+        drawAhead.Count(AheadHits);
+    }
     if (registerKey) {
 
         for (std::size_t i = 0; i < programs.size(); ++i) {
