@@ -97,6 +97,7 @@ struct DrawPassStats {
     std::uint64_t continued = 0;
 };
 DrawPassStats DrawPassCounters();
+std::uint64_t CpuStoredClears();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,
