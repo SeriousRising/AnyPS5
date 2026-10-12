@@ -119,6 +119,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::lock_guard cacheLock(drawCacheMutex);
             auto& counters = drawEntryCounters;
             counters.stageValidations += stageValidations;
+            const std::size_t path = graphics.stages.mesh ? 1 : graphics.stages.tessellation ? 2 : 0;
+            ++counters.pathLookups[path];
+            if (drawHit) ++counters.pathHits[path];
+            else if (path == 1) ++(*miss == DrawMiss::Layout ? counters.meshLayout : *miss == DrawMiss::Gate ? counters.meshGate : counters.meshDiffering);
             counters.stageEqual += stageEqual;
             counters.variantsCompared += compared;
             if (drawHit) {
@@ -176,6 +180,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     reportDrawCache(counters);
                 }
             }
+        }
+        if (entry == nullptr && profile) {
+            std::lock_guard cacheLock(drawCacheMutex);
+            const std::size_t path = graphics.stages.mesh ? 1 : graphics.stages.tessellation ? 2 : 0;
+            ++drawEntryCounters.pathLookups[path];
+            if (path == 1) ++drawEntryCounters.meshAbsent;
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }

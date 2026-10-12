@@ -16,7 +16,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-enum DrawAheadCount : std::size_t { AheadScans, AheadPrepared, AheadHits, AheadWarm, AheadPassed, AheadPending, AheadUnsupported, AheadErrors, AheadStops, AheadOverKnown, AheadOverRaw, AheadOverSync, AheadOverImage, AheadOverVertex, DrawAheadCountKinds };
+enum DrawAheadCount : std::size_t { AheadScans, AheadPrepared, AheadHits, AheadWarm, AheadPassed, AheadPending, AheadUnsupported, AheadErrors, AheadStops, AheadOverKnown, AheadOverRaw, AheadOverSync, AheadOverImage, AheadOverVertex, AheadIndirect, AheadEmpty, AheadMetadataPass, AheadNothing, AheadRejected, AheadMesh, AheadNoDevice, AheadStageRejected, DrawAheadCountKinds };
 
 enum DrawLockRunCount : std::size_t { RunsStarted, RunDrawsHeld, RunEndedByMiss, RunEndedBySync, RunEndedByPacket, RunEndedByBound, DrawLockRunCountKinds };
 
