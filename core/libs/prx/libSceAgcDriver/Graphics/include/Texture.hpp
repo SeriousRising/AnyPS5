@@ -21,6 +21,16 @@
 
 namespace AgcDriver::Graphics {
 
+struct RefreshParts {
+    enum Part : std::size_t { Scan, Collect, Keys, Stamps, Early, PartCount };
+    enum Answer : std::size_t { Taken, NoAnswer, EpochMoved, PendingMoved, KeysUnsettled, Stamped, AnswerCount };
+    std::array<double, PartCount> us{};
+    std::array<std::uint64_t, AnswerCount> answers{};
+    std::uint64_t refreshes = 0;
+};
+RefreshParts& ThreadRefreshParts();
+
+
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
@@ -443,6 +453,13 @@ private:
     mutable DccKeyProof keyProof;
     // Refresh's walk of the surface's pages (GuestMemory::CollectMemo).
     GuestMemory::CollectMemo collectMemo;
+    struct Settled {
+        bool valid = false;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t tracker = 0;
+    } settled;
+    RefreshParts::Answer settledStill();
+    bool keyWritersPending() const;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;

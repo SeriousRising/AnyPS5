@@ -1249,9 +1249,57 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+RefreshParts& ThreadRefreshParts() {
+    static thread_local RefreshParts parts;
+    return parts;
+}
+
+bool StorageTexture::keyWritersPending() const {
+    const auto count = DccKeyBytes(guestBytes);
+    if (descriptor.dccAddress == 0 || count == 0) return false;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) return recorder->PendingWriteOverlaps(descriptor.dccAddress, count);
+    return Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, count);
+}
+
+RefreshParts::Answer StorageTexture::settledStill() {
+    if (!settled.valid || generation == 0) return RefreshParts::NoAnswer;
+    if (!GuestMemory::CollectMemoCurrent(collectMemo, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return RefreshParts::EpochMoved;
+    if (PendingSerial() != settled.pendingSerial) return RefreshParts::PendingMoved;
+    const bool keyed = descriptor.dccAddress != 0;
+    if (keyed && (keyProof.generation == 0 || keyProof.keys != uploadedKeys || keyWritersPending())) return RefreshParts::KeysUnsettled;
+    const auto tracker = GuestMemory::TrackerGeneration();
+    if (tracker != settled.tracker) {
+        const std::array<GuestMemory::UnchangedQuery, 2> queries{{{descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation}, {descriptor.dccAddress, DccKeyBytes(guestBytes), keyProof.generation}}};
+        if (!GuestMemory::UnchangedSinceAll(std::span(queries).first(keyed ? 2u : 1u))) return RefreshParts::Stamped;
+        settled.tracker = tracker;
+    }
+    return RefreshParts::Taken;
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto part = start;
+    const auto charge = [&](RefreshParts::Part which) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        ThreadRefreshParts().us[which] += std::chrono::duration<double, std::micro>(now - part).count();
+        part = now;
+    };
+    static const bool earlyReturn = std::getenv("APS5_NO_LOOKUP_EARLY_RETURN") == nullptr;
+    if (profile) ++ThreadRefreshParts().refreshes;
+    if (earlyReturn) {
+        const auto answer = settledStill();
+        ++ThreadRefreshParts().answers[answer];
+        charge(RefreshParts::Early);
+        if (answer == RefreshParts::Taken) {
+            NoteProved();
+            ++Profile().storageReused;
+            if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+            return true;
+        }
+    }
+    settled.valid = false;
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { refreshing = previous; }
@@ -1280,13 +1328,16 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    const auto serialBefore = PendingSerial();
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+    charge(RefreshParts::Scan);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
     const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), collectMemo);
+    charge(RefreshParts::Collect);
     // Per tracked layer: changed since its generation (a keys change makes every layer stale).
     std::vector<bool> changed(trackedLayers, false);
     // Per 64 KiB block of the surface (blockGenerations): stamped since its layer's generation, and
@@ -1321,6 +1372,7 @@ bool StorageTexture::Refresh() {
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedKeys();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        charge(RefreshParts::Keys);
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -1405,10 +1457,12 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    charge(RefreshParts::Stamps);
     if (unchanged) {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
+        if (stamped && tracked && current != 0 && !flushed && alias == nullptr && PendingSerial() == serialBefore && (descriptor.dccAddress == 0 || (keyProof.generation != 0 && !keyWritersPending()))) settled = {true, serialBefore, current};
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
