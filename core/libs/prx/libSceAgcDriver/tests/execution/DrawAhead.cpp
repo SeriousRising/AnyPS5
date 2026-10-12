@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -18,6 +19,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdint>
@@ -358,6 +360,28 @@ void Conditions(Scene& scene) {
 void Stores(Scene& scene) {
     constexpr std::uint32_t draws = 40;
     for (std::uint32_t i = 0; i < Values; ++i) scene.memory.SetWord(ValuesOffset + i * 4u, 0x45000000u + i);
+    std::atomic<bool> done{false};
+    std::atomic<std::uint32_t> others{0};
+    std::thread other([&] {
+        Commands commands;
+        while (!done.load()) {
+            commands.Store(scene.store, scene.second.Address(), 64);
+            for (int i = 0; i < 8; ++i) commands.Dispatch();
+            commands.Write(scene.memory.Address(DoneOffset + 4u), others.load() + 1);
+            Packet packet{commands.words.data(), static_cast<std::uint32_t>(commands.words.size()), 0, {}};
+            if (sceAgcDriverSubmitAcb(0x20, &packet) != 0) break;
+            commands.words.clear();
+            for (const auto serial = ++others; !done.load() && scene.memory.Word(DoneOffset + 4u) != serial;) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    });
+    struct Joined {
+        std::atomic<bool>& done;
+        std::thread& thread;
+        ~Joined() {
+            done = true;
+            thread.join();
+        }
+    } joined{done, other};
     for (std::uint32_t round = 0; round < 12; ++round) {
         for (std::uint32_t i = 1; i <= draws; ++i) scene.SetTable(i, scene.Value(round * draws + i), scene.Result(64 + i));
         Commands commands;
@@ -372,6 +396,7 @@ void Stores(Scene& scene) {
         for (std::uint32_t i = 1; i <= draws; ++i) Require(scene.ResultWord(64 + i) == 0x45000000u + round * draws + i, "draw ahead: a draw under a range a dispatch stores to did not read its own table");
         Require(scene.memory.Word(0) == 0x3f800000u, "draw ahead: the dispatch before the draws did not store");
     }
+    Require(others.load() != 0, "draw ahead: the other queue submitted nothing beside the draws");
 }
 
 void Stress(Scene& scene, std::uint32_t rounds) {
