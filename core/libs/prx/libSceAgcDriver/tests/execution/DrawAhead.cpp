@@ -48,6 +48,7 @@ constexpr std::uint32_t ResultsOffset = ValuesOffset + Values * 4u;
 constexpr std::uint32_t Results = 4096;
 constexpr std::uint32_t ConditionsOffset = BlockBytes;
 constexpr std::uint32_t DoneOffset = BlockBytes + 0x8000u;
+constexpr std::uint32_t UnderOffset = BlockBytes * 4u;
 
 class GuestBlock {
 public:
@@ -181,6 +182,14 @@ struct Commands {
         Context(0x318, static_cast<std::uint32_t>(address >> 8u));
         Context(0x390, static_cast<std::uint32_t>(address >> 40u));
     }
+    void WideTarget(std::uint64_t address) {
+        Target(address);
+        Context(0x3b0, (1u << 28u) | (255u << 14u) | 255u);
+        Context(0x10f, std::bit_cast<std::uint32_t>(128.0f));
+        Context(0x110, std::bit_cast<std::uint32_t>(128.0f));
+        Context(0x111, std::bit_cast<std::uint32_t>(-128.0f));
+        Context(0x112, std::bit_cast<std::uint32_t>(128.0f));
+    }
     void Condition(std::uint64_t address, std::uint32_t words) { Add({0xc0032200u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0u, words}); }
     void Store(const Kernel& kernel, std::uint64_t address, std::uint32_t bytes) {
         for (const auto reg : kernel.header.registers) ShaderRegister(reg.offset, reg.value);
@@ -203,6 +212,7 @@ struct Scene {
     GuestBlock memory{BlockBytes * 2u};
     GuestBlock target{BlockBytes};
     GuestBlock second{BlockBytes};
+    GuestBlock under{BlockBytes * 8u};
     Program vertex{2, VertexCode, 4};
     Program read{1, ReadCode, 10};
     Program copy{1, CopyCode, 10};
@@ -399,6 +409,26 @@ void Stores(Scene& scene) {
     Require(others.load() != 0, "draw ahead: the other queue submitted nothing beside the draws");
 }
 
+void Under(Scene& scene) {
+    constexpr std::uint32_t draws = 40;
+    for (std::uint32_t i = 0; i < Values; ++i) scene.memory.SetWord(ValuesOffset + i * 4u, 0x46000000u + i);
+    for (std::uint32_t round = 0; round < 12; ++round) {
+        for (std::uint32_t i = 0; i < draws; ++i) {
+            scene.under.SetAddress(UnderOffset + i * TableBytes, scene.Value(round * draws + i));
+            scene.under.SetAddress(UnderOffset + i * TableBytes + 8u, scene.Result(128 + i));
+        }
+        Commands commands;
+        scene.State(commands, scene.copy);
+        commands.WideTarget(scene.under.Address());
+        for (std::uint32_t i = 0; i < draws; ++i) {
+            commands.Table(scene.under.Address(UnderOffset + i * TableBytes));
+            commands.Draw();
+        }
+        scene.Finish(commands);
+        for (std::uint32_t i = 0; i < draws; ++i) Require(scene.ResultWord(128 + i) == 0x46000000u + round * draws + i, "draw ahead: a draw whose table lies in the memory of its render target did not read its own table");
+    }
+}
+
 void Stress(Scene& scene, std::uint32_t rounds) {
     constexpr std::uint32_t pool = 24;
     std::mt19937 random(0x5eed);
@@ -473,20 +503,26 @@ void Stress(Scene& scene, std::uint32_t rounds) {
     }
 }
 
-void Benchmark(Scene& scene, std::uint32_t batches, bool stores) {
+void Benchmark(Scene& scene, std::uint32_t batches, bool stores, bool under) {
     constexpr std::uint32_t frames = 3, draws = 650;
     for (std::uint32_t i = 0; i < Values; ++i) scene.memory.SetWord(ValuesOffset + i * 4u, i % 2 == 0 ? 0x3f800000u : 0u);
     std::uint64_t issued = 0;
+    const auto table = [&](std::uint32_t i) { return under && i % 5 != 0 ? scene.under.Address(UnderOffset + i * TableBytes) : scene.Table(i); };
     const auto batch = [&](std::uint32_t serial) {
-        for (std::uint32_t i = 0; i < frames * draws; ++i) scene.SetTable(i, scene.Value((serial * 1031u + i * 7u) % Values), scene.Result(0));
+        for (std::uint32_t i = 0; i < frames * draws; ++i) {
+            const auto source = scene.Value((serial * 1031u + i * 7u) % Values);
+            if (under && i % 5 != 0) scene.under.SetAddress(UnderOffset + i * TableBytes, source);
+            else scene.SetTable(i, source, scene.Result(0));
+        }
         for (std::uint32_t frame = 0; frame < frames; ++frame) {
             Commands commands;
             scene.State(commands, scene.read);
+            if (under) commands.WideTarget(scene.under.Address());
             if (stores) commands.Store(scene.store, scene.Table(frame * draws + draws / 2), (draws - draws / 2) * TableBytes);
             for (std::uint32_t i = 0; i < draws; ++i) {
                 if (i == draws / 2) continue;
                 if (stores && i > draws / 2) commands.Dispatch();
-                commands.Table(scene.Table(frame * draws + i));
+                commands.Table(table(frame * draws + i));
                 commands.Draw();
             }
             if (frame + 1 == frames) scene.Finish(commands);
@@ -503,7 +539,7 @@ void Benchmark(Scene& scene, std::uint32_t batches, bool stores) {
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     const double busy = static_cast<double>(std::clock() - cpu) / CLOCKS_PER_SEC;
     const auto after = AgcDriver::DrawAheadCounts();
-    std::printf("draw ahead %s%s: %llu draws in %.2f s, %.1f us a draw, %.2f cores busy, %llu prepared ahead, %llu hit\n", std::getenv("APS5_NO_DRAW_AHEAD") != nullptr ? "off" : "on", stores ? ", half of the tables under a range a dispatch before each draw stores to" : "", static_cast<unsigned long long>(issued), seconds, seconds * 1e6 / static_cast<double>(issued), busy / seconds, static_cast<unsigned long long>(after.prepared - before.prepared), static_cast<unsigned long long>(after.hits - before.hits));
+    std::printf("draw ahead %s%s: %llu draws in %.2f s, %.1f us a draw, %.2f cores busy, %llu prepared ahead, %llu hit\n", std::getenv("APS5_NO_DRAW_AHEAD") != nullptr ? "off" : "on", stores ? ", half of the tables under a range a dispatch before each draw stores to" : under ? ", four of five tables in the memory of a render target with results pending" : "", static_cast<unsigned long long>(issued), seconds, seconds * 1e6 / static_cast<double>(issued), busy / seconds, static_cast<unsigned long long>(after.prepared - before.prepared), static_cast<unsigned long long>(after.hits - before.hits));
 }
 
 }
@@ -514,17 +550,18 @@ int main(int argc, char** argv) {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
-        Require(argc == 1 || (argc == 3 && (std::string(argv[1]) == "bench" || std::string(argv[1]) == "bench-stores")), "draw ahead: expected no arguments, or bench or bench-stores and a number of batches");
+        Require(argc == 1 || (argc == 3 && (std::string(argv[1]) == "bench" || std::string(argv[1]) == "bench-stores" || std::string(argv[1]) == "bench-under")), "draw ahead: expected no arguments, or bench, bench-stores or bench-under and a number of batches");
         {
             Scene scene;
             if (argc == 3) {
-                Benchmark(scene, static_cast<std::uint32_t>(std::atoi(argv[2])), std::string(argv[1]) == "bench-stores");
+                Benchmark(scene, static_cast<std::uint32_t>(std::atoi(argv[2])), std::string(argv[1]) == "bench-stores", std::string(argv[1]) == "bench-under");
             } else {
                 Chain(scene);
                 Registers(scene);
                 Labels(scene);
                 Conditions(scene);
                 Stores(scene);
+                Under(scene);
                 Stress(scene, 48);
                 const auto counts = AgcDriver::DrawAheadCounts();
                 const bool off = std::getenv("APS5_NO_DRAW_AHEAD") != nullptr;
