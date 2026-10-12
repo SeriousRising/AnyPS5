@@ -121,10 +121,16 @@ bool gdsRange(std::uint64_t offset, std::size_t bytes) {
     return offset <= GdsBytes && bytes <= GdsBytes - offset;
 }
 
+std::uint64_t dmaSourceAddress(std::span<const std::uint32_t> packet) {
+    return dmaSource(packet) == DmaSelectGds ? GdsAddress() + packet[2] : address(packet[2], packet[3]);
+}
+
+std::uint64_t dmaDestinationAddress(std::span<const std::uint32_t> packet) {
+    return dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
+}
+
 std::vector<std::byte> dmaSourceBytes(std::span<const std::uint32_t> packet) {
-    const std::size_t bytes = packet[6] & 0x3ffffffu;
-    if (dmaSource(packet) != DmaSelectGds) return copySource(address(packet[2], packet[3]), bytes, dmaSource(packet) == 2);
-    return copySource(GdsAddress() + packet[2], bytes, false);
+    return copySource(dmaSourceAddress(packet), packet[6] & 0x3ffffffu, dmaSource(packet) == 2);
 }
 
 void copyMemory(std::uint64_t source, std::uint64_t destination, std::size_t bytes, bool immediate) {
@@ -605,7 +611,7 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
             if (packet.size() < 7) return std::nullopt;
             if (dmaDestination(packet) == DmaSelectNowhere) return StoreWrite{address(packet[2], packet[3]), {}, {}};
             const std::size_t bytes = packet[6] & 0x3ffffffu;
-            const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
+            const auto destination = dmaDestinationAddress(packet);
             if (!fits(destination, bytes)) return std::nullopt;
             return StoreWrite{destination, {}, dmaSourceBytes(packet)};
         }
@@ -647,8 +653,8 @@ std::optional<MemoryCopy> decodeSourceCopy(std::span<const std::uint32_t> packet
     const bool toGds = dmaDestination(packet) == DmaSelectGds;
     if (!toGds && !memorySelector(dmaDestination(packet))) return std::nullopt;
     const std::size_t bytes = packet[6] & 0x3ffffffu;
-    const auto source = fromGds ? GdsAddress() + packet[2] : address(packet[2], packet[3]);
-    const auto destination = toGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
+    const auto source = dmaSourceAddress(packet);
+    const auto destination = dmaDestinationAddress(packet);
     if (bytes == 0 || (source < destination + bytes && destination < source + bytes)) return std::nullopt;
     return MemoryCopy{source, destination, bytes};
 }
@@ -978,7 +984,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             const std::size_t bytes = packet[6] & 0x3ffffffu;
             if (bytes == 0 || dmaDestination(packet) == DmaSelectNowhere) return;
             auto data = dmaSourceBytes(packet);
-            const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
+            const auto destination = dmaDestinationAddress(packet);
             GuestMemory::CheckRange(reinterpret_cast<void*>(destination), bytes, 1, true);
             GuestMemory::Write(destination, data);
             return;
