@@ -169,6 +169,14 @@ void Run(AgcDriver::VulkanDevice& device) {
     Require(changedResult != firstResult && changedResult->spirv.data() == firstResult->spirv.data(), "prepared invocation did not distinguish changed runtime data");
     users[0] -= 1;
     Require(invocation.Materialize(*preparedCapture) == firstResult, "prepared invocation evicted the previous runtime data");
+    for (std::uint32_t other = 1; other <= 600; ++other) {
+        users[1] = other;
+        static_cast<void>(invocation.Materialize(*invocation.Capture(preparedRuntime)));
+    }
+    users[1] = users[0];
+    const char* memoEntries = std::getenv("APS5_RESULT_MEMO_ENTRIES");
+    const bool kept = memoEntries == nullptr || std::atoi(memoEntries) > 601;
+    Require((invocation.Materialize(*preparedCapture) == firstResult) == kept, kept ? "the result memo lost a result behind 600 others of its program" : "the result memo of the size asked for kept more results than that");
     auto replacement = OpenVulkanTestDevice();
     Require(replacement != nullptr && replacement->Serial() != device.Serial(), "replacement device was not created");
     auto replacementRequest = request;
