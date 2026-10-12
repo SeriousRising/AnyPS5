@@ -1968,11 +1968,11 @@ void Recorder::NoteComputeShape(std::uint64_t key, const ComputeShape& shape) {
     timingShapes.emplace(key, shape);
 }
 
-void Recorder::NoteDispatch(std::uint64_t key, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+void Recorder::NoteDispatch(std::uint64_t key, bool indirect, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     std::lock_guard lock(timingMutex);
     auto& dispatches = timingDispatches[key];
     ++dispatches.count;
-    if (x == 0 && y == 0 && z == 0) {
+    if (indirect) {
         ++dispatches.indirect;
         return;
     }

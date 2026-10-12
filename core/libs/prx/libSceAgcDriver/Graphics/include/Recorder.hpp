@@ -522,9 +522,9 @@ public:
     // The shape of the compute program timed under `key`; false when the key has none recorded yet.
     static bool HasComputeShape(std::uint64_t key);
     static void NoteComputeShape(std::uint64_t key, const ComputeShape& shape);
-    // One dispatch of the program timed under `key` over x*y*z workgroups (zeros: an indirect one,
+    // One dispatch of the program timed under `key` over x*y*z workgroups (ignored for an indirect one,
     // whose counts the CPU does not know), for the same line.
-    static void NoteDispatch(std::uint64_t key, std::uint32_t x, std::uint32_t y, std::uint32_t z);
+    static void NoteDispatch(std::uint64_t key, bool indirect, std::uint32_t x, std::uint32_t y, std::uint32_t z);
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
