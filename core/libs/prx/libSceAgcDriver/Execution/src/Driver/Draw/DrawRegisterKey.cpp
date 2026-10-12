@@ -56,6 +56,18 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     return key;
 }
 
+std::uint64_t Driver::drawKeyFor(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, const Pm4::DrawParameters& drawParameters) {
+    static const bool indexRange = std::getenv("APS5_NO_MESH_DRAW_KEY") == nullptr;
+    auto key = drawRegisterKey(queue, registry, deviceSerial);
+    const auto routing = queue.context.find(0x2d5);
+    if (!indexRange || routing == queue.context.end() || (routing->second & 0x20u) == 0) return key;
+    for (const std::uint64_t value : {drawParameters.indexAddress, static_cast<std::uint64_t>(drawParameters.indexCount), static_cast<std::uint64_t>(drawParameters.indexSize), static_cast<std::uint64_t>(drawParameters.instanceCount), static_cast<std::uint64_t>(drawParameters.indexed)}) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    }
+    return key;
+}
+
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {
     if (a.resourcesNum != b.resourcesNum || a.fetchAttribReg != b.fetchAttribReg || a.fetchBufferReg != b.fetchBufferReg || a.fetchEmbedded != b.fetchEmbedded) return false;
     for (std::uint32_t i = 0; i < a.resourcesNum && i < a.resources.size(); ++i) {

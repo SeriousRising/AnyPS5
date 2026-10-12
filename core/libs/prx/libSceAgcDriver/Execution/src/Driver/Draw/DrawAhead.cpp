@@ -211,7 +211,7 @@ void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint
     if (!drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return unsupported(AheadEmpty);
     if (Graphics::DecodeColorMetadataPass(queue)) return unsupported(AheadMetadataPass);
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect, true)) return unsupported(*verdict == DrawVerdict::Rejected ? AheadRejected : AheadNothing);
-    const auto drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+    const auto drawKey = drawKeyFor(queue, *submission.shaders, localDevice->Serial(), drawParameters);
     std::shared_ptr<DrawEntry> entry;
     {
         std::lock_guard cacheLock(drawCacheMutex);
