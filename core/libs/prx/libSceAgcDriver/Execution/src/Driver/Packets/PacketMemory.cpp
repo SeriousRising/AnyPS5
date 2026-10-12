@@ -14,6 +14,7 @@ namespace AgcDriver::DriverDetail {
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool interruptSubmitNow = std::getenv("APS5_INTERRUPT_SUBMIT_NOW") != nullptr;
     wroteOnGpu = false;
     LabelStepTimer steps(profile);
 
@@ -54,7 +55,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 const auto queueId = submission.queue;
                 interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
                 steps.Mark(InterruptCompletion);
-                if (interruptDeferred && workOpen) {
+                if (interruptDeferred && workOpen && interruptSubmitNow) {
                     localDevice->SubmitRecorded(submission.queue == 0);
                     steps.Mark(InterruptSubmit);
                 }
