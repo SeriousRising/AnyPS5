@@ -88,13 +88,20 @@ std::array<std::byte, 16> clearTexel(const ColorTarget& color, DccKeys keys) {
     return texel;
 }
 
-bool clearToTexel(StorageTexture& image, const std::array<std::byte, 16>& texel, std::uint32_t elementBytes, const char*& refusal) {
+std::array<std::uint32_t, 4> clearPattern(const std::array<std::byte, 16>& texel, std::uint32_t elementBytes) {
     std::array<std::byte, 16> repeated{};
     for (std::size_t offset = 0; offset + elementBytes <= repeated.size(); offset += elementBytes) std::memcpy(repeated.data() + offset, texel.data(), elementBytes);
     std::array<std::uint32_t, 4> pattern{};
     std::memcpy(pattern.data(), repeated.data(), repeated.size());
+    return pattern;
+}
+
+bool clearToTexel(StorageTexture& image, const std::array<std::byte, 16>& texel, std::uint32_t elementBytes, const char*& refusal) {
+    const auto pattern = clearPattern(texel, elementBytes);
     return image.FillClear(std::span<const std::uint32_t, 4>(pattern), StorageTexture::WholeImage, refusal);
 }
+
+std::atomic<std::uint64_t> cpuStoredClears{0};
 
 void writeTexels(const ColorTarget& color, const std::array<std::byte, 16>& texel) {
     const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
@@ -111,11 +118,13 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
     MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
 }
 
-void reportCpuClear(const ColorTarget& color, const char* refusal) {
+void reportCpuClear(const ColorTarget& color, const std::array<std::byte, 16>& texel, const char* refusal) {
+    cpuStoredClears.fetch_add(1, std::memory_order_relaxed);
     static std::mutex reportMutex;
     static std::set<std::pair<std::uint64_t, std::string>> reported;
     std::lock_guard lock(reportMutex);
-    if (reported.size() < 32 && reported.emplace(color.address, refusal != nullptr ? refusal : "unknown").second) std::fprintf(stderr, "[gpu] color target 0x%llx (%ux%u, VkFormat %d): its fast clear is stored by the CPU and uploaded again, the image clear was refused: %s\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), refusal != nullptr ? refusal : "unknown");
+    const auto pattern = clearPattern(texel, color.elementBytes);
+    if (reported.size() < 32 && reported.emplace(color.address, refusal != nullptr ? refusal : "unknown").second) std::fprintf(stderr, "[gpu] color target 0x%llx (%ux%u, VkFormat %d): its fast clear is stored by the CPU and uploaded again, the image clear was refused: %s; pattern %08x %08x %08x %08x\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), refusal != nullptr ? refusal : "unknown", pattern[0], pattern[1], pattern[2], pattern[3]);
 }
 
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
@@ -137,7 +146,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
         MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
         return;
     }
-    reportCpuClear(color, refusal);
+    reportCpuClear(color, texel, refusal);
     storeClearTexels(context, color, texel);
     resident.Refresh();
 }
@@ -152,7 +161,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, Sto
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     if (resident == nullptr || !clearToTexel(*resident, texel, color.elementBytes, refusal)) {
-        if (resident != nullptr) reportCpuClear(color, refusal);
+        if (resident != nullptr) reportCpuClear(color, texel, refusal);
         StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
         writeTexels(color, texel);
         if (resident != nullptr) resident->Refresh();
@@ -702,6 +711,10 @@ bool DrawRecipes() {
 
 namespace {
 std::atomic<std::uint64_t> passesBegun{0}, passesContinued{0};
+}
+
+std::uint64_t CpuStoredClears() {
+    return cpuStoredClears.load(std::memory_order_relaxed);
 }
 
 DrawPassStats DrawPassCounters() {
