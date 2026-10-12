@@ -202,7 +202,15 @@ void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint
     std::string rejected;
     bool traceIndirect = false;
     const auto localDevice = device.Load();
-    if (drawParameters.indirect || localDevice == nullptr || precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect, true)) return skip(AheadUnsupported);
+    const auto unsupported = [&](DrawAheadCount why) {
+        skip(why);
+        skip(AheadUnsupported);
+    };
+    if (drawParameters.indirect) return unsupported(AheadIndirect);
+    if (localDevice == nullptr) return unsupported(AheadNoDevice);
+    if (!drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return unsupported(AheadEmpty);
+    if (Graphics::DecodeColorMetadataPass(queue)) return unsupported(AheadMetadataPass);
+    if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect, true)) return unsupported(*verdict == DrawVerdict::Rejected ? AheadRejected : AheadNothing);
     const auto drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
     std::shared_ptr<DrawEntry> entry;
     {
@@ -215,7 +223,7 @@ void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint
     const auto& graphics = decode->state;
     const auto& programs = decode->programs;
     const auto& roles = decode->roles;
-    if (graphics.stages.mesh) return skip(AheadUnsupported);
+    if (graphics.stages.mesh) return unsupported(AheadMesh);
     if (entry != nullptr && entry->stages.size() == programs.size()) {
         bool warm = true;
         std::vector<ShaderRecompiler::MemoryRegion> regions;
@@ -253,7 +261,7 @@ void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         static_cast<void>(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, decode->pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, false, matched, matchedRegions, false, 0, 0, captures, phaseTiming, phaseMs, rejected));
-        if (!rejected.empty()) return skip(AheadUnsupported);
+        if (!rejected.empty()) return unsupported(AheadStageRejected);
         const auto pushBytes = stageCaptures[i].compiled->pushConstants.size();
         require(pushBytes <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         pushCursorBytes += static_cast<std::uint32_t>(pushBytes);
