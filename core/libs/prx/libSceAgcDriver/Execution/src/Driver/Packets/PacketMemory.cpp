@@ -184,7 +184,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
                 if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
                 if (reason == 0 || reason == 1 || reason == 5 || reason == 6) {
-                    noteLabelStore(label->address, bytes, stamp);
+                    noteLabelStore(label->address, bytes, stamp, submission.queue);
                     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 }
                 countLabelOutcome(reason);
@@ -235,7 +235,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     GuestMemory::Write(label->address, bytes, 4);
                     wroteOnGpu = true;
                 }
-                if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp);
+                if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp, submission.queue);
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 countLabelOutcome(reason);
                 ++immediateLabels;
@@ -311,7 +311,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 dmaTimes.storeMs = dmaSince(dmaTimed, storeStart);
                 dmaTimes.reason = reason;
                 dmaTimes.outcome = reason == 0 ? 0u : reason == 5 || reason == 6 ? 1u : reason == 1 ? 2u : 5u;
-                if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(store->address, bytes, stamp);
+                if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5 || reason == 6) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;
