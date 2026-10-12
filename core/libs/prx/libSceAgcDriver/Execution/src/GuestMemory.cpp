@@ -1105,7 +1105,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, CollectMemo* held = nullptr) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1117,11 +1117,16 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
+    if (useMemo && held != nullptr && held->epoch == epoch && held->unwatched == unwatched && held->begin <= first && stop <= held->end) {
+        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        return tracker.generation.load(std::memory_order_relaxed);
+    }
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         for (const auto& entry : threadCollectMemo.entries) {
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
+                if (held != nullptr) *held = {first, stop, epoch, unwatched};
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
@@ -1159,6 +1164,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
         else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        if (held != nullptr) *held = {first, stop, epoch, serial};
     }
     return tracker.generation;
 }
@@ -1167,6 +1173,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, true);
+}
+
+std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, CollectMemo& memo) {
+    return collectWrites(address, bytes, true, &memo);
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
