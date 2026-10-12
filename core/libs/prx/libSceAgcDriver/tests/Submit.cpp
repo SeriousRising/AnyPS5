@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "execution/VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -273,6 +275,35 @@ void testEndOfPipeLabelsWithoutWork() {
     check(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "graphics event deletion failed");
     owner.reset();
     check(sceKernelDeleteEqueue(eq) == 0, "event queue deletion failed");
+}
+
+void testEndOfPipeInterruptsKeepTheCollectEpoch() {
+    alignas(64) static volatile std::uint32_t label = 0, gate = 0, done = 0;
+    constexpr std::uint32_t Interrupts = 8;
+    const auto bumps = [] { return AgcDriver::GuestMemory::CollectEpochBumps(); };
+    AgcDriverWaitIdle_nid_postfix();
+    std::vector<std::uint32_t> words;
+    for (std::uint32_t i = 0; i < Interrupts; ++i) {
+        const auto packet = endOfPipeLabel(&label, i + 1);
+        words.insert(words.end(), packet.begin(), packet.end());
+    }
+    const std::array<std::uint32_t, 8> plain{0xc0064900, 0, 1u << 24u, 0, 0, 0, 0, 0};
+    for (std::uint32_t i = 0; i < Interrupts; ++i) words.insert(words.end(), plain.begin(), plain.end());
+    const auto before = bumps();
+    submit(0, words);
+    waitFor(&label, Interrupts, "the end-of-pipe labels never landed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto interrupts = bumps() - before;
+    const bool kept = std::getenv("APS5_NO_INTERRUPT_EPOCH_KEEP") == nullptr;
+    std::printf("collect epochs of a submission of %u end-of-pipe interrupts: %llu\n", 2 * Interrupts, static_cast<unsigned long long>(interrupts));
+    check(kept ? interrupts <= Interrupts + 1 : interrupts >= 2 * Interrupts + 1, kept ? "end-of-pipe interrupts that drain nothing advanced the collect epoch" : "end-of-pipe interrupts did not advance the collect epoch with the switch set");
+    const auto waiting = bumps();
+    submit(0, commands(waitEqual(&gate, 1), writeData(&done, 1)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    gate = 1;
+    waitFor(&done, 1, "the queue never passed a wait the CPU satisfied");
+    AgcDriverWaitIdle_nid_postfix();
+    check(bumps() - waiting >= 2, "a wait the CPU satisfied did not advance the collect epoch");
 }
 
 void testLabelStoredSinceSubmission() {
@@ -607,6 +638,7 @@ int main() {
         testEndOfPipeInterrupts();
         testLabelStoredSinceSubmission();
         testEndOfPipeLabelsWithoutWork();
+        testEndOfPipeInterruptsKeepTheCollectEpoch();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
         testWaitFreeSubmissionAfterEarlierQueue0Work();
