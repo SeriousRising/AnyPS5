@@ -3,6 +3,7 @@
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
@@ -254,6 +255,84 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
     Require(text.str().size() > 1024 && text.str() == serializer.Serialize(request), "shader failure capture was incomplete");
     const auto replay = serializer.Deserialize(text.str());
     Require(serializer.Serialize(replay.request) == text.str(), "shader failure capture changed on replay");
+}
+
+void RunInactiveSrtReads(AgcDriver::VulkanDevice& device) {
+    using namespace ShaderRecompiler;
+    alignas(256) std::array<std::uint32_t, 64> output{};
+    alignas(4096) std::uint32_t payload = 0u;
+    const auto outputAddress = reinterpret_cast<std::uintptr_t>(output.data() + 16u);
+    const auto payloadAddress = reinterpret_cast<std::uintptr_t>(&payload);
+    std::array<std::uint32_t, 13> users{};
+    users[0] = static_cast<std::uint32_t>(outputAddress);
+    users[1] = static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu);
+    users[2] = 32u;
+    users[3] = 0x31016facu;
+    const auto dispatch = [&](const RecompileResult& result, std::uint32_t expected, const char* message) {
+        output.fill(0xdeadbeefu);
+        auto expectedOutput = output;
+        expectedOutput[16] = expected;
+        device.Dispatch(result, 1u, 1u, 1u);
+        device.WaitIdle();
+        const auto actualBytes = std::as_bytes(std::span(output));
+        const auto expectedBytes = std::as_bytes(std::span(expectedOutput));
+        Require(std::equal(actualBytes.begin(), actualBytes.end(), expectedBytes.begin()), message);
+    };
+    for (const std::uint32_t waveSize : {32u, 64u}) {
+        for (const bool inverted : {false, true}) {
+            alignas(256) std::array<std::uint32_t, 14> code{
+                0xbf06800cu, 0xbf850005u, 0xf4000404u, 0xfa000000u, 0xbf8cc07fu, 0x7e020210u, 0xbf820004u,
+                0xf4000485u, 0xfa000000u, 0xbf8cc07fu, 0x7e020212u, 0xe0700000u, 0x80000100u, 0xbf810000u
+            };
+            code[1] = inverted ? 0xbf840005u : 0xbf850005u;
+            const auto codeAddress = reinterpret_cast<std::uintptr_t>(code.data());
+            AgcDriver::DriverDetail::ShaderSnapshot snapshot{codeAddress, 0u, 0u, {code.begin(), code.end()}, {}};
+            const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {false, false, false}, false, 1u, {}};
+            RecompileRequest request{{ShaderStage::Compute, codeAddress, snapshot.code, 0u, {}}, {waveSize, 0u, users, compute, {}, {}, {}}, device.ComputeTarget(waveSize), {0u, 0u, 0u, 128u}};
+            const auto handle = AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0u, request);
+            for (const auto selector : {0u, 1u, 0u}) {
+                for (const bool useCache : {false, true}) {
+                    request.useCache = useCache;
+                    request.context.memory = {};
+                    const bool taken = (selector == 0u) != inverted;
+                    const auto pointerSlot = taken ? 10u : 8u;
+                    users[8] = users[9] = users[10] = users[11] = 0u;
+                    users[pointerSlot] = static_cast<std::uint32_t>(payloadAddress);
+                    users[pointerSlot + 1u] = static_cast<std::uint32_t>(payloadAddress >> 32u);
+                    users[12] = selector;
+                    payload = 0x12345678u + selector + (useCache ? 16u : 0u);
+                    const auto expected = payload;
+                    AgcDriver::ShaderMemory memory({});
+                    static_cast<void>(memory.Capture(request));
+                    const auto regions = memory.Regions();
+                    Require(regions.size() == 1u && regions.front().guestAddress == payloadAddress && regions.front().bytes.size() == sizeof(payload), "inactive SRT capture recorded an unused pointer");
+                    request.context.memory = regions;
+                    const auto ordinary = Recompile(request);
+                    Require(useCache || !ordinary.cacheHit, "inactive SRT uncached compilation reused a variant");
+                    dispatch(ordinary, expected, "inactive SRT ordinary dispatch changed the selected payload or output padding");
+                    if (useCache) {
+                        const auto cached = Recompile(request);
+                        Require(cached.cacheHit, "inactive SRT unchanged request missed the shader cache");
+                        dispatch(cached, expected, "inactive SRT cached dispatch changed the selected payload or output padding");
+                    }
+                    Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0u, request) == handle, "inactive SRT runtime data replaced the prepared source");
+                    const auto invocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0u, request);
+                    AgcDriver::ShaderMemory preparedMemory({});
+                    const auto capture = preparedMemory.Capture(invocation);
+                    dispatch(*invocation.Materialize(*capture), expected, "inactive SRT prepared dispatch changed the selected payload or output padding");
+                    const auto serialized = RequestSerializer{}.Serialize(request);
+                    payload = 0xbad0bad0u;
+                    users[8] = users[9] = users[10] = users[11] = 0u;
+                    users[12] ^= 1u;
+                    auto replay = RequestSerializer{}.Deserialize(serialized);
+                    dispatch(Recompile(replay.request), expected, "inactive SRT replay changed the selected payload or output padding after live memory changed");
+                    dispatch(*invocation.Materialize(*capture), expected, "inactive SRT prepared capture changed after live memory changed");
+                    Require(snapshot.prepared->entries.size() == 1u, "inactive SRT toggling prepared the source repeatedly");
+                }
+            }
+        }
+    }
+    std::cout << "inactive SRT wave32/64 branch, prepared, cache and snapshot replay tests passed\n";
 }
 
 void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
@@ -805,6 +884,7 @@ int main(int argc, char** argv) {
         }
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        RunInactiveSrtReads(*device);
         Run(*device);
         RegisteredVertexWorkgroup(device->Target());
         FailureCapture(*device);
