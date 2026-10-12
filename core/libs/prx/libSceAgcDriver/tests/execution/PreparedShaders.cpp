@@ -1,4 +1,5 @@
 #include "VulkanTestDevice.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -333,6 +334,125 @@ void RunInactiveSrtReads(AgcDriver::VulkanDevice& device) {
         }
     }
     std::cout << "inactive SRT wave32/64 branch, prepared, cache and snapshot replay tests passed\n";
+}
+
+class GuestScalarData {
+public:
+    explicit GuestScalarData(std::uint32_t word) : data(static_cast<std::uint32_t*>(std::aligned_alloc(65536u, 65536u))) {
+        Require(data != nullptr, "GPU-controlled scalar data allocation failed");
+        std::fill_n(data, 65536u / sizeof(std::uint32_t), 0u);
+        data[0] = word;
+        GuestAllocations::Mutation().Add(data, 65536u, true, false, true);
+    }
+    ~GuestScalarData() {
+        GuestAllocations::Mutation().Remove(data);
+        std::free(data);
+    }
+    GuestScalarData(const GuestScalarData&) = delete;
+    GuestScalarData& operator=(const GuestScalarData&) = delete;
+    std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
+    void Set(std::size_t index, std::uint32_t word) { data[index] = word; }
+private:
+    std::uint32_t* data;
+};
+
+void RunGpuControlledScalarCase(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, bool inverted, bool buffer, std::uint32_t value, bool useCache, bool invalidActive) {
+    using namespace ShaderRecompiler;
+    alignas(256) std::array<std::uint32_t, 64> output{};
+    GuestScalarData payload(value);
+    GuestScalarData table(static_cast<std::uint32_t>(payload.Address()));
+    table.Set(1u, static_cast<std::uint32_t>((payload.Address() >> 32u) & 0xffffu));
+    table.Set(2u, 4u);
+    table.Set(3u, 0x31016facu);
+    const auto outputAddress = reinterpret_cast<std::uintptr_t>(output.data() + 16u);
+    std::array<std::uint32_t, 12> users{};
+    users[0] = static_cast<std::uint32_t>(outputAddress);
+    users[1] = static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu);
+    users[2] = 32u;
+    users[3] = 0x31016facu;
+    users[8] = static_cast<std::uint32_t>(table.Address());
+    users[9] = static_cast<std::uint32_t>(table.Address() >> 32u);
+    alignas(256) std::array<std::uint32_t, 22> code{
+        0xbf06800cu, 0xbf850004u, 0xf4040405u, 0xfa000030u, 0xbf8cc07fu, 0xbf820003u,
+        0xf4040404u, 0xfa000000u, 0xbf8cc07fu, 0xf4000488u, 0xfa000000u, 0xbf8cc07fu,
+        0xbf068012u, 0xbf850003u, 0x7e0202ffu, 0x13579bdfu, 0xbf820002u,
+        0x7e0202ffu, 0x2468ace0u, 0xe0700000u, 0x80000100u, 0xbf810000u
+    };
+    if (buffer) {
+        code[2] = 0xf4080405u;
+        code[6] = 0xf4080404u;
+        code[9] = 0xf4200508u;
+        code[12] = 0xbf068014u;
+    }
+    if (inverted) {
+        code[1] = 0xbf840004u;
+        std::swap(code[2], code[6]);
+        std::swap(code[3], code[7]);
+    }
+    const auto codeAddress = reinterpret_cast<std::uintptr_t>(code.data());
+    AgcDriver::DriverDetail::ShaderSnapshot snapshot{codeAddress, 0u, 0u, {code.begin(), code.end()}, {}};
+    const ShaderComputeStageInfo compute{{1u, 1u, 1u}, 0u, {true, false, false}, false, 1u, {}};
+    RecompileRequest request{{ShaderStage::Compute, codeAddress, snapshot.code, 0u, {}}, {waveSize, 0u, users, compute, {}, {}, {}}, device.ComputeTarget(waveSize), {0u, 0u, 0u, 128u}};
+    request.useCache = useCache;
+    const auto handle = AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0u, request);
+    AgcDriver::ShaderMemory memory({});
+    static_cast<void>(memory.Capture(request));
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    const auto ordinary = Recompile(request);
+    Require(useCache || !ordinary.cacheHit, "GPU-controlled uncached compilation reused a variant");
+    const auto dispatch = [&](const RecompileResult& result, std::uint32_t expectedValue) {
+        output.fill(0xdeadbeefu);
+        auto expected = output;
+        expected[16] = expectedValue == 0u ? 0x2468ace0u : 0x13579bdfu;
+        device.Dispatch(result, invalidActive ? 2u : 1u, 1u, 1u);
+        device.WaitIdle();
+        if (invalidActive) {
+            std::cout << "GPU-controlled active-invalid dispatch completed; verify deferred BDA fault\n";
+            return;
+        }
+        const auto actualBytes = std::as_bytes(std::span(output));
+        const auto expectedBytes = std::as_bytes(std::span(expected));
+        Require(std::equal(actualBytes.begin(), actualBytes.end(), expectedBytes.begin()), "GPU-controlled scalar pointer/V# changed its payload or output padding");
+        std::cout << "GPU-controlled scalar pointer/V# full 256-byte output verified\n";
+    };
+    dispatch(ordinary, value);
+    if (invalidActive) return;
+    if (useCache) {
+        const auto cached = Recompile(request);
+        Require(cached.cacheHit, "GPU-controlled unchanged request missed the shader cache");
+        dispatch(cached, value);
+    }
+    const auto invocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0u, request);
+    AgcDriver::ShaderMemory preparedMemory({});
+    const auto capture = preparedMemory.Capture(invocation);
+    const auto serialized = RequestSerializer{}.Serialize(request);
+    payload.Set(0u, 1u - value);
+    auto replay = RequestSerializer{}.Deserialize(serialized);
+    dispatch(Recompile(replay.request), 1u - value);
+    dispatch(*invocation.Materialize(*capture), 1u - value);
+    Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0u, request) == handle && snapshot.prepared->entries.size() == 1u, "GPU-controlled live data replaced its prepared source");
+}
+
+void RunGpuControlledScalarReads(AgcDriver::VulkanDevice& device, bool invalidActive = false) {
+    for (const auto wave : {32u, 64u}) {
+        for (const bool inverted : {false, true}) {
+            for (const bool buffer : {false, true}) {
+                for (const auto value : {0u, 1u}) {
+                    for (const bool useCache : {false, true}) {
+                        if (invalidActive) {
+                            if (useCache) continue;
+                            auto isolated = OpenVulkanTestDevice();
+                            Require(isolated != nullptr, "GPU-controlled fault control requires Vulkan");
+                            RunGpuControlledScalarCase(*isolated, wave, inverted, buffer, value, useCache, true);
+                        } else {
+                            RunGpuControlledScalarCase(device, wave, inverted, buffer, value, useCache, false);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
@@ -859,7 +979,7 @@ void DeferredUndecodableRegistration() {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup")), "invalid test arguments");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--gpu-controlled-srt" || std::string_view(argv[1]) == "--gpu-controlled-invalid" || std::string_view(argv[1]) == "--registered-workgroup")), "invalid test arguments");
         if (argc == 2 && std::string_view(argv[1]) == "--registered-workgroup") {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
@@ -884,6 +1004,11 @@ int main(int argc, char** argv) {
         }
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && (std::string_view(argv[1]) == "--gpu-controlled-srt" || std::string_view(argv[1]) == "--gpu-controlled-invalid")) {
+            RunGpuControlledScalarReads(*device, std::string_view(argv[1]) == "--gpu-controlled-invalid");
+            return 0;
+        }
+        RunGpuControlledScalarReads(*device);
         RunInactiveSrtReads(*device);
         Run(*device);
         RegisteredVertexWorkgroup(device->Target());
