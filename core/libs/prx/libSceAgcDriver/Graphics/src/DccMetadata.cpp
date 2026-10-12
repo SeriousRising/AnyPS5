@@ -297,27 +297,51 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
     return keys;
 }
 
-// A uniform fill the title recorded over the whole range, when it is the newest recorded write
-// there: the keys the range holds once it landed, known without waiting for it, as a fill
-// classified as a key fill is (NoteKeysFillOnGpu). No image follows a CMASK, or keys before their
-// surface's first use, so nothing classifies their fill. The answer joins the memo, for the
-// readers of the bytes. APS5_NO_KEYS_FILL_MEMO=1 waits for the fill, as before.
+// The uniform fills the title recorded over the range, when the newest recorded write over every
+// byte of it is one of them: the keys the range holds once they landed, known without waiting for
+// them, as a fill classified as a key fill is (NoteKeysFillOnGpu). No image follows a CMASK, or
+// keys before their surface's first use, so nothing classifies their fill. The answer joins the
+// memo, for the readers of the bytes. APS5_NO_KEYS_FILL_MEMO=1 waits for the fills, as before;
+// APS5_NO_JOINED_KEY_FILLS=1 answers from one fill of the whole range only.
 std::optional<DccKeys> PendingFillKeys(Recorder& recorder, std::uint64_t begin, std::size_t count) {
     static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_MEMO") != nullptr;
+    static const bool joined = std::getenv("APS5_NO_JOINED_KEY_FILLS") == nullptr;
     const auto end = begin + count;
     if (disabled || AnyShadowedOverlaps(begin, count)) return std::nullopt;
     const auto newest = recorder.NewestWriteNote(begin, count);
-    for (const auto& write : recorder.PendingWritesOver(begin, count)) {
-        if (write.note != newest || write.value < 0 || write.begin > begin || write.end < end) continue;
-        const auto keys = ByteKeys(static_cast<std::uint8_t>(write.value));
-        auto& memo = Memo();
-        std::lock_guard lock(memo.mutex);
-        if (MemoRecorder(memo) != &recorder) return std::nullopt;
-        std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
-        memo.entries.push_back({begin, end, keys, newest});
-        return keys;
+    auto writes = recorder.PendingWritesOver(begin, count);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, end}};
+    int value = -1;
+    bool mixed = false;
+    for (const auto& write : writes) {
+        if (unwritten.empty()) break;
+        if (!joined && (write.note != newest || write.begin > begin || write.end < end)) return std::nullopt;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        bool covered = false;
+        for (const auto& [from, to] : unwritten) {
+            if (write.end <= from || to <= write.begin) {
+                rest.emplace_back(from, to);
+                continue;
+            }
+            covered = true;
+            if (from < write.begin) rest.emplace_back(from, write.begin);
+            if (write.end < to) rest.emplace_back(write.end, to);
+        }
+        unwritten = std::move(rest);
+        if (!covered) continue;
+        if (write.value < 0) return std::nullopt;
+        if (value >= 0 && value != write.value) mixed = true;
+        value = write.value;
     }
-    return std::nullopt;
+    if (!unwritten.empty() || value < 0) return std::nullopt;
+    const auto keys = mixed ? DccKeys::Mixed : ByteKeys(static_cast<std::uint8_t>(value));
+    auto& memo = Memo();
+    std::lock_guard lock(memo.mutex);
+    if (MemoRecorder(memo) != &recorder) return std::nullopt;
+    std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
+    memo.entries.push_back({begin, end, keys, newest});
+    return keys;
 }
 
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
