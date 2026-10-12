@@ -208,7 +208,7 @@ void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint
         linked.push_back({roles[i], program.binary, program.userDataBase, program.firstUserSgpr, program.userData});
         if (program.binary.stage != Stage::Fragment && roles[i] != Role::GeometryBack) vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
     }
-    ShaderMemory shaderMemory(memory);
+    ShaderMemory shaderMemory(memory, &queryPendingWrite);
     std::vector<StageCapture> stageCaptures(programs.size());
     std::vector<std::shared_ptr<DispatchVariant>> matched(programs.size());
     std::vector<std::shared_ptr<DispatchVariant>> fresh(programs.size());
@@ -227,19 +227,33 @@ void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint
         require(pushBytes <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         pushCursorBytes += static_cast<std::uint32_t>(pushBytes);
     }
+    static const bool overPending = std::getenv("APS5_NO_DRAW_AHEAD_PENDING") == nullptr;
     PendingView pending;
     pending.Load();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
-    bool written = false;
-    const auto read = [&](std::uint64_t address, std::size_t bytes) {
+    auto worst = ShaderMemory::PendingWrite::None;
+    bool vertexTables = false;
+    const auto read = [&](std::uint64_t address, std::size_t bytes, bool vertex) {
+        using Policy = ShaderMemory::PendingWrite;
         runs.emplace_back(address, address + bytes);
-        written = written || pending.Overlaps(address, bytes);
+        if (!pending.Overlaps(address, bytes)) return;
+        std::uint64_t ValidateCounters::*reason = nullptr;
+        const auto policy = classifyPendingWrite(address, bytes, reason, pending);
+        if (policy == Policy::Sync || policy == Policy::None) worst = Policy::Sync;
+        else if (worst != Policy::Sync && (policy == Policy::Raw || policy == Policy::VerifyRaw)) worst = Policy::Raw;
+        else if (worst == Policy::None) worst = Policy::KnownValue;
+        vertexTables = vertexTables || vertex;
     };
     for (std::size_t i = 0; i < programs.size(); ++i) {
-        for (const auto& region : stageCaptures[i].regions) read(region.guestAddress, region.bytes.size());
-        for (const auto& decoded : decodeReads[i]) read(decoded.address, decoded.bytes.size());
+        for (const auto& region : stageCaptures[i].regions) read(region.guestAddress, region.bytes.size(), false);
+        for (const auto& decoded : decodeReads[i]) read(decoded.address, decoded.bytes.size(), true);
     }
-    if (written || Graphics::StorageTexture::AnyPendingOverlaps(runs) || Graphics::AnyShadowedOverlaps(runs)) return skip(AheadPending);
+    const bool images = Graphics::StorageTexture::AnyPendingOverlaps(runs) || Graphics::AnyShadowedOverlaps(runs);
+    if (worst != ShaderMemory::PendingWrite::None || images) {
+        if (!overPending) return skip(AheadPending);
+        skip(images ? AheadOverImage : worst == ShaderMemory::PendingWrite::Sync ? AheadOverSync : worst == ShaderMemory::PendingWrite::Raw ? AheadOverRaw : AheadOverKnown);
+        if (vertexTables) skip(AheadOverVertex);
+    }
     cacheDrawStages(true, false, drawParameters, std::nullopt, programs, stageCaptures, vertexInfos, decodeReads, false, matched, fresh, drawKey, true, decode, phaseTiming);
     for (const auto& variant : fresh) {
         if (variant != nullptr) variant->ahead.fetch_add(1, std::memory_order_relaxed);
