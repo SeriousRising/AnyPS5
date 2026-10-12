@@ -636,7 +636,11 @@ struct VulkanDevice::State {
             device = VK_NULL_HANDLE;
         }
         if (device != VK_NULL_HANDLE) {
-            const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            VkResult idle = VK_SUCCESS;
+            {
+                const Graphics::DeviceQueueUse queueUse;
+                idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            }
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
@@ -1719,15 +1723,18 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
-    check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    {
+        const Graphics::DeviceQueueUse queueUse;
+        check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    }
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
 
 namespace {
 
-bool OpportunisticReap() {
+bool OpportunisticReap(const Graphics::Recorder& recorder) {
     static const bool enabled = std::getenv("APS5_NO_OPPORTUNISTIC_REAP") == nullptr;
-    return enabled;
+    return enabled && !recorder.ReapLeftToThread();
 }
 
 }
@@ -1747,7 +1754,7 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
     // after a completing batch already finished can go to the GPU instead of behind a completion.
     // Not for cross-queue submitters: a retired batch's write-back may sync a later batch under the
     // mutex (see the header), which a poller or compute worker must never do for queue 0.
-    if (reapFirst && OpportunisticReap()) state->recorder->Reap();
+    if (reapFirst && OpportunisticReap(*state->recorder)) state->recorder->Reap();
     state->recorder->Submit();
 }
 
@@ -1757,7 +1764,7 @@ bool VulkanDevice::CanWaitUnlocked() const {
 
 std::uint64_t VulkanDevice::SubmitAndEpoch() {
     if (!state->recorder) return 0;
-    if (OpportunisticReap()) state->recorder->Reap();
+    if (OpportunisticReap(*state->recorder)) state->recorder->Reap();
     return state->recorder->SubmitAndEpoch();
 }
 
@@ -1775,6 +1782,10 @@ void VulkanDevice::ReapRecorded(std::uint64_t serial) {
 
 void VulkanDevice::ReapRecorded() {
     if (state->recorder) state->recorder->Reap();
+}
+
+void VulkanDevice::ReapAtBoundary() {
+    if (state->recorder && !state->recorder->ReapLeftToThread()) state->recorder->Reap();
 }
 
 std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal) const {
@@ -1828,7 +1839,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         stepMs = {};
         stores = idle = 0;
     };
-    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap(recorder)) recorder.Reap();
     step(0);
     if (recorder.Idle()) {
         ++idle;
@@ -1891,7 +1902,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
 
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
     if (!state->recorder) return false;
-    if (reapFirst && OpportunisticReap()) state->recorder->Reap();
+    if (reapFirst && OpportunisticReap(*state->recorder)) state->recorder->Reap();
     return state->recorder->AfterRecordedWork(std::move(action));
 }
 
@@ -1899,7 +1910,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!state->recorder) return false;
     auto& recorder = *state->recorder;
     constexpr std::size_t bytes = 15 * 16 + 8;
-    if (OpportunisticReap()) recorder.Reap();
+    if (OpportunisticReap(recorder)) recorder.Reap();
     if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
     const auto context = graphicsContext();
     Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
@@ -1921,7 +1932,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
     // finished does not force a wait below. Before the import lookup: a completion may refresh the
     // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
-    if (OpportunisticReap()) recorder.Reap();
+    if (OpportunisticReap(recorder)) recorder.Reap();
     const auto context = graphicsContext();
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr) return false;
@@ -2846,7 +2857,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    {
+        const Graphics::DeviceQueueUse queueUse;
+        check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    }
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -2967,7 +2981,11 @@ void VulkanDevice::QueuePresent() {
     present.swapchainCount = 1;
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
-    const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    VkResult presented = VK_SUCCESS;
+    {
+        const Graphics::DeviceQueueUse queueUse;
+        presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    }
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
