@@ -25,7 +25,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
-            bumpEpoch(&EpochBumps::drains);
+            static const bool interruptEpoch = std::getenv("APS5_NO_INTERRUPT_EPOCH_KEEP") != nullptr;
+            if (interruptEpoch) bumpEpoch(&EpochBumps::drains);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
