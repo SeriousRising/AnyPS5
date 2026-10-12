@@ -34,6 +34,7 @@ constexpr std::uint32_t Height = 32;
 constexpr std::uint32_t ReusedWidth = 32;
 constexpr std::uint32_t ReusedHeight = 8;
 constexpr std::uint32_t Format32Float = 22;
+constexpr std::uint32_t Format8888UNorm = 56;
 constexpr std::uint32_t Format32323232Float = 77;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::size_t BlockBytes = 65536;
@@ -268,6 +269,28 @@ void CheckReuse(AgcDriver::VulkanDevice& device, std::uint8_t* memory) {
     }
 }
 
+std::uint32_t ColorStored(std::uint32_t tid, std::uint32_t component) {
+    return std::bit_cast<std::uint32_t>(((tid >> component) & 1u) != 0u ? 1.0f : 0.0f);
+}
+
+void CheckSampledReuse(AgcDriver::VulkanDevice& device, std::uint8_t* memory) {
+    const auto color = TextureDescriptor(memory, Format8888UNorm, Width, Height);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        for (std::uint32_t component = 0; component < 4u; ++component) Buffer[tid * 4u + component] = ColorStored(tid, component);
+    }
+    Dispatch(device, StoreCode, color);
+    DrawDepth(device, memory);
+    Buffer.fill(0xdeadbeefu);
+    Dispatch(device, LoadCode, color);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        for (std::uint32_t component = 0; component < 4u; ++component) {
+            Require(Buffer[tid * 4u + component] == ColorStored(tid, component), "image_load of a color texture at an address a depth target was bound at again: thread " + std::to_string(tid) + " component " + std::to_string(component) + " is " + std::to_string(std::bit_cast<float>(Buffer[tid * 4u + component])) + ", expected " + std::to_string(std::bit_cast<float>(ColorStored(tid, component))));
+        }
+    }
+    DrawDepth(device, memory);
+    CheckDepthLoad(device, memory, "depth surface bound again after its memory was sampled as a color texture");
+}
+
 }
 
 int main() {
@@ -281,6 +304,7 @@ int main() {
         CheckReuse(*device, block.Data());
         DrawDepth(*device, block.Data());
         CheckDepthLoad(*device, block.Data(), "depth surface bound again after its memory was reused");
+        CheckSampledReuse(*device, block.Data());
         std::puts("depth surface reuse tests passed");
         return 0;
     } catch (const std::exception& error) {
