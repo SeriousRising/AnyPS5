@@ -22,6 +22,13 @@ void Driver::reportDrawCache(DrawEntryCounters& counters) {
         drawAhead.reported[kind] = total;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[draw-ahead] %s (10 s): %llu scans started, %llu draws prepared ahead, %llu draws hit with every stage prepared ahead; of the prepared, reads over recorded GPU work: %llu served from known values, %llu read raw on evidence, %llu read without the wait they need in order, %llu under a pending or shadowed image (%llu of all these in vertex tables); not prepared: %llu already cached, %llu the queue had reached, %llu over recorded GPU work with that switched off, %llu indirect, mesh or rejected, %llu failed; %llu scans stopped at a packet they cannot follow\n", drawAheadEnabled() ? "on" : "off", ahead[AheadScans], ahead[AheadPrepared], ahead[AheadHits], ahead[AheadOverKnown], ahead[AheadOverRaw], ahead[AheadOverSync], ahead[AheadOverImage], ahead[AheadOverVertex], ahead[AheadWarm], ahead[AheadPassed], ahead[AheadPending], ahead[AheadUnsupported], ahead[AheadErrors], ahead[AheadStops]);
+    std::array<unsigned long long, DrawLockRunCountKinds> runs{};
+    for (std::size_t kind = 0; kind < DrawLockRunCountKinds; ++kind) {
+        const auto total = drawLockRunCounts[kind].load(std::memory_order_relaxed);
+        runs[kind] = total - drawLockRunReported[kind];
+        drawLockRunReported[kind] = total;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-run] %s (10 s): the GPU mutex was kept after %llu draws and %llu draws after them found it held; given up at a draw that missed the cache %llu, before a validation's GPU wait %llu, at a packet that is neither a draw nor a register write or at the end %llu, after %u draws or %lld us %llu\n", drawLockRunEnabled() ? "on" : "off", runs[RunsStarted], runs[RunDrawsHeld], runs[RunEndedByMiss], runs[RunEndedBySync], runs[RunEndedByPacket], DrawLockRun::MaxDraws, static_cast<long long>(DrawLockRun::MaxHeld.count()), runs[RunEndedByBound]);
     counters = DrawEntryCounters{};
 }
 
