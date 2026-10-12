@@ -94,6 +94,22 @@ alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{0xe0382000, 0x800
 alignas(256) constexpr std::array<std::uint32_t, 9> ReadCode{0xf4080304, 0xfa000000, 0x7e1e0280, 0xdc308000, 0x0a0c000f, 0xbf8c3f70, 0xf800180f, 0x0a0a0a0a, 0xbf810000};
 alignas(256) constexpr std::array<std::uint32_t, 13> CopyCode{0xf4080304, 0xfa000000, 0x7e1e0280, 0xdc308000, 0x0a0c000f, 0xbf8c3f70, 0x7e02020e, 0x7e04020f, 0xdc708000, 0x007d0a01, 0xf800180f, 0x0a0a0a0a, 0xbf810000};
 alignas(256) constexpr std::array<std::uint32_t, 5> StoreCode{0x7e040280, 0x7e0202f2, 0xe0701000, 0x80010102, 0xbf810000};
+alignas(256) constexpr std::array<std::uint32_t, 104> GeometryCode{
+    0x8f6a9003, 0x94fe6ac1, 0xbf88000b, 0xd7650006, 0x000100c1, 0xd7660006, 0x00020cc1, 0x93ebff03,
+    0x00040018, 0xd7460006, 0x04190c6b, 0x340c0c82, 0xd8340000, 0x00000506, 0xbf8cc07f, 0xbefe04c1,
+    0xbf8a0000, 0x938dff02, 0x00090016, 0x9382ff03, 0x00040018, 0x938cff03, 0x00080008, 0xd7650009,
+    0x000100c1, 0xd7660009, 0x000212c1, 0xd746000a, 0x04250c02, 0x7da8120c, 0xbf88002e, 0x361600ff,
+    0x0000ffff, 0x2c180090, 0x361a02ff, 0x0000ffff, 0xd8d80000, 0x0b00000b, 0xd8d80000, 0x0c00000c,
+    0xd8d80000, 0x0d00000d, 0xbf8cc07f, 0xe0382000, 0x8002100b, 0xe0382010, 0x8002140b, 0xe0382000,
+    0x8002180c, 0xe0382010, 0x80021c0c, 0xe0382000, 0x8002200d, 0xe0382010, 0x8002240d, 0x161c1483,
+    0x161e14ff, 0x00000060, 0xbf8c3f70, 0xdb7c0400, 0x0000100f, 0xdb7c0410, 0x0000140f, 0xdb7c0420,
+    0x0000180f, 0xdb7c0430, 0x00001c0f, 0xdb7c0440, 0x0000200f, 0xdb7c0450, 0x0000240f, 0x4a501c81,
+    0x4a521c82, 0x3450508a, 0x34525294, 0xd772002a, 0x04a6510e, 0xbf8cc07f, 0xbefe04c1, 0xbf8a0000,
+    0x930e830d, 0xbf078002, 0xbf850003, 0x8f0f8c0d, 0x887c0f0e, 0xbf900009, 0x7da8140d, 0xbf880002,
+    0xf8000941, 0x0000002a, 0xbefe04c1, 0x7da8140e, 0xbf88000a, 0x34561485, 0xdbfc0400, 0x2c00002b,
+    0xdbfc0410, 0x3000002b, 0xbf8cc07f, 0xf80008cf, 0x2f2e2d2c, 0xf800020f, 0x33323130, 0xbf810000,
+};
+alignas(256) constexpr std::array<std::uint32_t, 7> InterpolatedCode{0xc8020002, 0xc8060102, 0xc80a0202, 0xc80e0302, 0xf800180f, 0x03020100, 0xbf810000};
 alignas(256) std::array<std::array<float, 4>, 3> Triangle{{{-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}}};
 
 struct Program {
@@ -101,9 +117,10 @@ struct Program {
         Shader shader{};
         ShaderUserData users{};
         std::array<ShaderRegister, 4> registers{};
+        std::array<ShaderRegister, 1> contexts{};
     } header;
 
-    Program(std::uint8_t type, std::span<const std::uint32_t> code, std::uint32_t users) {
+    Program(std::uint8_t type, std::span<const std::uint32_t> code, std::uint32_t users, std::uint32_t allocation = 0, std::uint32_t resourceBits = 0, ShaderRegister context = {0, 0}) {
         const auto address = reinterpret_cast<std::uintptr_t>(code.data());
         const std::uint32_t program = type == 1 ? 0x008u : 0x0c8u;
         const std::uint32_t resources = type == 1 ? 0x00bu : 0x08bu;
@@ -116,7 +133,12 @@ struct Program {
         header.shader.user_data = &header.users;
         header.shader.sh_registers = header.registers.data();
         header.shader.num_sh_registers = static_cast<std::uint8_t>(header.registers.size());
-        header.registers = {{{program, static_cast<std::uint32_t>(address >> 8u)}, {program + 1u, static_cast<std::uint32_t>(address >> 40u)}, {resources - 1u, 0}, {resources, users << 1u}}};
+        header.registers = {{{program, static_cast<std::uint32_t>(address >> 8u)}, {program + 1u, static_cast<std::uint32_t>(address >> 40u)}, {resources - 1u, allocation}, {resources, (users << 1u) | resourceBits}}};
+        if (context.offset != 0) {
+            header.contexts = {{context}};
+            header.shader.cx_registers = header.contexts.data();
+            header.shader.num_cx_registers = 1;
+        }
         AgcDriverRegisterShader_nid_postfix(&header.shader);
     }
 
@@ -244,6 +266,19 @@ struct Scene {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         AgcDriverWaitIdle_nid_postfix();
+    }
+
+    std::vector<std::uint32_t> Texels(std::uint64_t address) {
+        AgcDriver::QueueState queue;
+        for (const auto reg : ContextRegisters(address)) queue.context[reg.offset] = reg.value;
+        queue.userConfig[0x242] = 4;
+        const auto color = AgcDriver::Graphics::DecodeState(queue).color;
+        AgcDriver::Graphics::StorageTexture::FlushPending(color.address, color.bytes, nullptr, "test");
+        Commands commands;
+        Finish(commands);
+        std::vector<std::uint32_t> pixels(static_cast<std::size_t>(color.extent.width) * color.extent.height);
+        AgcDriver::Graphics::ReadColorTarget(color, std::as_writable_bytes(std::span(pixels)));
+        return pixels;
     }
 
     bool Holds(std::uint64_t address, std::uint32_t texel) {
@@ -429,6 +464,57 @@ void Under(Scene& scene) {
     }
 }
 
+void Mesh(Scene& scene) {
+    struct Vertex {
+        std::array<float, 4> position;
+        std::array<float, 4> color;
+    };
+    GuestBlock geometry(BlockBytes);
+    GuestBlock canvas(BlockBytes);
+    std::uint32_t previous = 0;
+    const std::array<std::uint16_t, 6> indices{0, 1, 2, 3, 4, 5};
+    constexpr std::uint32_t IndicesOffset = 0x8000;
+    constexpr std::uint32_t Rounds = 8;
+    std::memcpy(reinterpret_cast<void*>(geometry.Address(IndicesOffset)), indices.data(), sizeof(indices));
+    Program front(2, GeometryCode, 4, 3u << 29u, (3u << 16u) | (8u << 19u), {0x2d5, 0x20});
+    Program pixel(1, InterpolatedCode, 0, 0, 0, {0x1b6, 1});
+    auto context = ContextRegisters(canvas.Address());
+    for (const auto reg : std::initializer_list<ShaderRegister>{{0x2d5, 0x20}, {0x29b, 2}, {0x1ff, 12}, {0x2ce, 3}, {0x2ab, 4}, {0x1b6, 1}, {0x191, 0x400}}) context.push_back(reg);
+    const std::array<ShaderRegister, 2> primitive{{{0x242, 4}, {0x25b, (12u << 9u) | 4u}}};
+    AgcDriverResolveShaderAbi_nid_postfix(&front.header.shader, context, primitive);
+    AgcDriverResolveShaderAbi_nid_postfix(&pixel.header.shader, context, primitive);
+    for (std::uint32_t round = 0; round < Rounds; ++round) {
+        const float shade = static_cast<float>(round + 1) / Rounds;
+        const std::array<float, 4> color{shade, shade, shade, 1.0f};
+        const std::array<Vertex, 6> vertices{{{{-1.0f, -1.0f, 0.5f, 1.0f}, color}, {{-0.1f, -1.0f, 0.5f, 1.0f}, color}, {{-1.0f, 1.0f, 0.5f, 1.0f}, color}, {{1.0f, 1.0f, 0.5f, 1.0f}, color}, {{0.1f, 1.0f, 0.5f, 1.0f}, color}, {{1.0f, -1.0f, 0.5f, 1.0f}, color}}};
+        const auto buffer = geometry.Address(round * 256u);
+        std::memcpy(reinterpret_cast<void*>(buffer), vertices.data(), sizeof(vertices));
+        Commands commands;
+        for (const auto reg : context) commands.Context(reg.offset, reg.value);
+        for (const auto reg : primitive) commands.Add({0xc0017900u, reg.offset, reg.value});
+        commands.Program(front);
+        commands.ShaderRegister(0x08c, static_cast<std::uint32_t>(buffer));
+        commands.ShaderRegister(0x08d, (static_cast<std::uint32_t>(buffer >> 32u) & 0xffffu) | (32u << 16u));
+        commands.ShaderRegister(0x08e, static_cast<std::uint32_t>(vertices.size()));
+        commands.ShaderRegister(0x08f, 0x01016facu);
+        commands.Program(pixel);
+        commands.Add({0xc0012600u, static_cast<std::uint32_t>(geometry.Address(IndicesOffset)), static_cast<std::uint32_t>(geometry.Address(IndicesOffset) >> 32u)});
+        commands.Add({0xc0002a00u, 0u});
+        commands.Add({0xc0001300u, static_cast<std::uint32_t>(indices.size())});
+        commands.Add({0xc0033500u, static_cast<std::uint32_t>(indices.size()), 0u, 3u, 0u});
+        commands.Add({0xc0033500u, static_cast<std::uint32_t>(indices.size()), 3u, 3u, 0u});
+        commands.Add({0xc0033500u, static_cast<std::uint32_t>(indices.size()), 0u, 3u, 0u});
+        scene.Finish(commands);
+        const auto pixels = scene.Texels(canvas.Address());
+        const auto at = [&](float x, float y) { return pixels[static_cast<std::size_t>((1.0f - (y + 1.0f) * 0.5f) * 63.0f) * 64u + static_cast<std::size_t>((x + 1.0f) * 0.5f * 63.0f)]; };
+        const auto left = at(-0.8f, -0.8f);
+        Require((left & 0xffu) != 0 && (round == 0 || left != previous), "draw ahead: the first of the mesh draws with the same registers did not draw its index range");
+        Require(at(0.8f, 0.8f) == left, "draw ahead: the second of two mesh draws with the same registers did not draw its own index range");
+        Require(at(0.8f, -0.8f) == 0u && at(-0.8f, 0.8f) == 0u, "draw ahead: the mesh draws drew outside their triangles");
+        previous = left;
+    }
+}
+
 void Stress(Scene& scene, std::uint32_t rounds) {
     constexpr std::uint32_t pool = 24;
     std::mt19937 random(0x5eed);
@@ -546,9 +632,11 @@ void Benchmark(Scene& scene, std::uint32_t batches, bool stores, bool under) {
 
 int main(int argc, char** argv) {
     try {
+        bool meshes = false;
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+            meshes = device->Target().mesh.has_value();
         }
         Require(argc == 1 || (argc == 3 && (std::string(argv[1]) == "bench" || std::string(argv[1]) == "bench-stores" || std::string(argv[1]) == "bench-under")), "draw ahead: expected no arguments, or bench, bench-stores or bench-under and a number of batches");
         {
@@ -563,6 +651,8 @@ int main(int argc, char** argv) {
                 Stores(scene);
                 Under(scene);
                 Stress(scene, 48);
+                if (meshes) Mesh(scene);
+                else std::puts("no mesh shaders on this device: mesh draws not tested");
                 const auto counts = AgcDriver::DrawAheadCounts();
                 const bool off = std::getenv("APS5_NO_DRAW_AHEAD") != nullptr;
                 std::printf("draw ahead: %llu draws prepared ahead, %llu hit\n", static_cast<unsigned long long>(counts.prepared), static_cast<unsigned long long>(counts.hits));
