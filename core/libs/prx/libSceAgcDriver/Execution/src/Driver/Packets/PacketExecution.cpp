@@ -173,6 +173,7 @@ void Driver::execute(const Submission& submission) {
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 
         if (profilePackets) {
+            if (submission.queue == 0) GuestMemory::HitchPacketBegin(header == FlipPacketHeader ? GuestMemory::HitchFlipKind : opcode);
             packetStartedAt() = packetTimer.start;
             pendingDispatchPhases() = {};
             pendingDrawPhases() = {};
@@ -203,7 +204,10 @@ void Driver::execute(const Submission& submission) {
             }
             addDrawPhases(ms, drawn && pending.phases, pending.captures);
         };
-        if (profilePackets) packetProfile.flushMs += std::chrono::duration<double, std::milli>(packetTimer.start - flushStart).count();
+        if (profilePackets) {
+            packetProfile.flushMs += std::chrono::duration<double, std::milli>(packetTimer.start - flushStart).count();
+            GuestMemory::HitchAdd(GuestMemory::HitchCost::Flush, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(packetTimer.start - flushStart).count()));
+        }
 
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
         const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);

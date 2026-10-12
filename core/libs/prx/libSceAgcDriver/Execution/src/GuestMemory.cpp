@@ -297,6 +297,7 @@ public:
         if (!MemoryProfiled()) return;
         const auto now = std::chrono::steady_clock::now();
         CounterFor(kind).Add(bytes, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), SharedMemoryCounters());
+        if (kind == CounterCollect) HitchAdd(HitchCost::Collect, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()));
         auto& state = Profile();
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         auto last = state.lastReport.load();
@@ -1717,6 +1718,7 @@ void GpuMutexType::lock() {
             stats.holdStart = now;
         }
         const auto waitedMs = std::chrono::duration<double, std::milli>(now - start).count();
+        HitchAdd(HitchCost::MutexWait, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()));
         stats.waitedMs += waitedMs;
         ++stats.waits;
         stats.siteWaitedMs[site] += waitedMs;
@@ -1974,6 +1976,175 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     if (source.size() >= PageBytes) StoreOwnBytes(address, source);
     else StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });
+}
+
+}
+
+namespace AgcDriver::GuestMemory {
+
+namespace {
+
+constexpr std::size_t HitchKinds = HitchFlipKind + 1;
+constexpr std::size_t HitchCosts = static_cast<std::size_t>(HitchCost::Count);
+constexpr std::array<const char*, HitchCosts> HitchCostNames{"recompile", "pipeline creation", "GPU mutex wait", "waits on GPU results", "flush and submit", "guest memory collect", "texture upload", "texture write-back"};
+
+struct HitchCounters {
+    std::array<std::atomic<std::uint64_t>, HitchKinds> packetNs{};
+    std::array<std::atomic<std::uint64_t>, HitchCosts> costNs{};
+    std::atomic<std::uint64_t> pipelines{0};
+    std::atomic<std::uint64_t> longest{0};
+    std::atomic<std::uint64_t> runningKind{~0ull};
+    std::atomic<std::int64_t> runningSince{0};
+};
+
+HitchCounters& Hitches() {
+    static HitchCounters* const counters = new HitchCounters;
+    return *counters;
+}
+
+thread_local bool hitchWorker = false;
+
+struct HitchWindow {
+    std::mutex mutex;
+    bool started = false;
+    std::chrono::steady_clock::time_point previous{}, lastReport{};
+    std::array<std::uint64_t, HitchKinds> packetNs{};
+    std::array<std::uint64_t, HitchCosts> costNs{};
+    std::uint64_t pipelines = 0;
+    std::vector<double> intervals;
+    std::uint64_t listed = 0, unlisted = 0;
+};
+
+HitchWindow& HitchState() {
+    static HitchWindow* const window = new HitchWindow;
+    return *window;
+}
+
+}
+
+bool HitchProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+void HitchWorker() {
+    hitchWorker = true;
+}
+
+void HitchAdd(HitchCost cost, std::uint64_t nanoseconds) {
+    if (!hitchWorker || !HitchProfiled()) return;
+    auto& counters = Hitches();
+    counters.costNs[static_cast<std::size_t>(cost)].fetch_add(nanoseconds, std::memory_order_relaxed);
+    if (cost == HitchCost::PipelineCreate) counters.pipelines.fetch_add(1, std::memory_order_relaxed);
+}
+
+void HitchPacketBegin(std::uint32_t kind) {
+    if (!hitchWorker || !HitchProfiled()) return;
+    auto& counters = Hitches();
+    counters.runningSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    counters.runningKind.store(std::min<std::uint32_t>(kind, HitchFlipKind), std::memory_order_release);
+}
+
+void HitchPacketEnd(std::uint32_t kind, std::uint64_t nanoseconds) {
+    if (!hitchWorker || !HitchProfiled()) return;
+    auto& counters = Hitches();
+    kind = std::min<std::uint32_t>(kind, HitchFlipKind);
+    counters.runningKind.store(~0ull, std::memory_order_release);
+    counters.packetNs[kind].fetch_add(nanoseconds, std::memory_order_relaxed);
+    const auto packed = (nanoseconds << 9u) | kind;
+    if (packed > counters.longest.load(std::memory_order_relaxed)) counters.longest.store(packed, std::memory_order_relaxed);
+}
+
+std::vector<std::string> HitchPresent(std::chrono::steady_clock::time_point now, double inFlightWaitMs, std::string (*kindName)(std::uint32_t kind)) {
+    std::vector<std::string> lines;
+    if (!HitchProfiled()) return lines;
+    auto& counters = Hitches();
+    auto& window = HitchState();
+    std::lock_guard lock(window.mutex);
+    std::array<std::uint64_t, HitchKinds> packetNs{};
+    std::array<std::uint64_t, HitchCosts> costNs{};
+    for (std::size_t kind = 0; kind < HitchKinds; ++kind) packetNs[kind] = counters.packetNs[kind].load(std::memory_order_relaxed);
+    for (std::size_t cost = 0; cost < HitchCosts; ++cost) costNs[cost] = counters.costNs[cost].load(std::memory_order_relaxed);
+    const auto pipelines = counters.pipelines.load(std::memory_order_relaxed);
+    const auto longest = counters.longest.exchange(0, std::memory_order_relaxed);
+    const auto name = [&](std::uint64_t kind) {
+        if (kind == HitchFlipKind) return std::string("flip");
+        if (kindName != nullptr) return kindName(static_cast<std::uint32_t>(kind));
+        char text[16];
+        std::snprintf(text, sizeof(text), "0x%02x", static_cast<unsigned>(kind));
+        return std::string(text);
+    };
+    if (window.started) {
+        const auto intervalMs = std::chrono::duration<double, std::milli>(now - window.previous).count();
+        window.intervals.push_back(intervalMs);
+        if (intervalMs > 100.0) {
+            if (window.listed >= 20) {
+                ++window.unlisted;
+            } else {
+                ++window.listed;
+                std::vector<std::pair<double, std::size_t>> kinds;
+                double packetsMs = 0;
+                for (std::size_t kind = 0; kind < HitchKinds; ++kind) {
+                    const auto ms = static_cast<double>(packetNs[kind] - window.packetNs[kind]) / 1e6;
+                    if (ms <= 0) continue;
+                    kinds.emplace_back(ms, kind);
+                    packetsMs += ms;
+                }
+                std::sort(kinds.begin(), kinds.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                char text[160];
+                std::snprintf(text, sizeof(text), "[hitch] %.1f ms between presents (in-flight wait %.1f ms); queue 0 worker by packet kind:", intervalMs, inFlightWaitMs);
+                std::string line = text;
+                for (std::size_t i = 0; i < kinds.size() && i < 6; ++i) {
+                    std::snprintf(text, sizeof(text), " %s %.1f", name(kinds[i].second).c_str(), kinds[i].first);
+                    line += text;
+                }
+                if (kinds.empty()) line += " none";
+                if (longest != 0) {
+                    std::snprintf(text, sizeof(text), "; longest packet %s %.1f ms", name(longest & 0x1ffu).c_str(), static_cast<double>(longest >> 9u) / 1e6);
+                    line += text;
+                }
+                double runningMs = 0;
+                if (const auto running = counters.runningKind.load(std::memory_order_acquire); running != ~0ull) {
+                    const auto since = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(counters.runningSince.load(std::memory_order_relaxed)));
+                    runningMs = std::min(intervalMs, std::max(0.0, std::chrono::duration<double, std::milli>(now - since).count()));
+                    std::snprintf(text, sizeof(text), "; still in %s for %.1f ms", name(running).c_str(), runningMs);
+                    line += text;
+                }
+                line += "; of which";
+                for (std::size_t cost = 0; cost < HitchCosts; ++cost) {
+                    const auto ms = static_cast<double>(costNs[cost] - window.costNs[cost]) / 1e6;
+                    if (cost == static_cast<std::size_t>(HitchCost::PipelineCreate)) std::snprintf(text, sizeof(text), ", %s %.1f (%llu)", HitchCostNames[cost], ms, static_cast<unsigned long long>(pipelines - window.pipelines));
+                    else std::snprintf(text, sizeof(text), "%s %s %.1f", cost == 0 ? "" : ",", HitchCostNames[cost], ms);
+                    line += text;
+                }
+                const auto flushMs = static_cast<double>(costNs[static_cast<std::size_t>(HitchCost::Flush)] - window.costNs[static_cast<std::size_t>(HitchCost::Flush)]) / 1e6;
+                const auto idleMs = std::max(0.0, intervalMs - packetsMs - flushMs - runningMs);
+                std::snprintf(text, sizeof(text), "; worker outside packets %.1f ms%s", idleMs, idleMs > intervalMs / 2 ? " (most of the interval: the stall is on the guest side or the presenter)" : "");
+                line += text;
+                lines.push_back(std::move(line));
+            }
+        }
+    } else {
+        window.started = true;
+        window.lastReport = now;
+    }
+    window.previous = now;
+    window.packetNs = packetNs;
+    window.costNs = costNs;
+    window.pipelines = pipelines;
+    if (now - window.lastReport >= std::chrono::seconds(10) && !window.intervals.empty()) {
+        auto& intervals = window.intervals;
+        std::sort(intervals.begin(), intervals.end());
+        const auto percentile = [&](double fraction) { return intervals[std::min(intervals.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(intervals.size())))]; };
+        const auto over = [&](double ms) { return static_cast<unsigned long long>(intervals.end() - std::upper_bound(intervals.begin(), intervals.end(), ms)); };
+        char text[320];
+        std::snprintf(text, sizeof(text), "[hitch] %zu present intervals (10 s): p50 %.1f ms, p90 %.1f, p99 %.1f, max %.1f; over 50 ms %llu, over 100 ms %llu, over 250 ms %llu; %llu intervals over 100 ms listed, %llu more not listed", intervals.size(), percentile(0.5), percentile(0.9), percentile(0.99), intervals.back(), over(50.0), over(100.0), over(250.0), static_cast<unsigned long long>(window.listed), static_cast<unsigned long long>(window.unlisted));
+        lines.emplace_back(text);
+        intervals.clear();
+        window.listed = window.unlisted = 0;
+        window.lastReport = now;
+    }
+    return lines;
 }
 
 }

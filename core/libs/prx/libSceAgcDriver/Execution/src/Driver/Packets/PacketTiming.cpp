@@ -12,6 +12,7 @@ PacketTimer::~PacketTimer() {
     auto& entry = profile.byOpcode[key];
     ++entry.first;
     entry.second += std::chrono::duration<double, std::milli>(now - start).count();
+    if (queue == 0) GuestMemory::HitchPacketEnd(key == 0xffffu ? GuestMemory::HitchFlipKind : key, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()));
     if (now - profile.lastReport < std::chrono::seconds(10)) return;
     profile.lastReport = now;
     std::vector<std::pair<std::uint32_t, std::pair<std::uint64_t, double>>> hot(profile.byOpcode.begin(), profile.byOpcode.end());
