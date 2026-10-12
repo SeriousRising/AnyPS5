@@ -707,6 +707,17 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
 
 }
 
+std::optional<DccKeys> PendingClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes) {
+    const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
+    const auto metaAddress = resource.dccAddress;
+    if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count)) return std::nullopt;
+    if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return EncodedKeys(resource, *keys);
+    if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    return std::nullopt;
+}
+
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     const auto metaAddress = resource.dccAddress;
