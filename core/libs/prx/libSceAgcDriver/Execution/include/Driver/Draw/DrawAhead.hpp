@@ -2,9 +2,11 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAWAHEAD_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +17,17 @@
 namespace AgcDriver::DriverDetail {
 
 enum DrawAheadCount : std::size_t { AheadScans, AheadPrepared, AheadHits, AheadWarm, AheadPassed, AheadPending, AheadUnsupported, AheadErrors, AheadStops, AheadOverKnown, AheadOverRaw, AheadOverSync, AheadOverImage, AheadOverVertex, DrawAheadCountKinds };
+
+enum DrawLockRunCount : std::size_t { RunsStarted, RunDrawsHeld, RunEndedByMiss, RunEndedBySync, RunEndedByPacket, RunEndedByBound, DrawLockRunCountKinds };
+
+struct DrawLockRun {
+    static constexpr std::uint32_t MaxDraws = 8;
+    static constexpr std::chrono::microseconds MaxHeld{200};
+    std::unique_lock<GuestMemory::GpuMutexType> lock{GuestMemory::GpuMutex(), std::defer_lock};
+    std::uint32_t draws = 0;
+    std::chrono::steady_clock::time_point since{};
+    bool enabled = false;
+};
 
 struct DrawAhead {
     static constexpr std::size_t Running = std::numeric_limits<std::size_t>::max();

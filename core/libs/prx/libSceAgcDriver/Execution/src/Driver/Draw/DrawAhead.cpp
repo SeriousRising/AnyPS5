@@ -12,6 +12,37 @@ bool Driver::drawAheadEnabled() {
     return enabled && !ShaderRecompiler::DebugProbeActive();
 }
 
+bool Driver::drawLockRunEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_LOCK_RUN") == nullptr && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr && std::getenv("APS5_DRAIN_ALL") == nullptr;
+    return enabled;
+}
+
+DrawLockRun& Driver::drawLockRun() {
+    static thread_local DrawLockRun run;
+    return run;
+}
+
+void Driver::endDrawLockRun(DrawLockRunCount why) {
+    auto& run = drawLockRun();
+    if (!run.lock.owns_lock()) return;
+    run.lock.unlock();
+    drawLockRunCounts[why].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Driver::keepDrawLockRun() {
+    auto& run = drawLockRun();
+    if (!run.enabled) return;
+    if (run.lock.owns_lock()) {
+        ++run.draws;
+        drawLockRunCounts[RunDrawsHeld].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    run.lock.lock();
+    run.draws = 1;
+    run.since = std::chrono::steady_clock::now();
+    drawLockRunCounts[RunsStarted].fetch_add(1, std::memory_order_relaxed);
+}
+
 DrawAheadTotals Driver::DrawAheadCounts() {
     return {drawAhead.counts[AheadPrepared].load(std::memory_order_relaxed), drawAhead.counts[AheadHits].load(std::memory_order_relaxed)};
 }
