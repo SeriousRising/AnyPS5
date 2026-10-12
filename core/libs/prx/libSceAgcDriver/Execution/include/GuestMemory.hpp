@@ -95,6 +95,17 @@ void BumpCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
+// A caller's own memo of the last walk of its range: an entry of the per-thread ring under the same
+// rule (the walking thread's epoch, the unwatch serial, the page-rounded range), which the walks of
+// other ranges cannot evict. An image looked up by every draw of a submission keeps one, since the
+// ring holds 64 ranges and a frame's draws walk more than that between two lookups of a target.
+struct CollectMemo {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+};
+std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, CollectMemo& memo);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
