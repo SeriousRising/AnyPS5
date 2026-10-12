@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -162,7 +163,7 @@ Context mockContext() {
 
 constexpr std::uint64_t Batches = 8;
 const bool threads = std::getenv("APS5_NO_FLUSH_THREADS") == nullptr && std::getenv("APS5_NO_SUBMIT_THREAD") == nullptr;
-const bool reaps = std::getenv("APS5_NO_FLUSH_THREADS") == nullptr && std::getenv("APS5_NO_REAP_THREAD") == nullptr;
+const bool reaps = std::getenv("APS5_NO_FLUSH_THREADS") == nullptr && std::getenv("APS5_REAP_THREAD") != nullptr;
 
 void Hold(bool held) {
     std::lock_guard lock(mock.mutex);
@@ -309,6 +310,82 @@ void Shutdown(bool locked) {
     Expect(InOrder(mock.submitted), "a recorder torn down with batches pending did not submit every batch in order");
 }
 
+// A thread that wants the GPU mutex while the reap thread runs a batch's completions waits for
+// the one in progress and no more, and the rest run afterwards, once each and in order, on
+// whichever thread finishes the batch.
+void WorkerBehindAReap() {
+    if (!reaps) return;
+    Hold(false);
+    constexpr std::uint64_t Steps = 100, Stop = 10;
+    struct Run {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::vector<std::uint64_t> order;
+        bool reached = false;
+        bool contended = false;
+    } run;
+    auto recorder = std::make_unique<Recorder>(mockContext(), true);
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder->Activate();
+        for (std::uint64_t step = 1; step <= Steps; ++step) {
+            recorder->OnComplete([&run, step] {
+                std::unique_lock lock(run.mutex);
+                run.order.push_back(step);
+                if (step != Stop) return;
+                run.reached = true;
+                run.changed.notify_all();
+                lock.unlock();
+                const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                while (!AgcDriver::GuestMemory::GpuMutex().Contended() && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+                lock.lock();
+                run.contended = AgcDriver::GuestMemory::GpuMutex().Contended();
+            });
+        }
+        recorder->Submit();
+    }
+    {
+        std::unique_lock lock(run.mutex);
+        Expect(run.changed.wait_for(lock, std::chrono::seconds(20), [&] { return run.reached; }), "the reap thread did not run the batch's completions");
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        {
+            std::lock_guard lock(run.mutex);
+            Expect(run.contended, "the completion in progress did not see the waiting thread");
+            Expect(run.order.size() == Stop, "a thread waiting for the GPU mutex waited behind " + std::to_string(run.order.size() - std::min<std::size_t>(run.order.size(), Stop)) + " more completions than the one in progress");
+        }
+        Expect(recorder->InFlightBatches() == 1, "the batch the reap thread gave up is not in flight");
+        recorder->Sync();
+        std::lock_guard lock(run.mutex);
+        bool ordered = run.order.size() == Steps;
+        for (std::uint64_t step = 0; ordered && step < Steps; ++step) ordered = run.order[step] == step + 1;
+        Expect(ordered, "the completions of a batch given up by the reap thread did not run once each in order");
+        recorder.reset();
+    }
+}
+
+// With the reap thread kept from the mutex, the worker leaves its own reaps to it only while
+// fewer than eight batches are in flight, and reaps them itself in order after that.
+void StarvedReapThread() {
+    Hold(false);
+    Published published;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto recorder = std::make_unique<Recorder>(mockContext(), true);
+    recorder->Activate();
+    for (std::uint64_t label = 1; label < Batches; ++label) Flush(*recorder, published, label);
+    Expect(recorder->ReapLeftToThread() == reaps, reaps ? "seven batches in flight were not left to the reap thread" : "reaps were left to a reap thread that is switched off");
+    Flush(*recorder, published, Batches);
+    Expect(!recorder->ReapLeftToThread(), "eight batches in flight were still left to the reap thread");
+    Expect(WaitFor([] { return mock.submitted.size() == Batches; }), "the batches were not submitted");
+    Expect(recorder->Reap(), "the worker's own reap did not retire the finished batches");
+    {
+        std::lock_guard lock(published.mutex);
+        Expect(InOrder(published.order), "the worker's own reap did not publish every label in order");
+    }
+    recorder.reset();
+}
+
 }
 
 int main() {
@@ -320,6 +397,8 @@ int main() {
         for (int round = 0; round < 8; ++round) {
             OrderAndWaiter(true);
             Shutdown(round % 2 == 0);
+            WorkerBehindAReap();
+            StarvedReapThread();
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

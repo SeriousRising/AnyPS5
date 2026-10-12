@@ -489,8 +489,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_recorder_flush_threads COMMAND agc_recorder_flush_threads_tests)
     add_test(NAME agc_recorder_flush_threads_inline COMMAND agc_recorder_flush_threads_tests)
     set_tests_properties(agc_recorder_flush_threads_inline PROPERTIES ENVIRONMENT "APS5_NO_FLUSH_THREADS=1")
+    add_test(NAME agc_recorder_flush_threads_reap COMMAND agc_recorder_flush_threads_tests)
+    set_tests_properties(agc_recorder_flush_threads_reap PROPERTIES ENVIRONMENT "APS5_REAP_THREAD=1")
     if(WIN32)
-        set_tests_properties(agc_recorder_flush_threads agc_recorder_flush_threads_inline PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_flush_threads agc_recorder_flush_threads_inline agc_recorder_flush_threads_reap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
