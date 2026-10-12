@@ -146,6 +146,9 @@ public:
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
+    // Whether a thread is blocked in lock() now: a holder that can stop at a safe point (the
+    // recorder's reap thread between two completions) gives the mutex up to it.
+    bool Contended() const { return waiting.load(std::memory_order_acquire) != 0; }
 
 private:
     void acquired();
@@ -154,6 +157,7 @@ private:
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};
     std::uint32_t depth = 0;
+    std::atomic<std::uint32_t> waiting{0};
 };
 GpuMutexType& GpuMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
