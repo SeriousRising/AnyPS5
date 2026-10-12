@@ -15,6 +15,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -147,6 +148,61 @@ void CheckUnwatch() {
     Require(!UnchangedSince(base, Block, adjacent), "unwatch hid a CPU edit in unrelated memory");
 }
 
+void CheckHeldMemo() {
+    constexpr std::size_t Page = 4096;
+    void* memory = AllocateWatched(6 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto others = base + 2 * Block;
+    std::memset(memory, 0x11, 6 * Block);
+    const auto walks = [&](CollectMemo& memo) {
+        const auto before = TrackerGeneration();
+        Require(CollectWrites(base, 2 * Block, memo) != 0, "the held range was not collected");
+        return TrackerGeneration() != before;
+    };
+    const auto fillRing = [&] {
+        for (std::size_t page = 0; page < 64; ++page) Require(CollectWrites(others + page * Page, Page) != 0, "another range was not collected");
+    };
+    BumpCollectEpoch();
+    CollectMemo memo;
+    Require(walks(memo), "the first collect of an epoch did not walk");
+    Require(!walks(memo), "a collect repeated in its epoch walked again");
+    fillRing();
+    Require(!walks(memo), "walks of 64 other ranges made a held range walk again");
+    const auto held = CollectWrites(base + Page, Page, memo);
+    Require(held == TrackerGeneration(), "a range inside the held one was walked or given an old generation");
+    CollectMemo ringed;
+    Require(walks(ringed), "an empty memo answered for a range the ring had lost");
+    fillRing();
+    CollectMemo copied;
+    Require(CollectWrites(base, 2 * Block) != 0 && !walks(copied), "the ring's entry did not answer for a caller without a memo of its own");
+    fillRing();
+    Require(!walks(copied), "a memo taken from the ring's entry did not outlive it");
+
+    const auto beforeDriver = TrackerGeneration();
+    Require(MarkWritten(base, Page) != 0 && !walks(memo), "a driver store made the held range walk");
+    Require(!UnchangedSince(base, 2 * Block, beforeDriver) && UnchangedSince(base, 2 * Block, CollectWrites(base, 2 * Block, memo)), "a driver store was hidden by the held memo, or not covered by its answer");
+
+    const auto beforeCpu = TrackerGeneration();
+    static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x22;
+    BumpCollectEpoch();
+    Require(walks(memo) && !UnchangedSince(base, 2 * Block, beforeCpu), "a CPU store was not collected at the next epoch");
+    Require(!walks(memo), "the walk of a new epoch was not remembered");
+
+    const auto beforeThread = TrackerGeneration();
+    bool walkedElsewhere = false;
+    std::thread([&] {
+        BumpCollectEpoch();
+        walkedElsewhere = walks(memo);
+    }).join();
+    Require(walkedElsewhere && TrackerGeneration() > beforeThread, "another thread's collect was answered by this thread's walk");
+    std::thread([&] { walkedElsewhere = walks(memo) && walks(memo); }).join();
+    Require(walkedElsewhere, "a thread without an epoch reused a walk");
+
+    Require(!walks(memo), "this thread's walk no longer answered once other threads had used the memo");
+    Unwatch(base + Block, Block);
+    Require(CollectWrites(base, 2 * Block, memo) == 0, "unwatch did not invalidate a held collect");
+}
+
 #ifdef _WIN32
 void CheckPrivateMappingReuse() {
     void* memory = AllocateWatched(3 * Block);
@@ -191,6 +247,7 @@ int main() {
         CheckSharedBlock();
         CheckOwnStore();
         CheckUnwatch();
+        CheckHeldMemo();
 #ifdef _WIN32
         CheckPrivateMappingReuse();
 #endif
