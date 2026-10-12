@@ -39,6 +39,7 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
             before.resize(region.bytes.size());
             std::memcpy(before.data(), reinterpret_cast<const void*>(region.guestAddress), before.size());
         }
+        endDrawLockRun(RunEndedBySync);
         const auto waitsBefore = Graphics::Recorder::ThreadHookWaits();
         const bool timed = profile || traceCapSync();
         const auto waitedBefore = timed ? Graphics::Recorder::ThreadWaitedMs() : 0.0;

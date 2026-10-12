@@ -122,6 +122,10 @@ private:
     static bool drawPrecheck();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect, bool ahead = false);
     static bool drawAheadEnabled();
+    static bool drawLockRunEnabled();
+    static DrawLockRun& drawLockRun();
+    void endDrawLockRun(DrawLockRunCount why);
+    void keepDrawLockRun();
     void beginDrawAhead();
     void cancelDrawAhead();
     void stopDrawAhead();
@@ -280,6 +284,8 @@ private:
 
     DrawEntryCounters drawEntryCounters;
     DrawAhead drawAhead;
+    std::array<std::atomic<std::uint64_t>, DrawLockRunCountKinds> drawLockRunCounts{};
+    std::array<std::uint64_t, DrawLockRunCountKinds> drawLockRunReported{};
 
     std::mutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};

@@ -98,6 +98,15 @@ void Driver::execute(const Submission& submission) {
         }
     } aheadScope{*this, submission.queue == 0 && drawAheadEnabled()};
     if (aheadScope.active) beginDrawAhead();
+    struct LockRunScope {
+        Driver& driver;
+        DrawLockRun& run;
+        ~LockRunScope() {
+            driver.endDrawLockRun(RunEndedByPacket);
+            run.enabled = false;
+        }
+    } lockRunScope{*this, drawLockRun()};
+    lockRunScope.run.enabled = submission.queue == 0 && drawLockRunEnabled();
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
@@ -115,6 +124,11 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (lockRunScope.run.lock.owns_lock()) {
+            const bool follows = !Pm4::Predicated(header) && (Pm4::DrawOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x7a || opcode == 0x26 || opcode == 0x2a || opcode == 0x2f || opcode == 0x13);
+            if (!follows) endDrawLockRun(RunEndedByPacket);
+            else if (lockRunScope.run.draws >= DrawLockRun::MaxDraws || std::chrono::steady_clock::now() - lockRunScope.run.since >= DrawLockRun::MaxHeld) endDrawLockRun(RunEndedByBound);
+        }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
