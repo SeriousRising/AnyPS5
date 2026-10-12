@@ -304,6 +304,7 @@ void BusyRetireOutlivesALaterBatch() {
         recorder.Submit();
         recorder.Commands();
         recorder.Submit();
+        { const DeviceQueueUse submitted; }
         Expect(mock.submitted.size() == 2, "the hold did not submit the keeping batch and the later one apart");
         if (mock.submitted.size() != 2) return;
         mock.signaled.at(mock.submitted[0]) = true;
