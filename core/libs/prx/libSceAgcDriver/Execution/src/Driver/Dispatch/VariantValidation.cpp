@@ -88,7 +88,18 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         publish = Graphics::Recorder::PublishGeneration();
         pendingSerial = Graphics::StorageTexture::PendingSerial();
         forget = GuestMemory::ForgetSerial();
-        if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) return EntryOutcome::FlushingImage;
+        if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) {
+            static const bool throughHook = std::getenv("APS5_NO_VALIDATE_IMAGE_HOOK") == nullptr;
+            if (!throughHook) return EntryOutcome::FlushingImage;
+            endDrawLockRun(RunEndedBySync);
+            for (const auto& region : regions) GuestMemory::FlushGpuWrites(region.guestAddress, region.bytes.size());
+            validatedThroughHook.fetch_add(1, std::memory_order_relaxed);
+            pending.Load();
+            if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling)) return EntryOutcome::Differing;
+            publish = Graphics::Recorder::PublishGeneration();
+            pendingSerial = Graphics::StorageTexture::PendingSerial();
+            forget = GuestMemory::ForgetSerial();
+        }
     }
     if ((forget & 1) != 0) return EntryOutcome::ForgetMoved;
     for (const auto& label : deferredLabels().labels) {

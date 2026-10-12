@@ -284,6 +284,8 @@ private:
 
     DrawEntryCounters drawEntryCounters;
     DrawAhead drawAhead;
+    std::atomic<std::uint64_t> validatedThroughHook{0};
+    std::uint64_t validatedThroughHookReported = 0;
     std::array<std::atomic<std::uint64_t>, DrawLockRunCountKinds> drawLockRunCounts{};
     std::array<std::uint64_t, DrawLockRunCountKinds> drawLockRunReported{};
 

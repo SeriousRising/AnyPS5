@@ -22,6 +22,13 @@ void Driver::reportDrawCache(DrawEntryCounters& counters) {
         drawAhead.reported[kind] = total;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[draw-ahead] %s (10 s): %llu scans started, %llu draws prepared ahead, %llu draws hit with every stage prepared ahead; of the prepared, reads over recorded GPU work: %llu served from known values, %llu read raw on evidence, %llu read without the wait they need in order, %llu under a pending or shadowed image (%llu of all these in vertex tables); not prepared: %llu already cached, %llu the queue had reached, %llu over recorded GPU work with that switched off, %llu indirect, mesh or rejected, %llu failed; %llu scans stopped at a packet they cannot follow\n", drawAheadEnabled() ? "on" : "off", ahead[AheadScans], ahead[AheadPrepared], ahead[AheadHits], ahead[AheadOverKnown], ahead[AheadOverRaw], ahead[AheadOverSync], ahead[AheadOverImage], ahead[AheadOverVertex], ahead[AheadWarm], ahead[AheadPassed], ahead[AheadPending], ahead[AheadUnsupported], ahead[AheadErrors], ahead[AheadStops]);
+    std::array<unsigned long long, 9> refused{};
+    for (std::size_t kind = 0; kind < refused.size(); ++kind) {
+        const auto total = drawAhead.refused[kind].load(std::memory_order_relaxed);
+        refused[kind] = total - drawAhead.refusedReported[kind];
+        drawAhead.refusedReported[kind] = total;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-ahead] stages prepared ahead that the validation refused (10 s): %llu differing, %llu unmapped, %llu under a queued label, %llu under an image still pending or shadowed, %llu while recorded writes were published, %llu while the pending images changed, %llu while memory was unmapped or mapped; %llu stage validations of either cache read under such an image through the flush hook, as a capture does\n", refused[static_cast<std::size_t>(EntryOutcome::Differing)], refused[static_cast<std::size_t>(EntryOutcome::Inaccessible)], refused[static_cast<std::size_t>(EntryOutcome::QueuedLabel)], refused[static_cast<std::size_t>(EntryOutcome::FlushingImage)], refused[static_cast<std::size_t>(EntryOutcome::PublishMoved)], refused[static_cast<std::size_t>(EntryOutcome::PendingMoved)], refused[static_cast<std::size_t>(EntryOutcome::ForgetMoved)], static_cast<unsigned long long>(validatedThroughHook.load(std::memory_order_relaxed) - std::exchange(validatedThroughHookReported, validatedThroughHook.load(std::memory_order_relaxed))));
     std::array<unsigned long long, DrawLockRunCountKinds> runs{};
     for (std::size_t kind = 0; kind < DrawLockRunCountKinds; ++kind) {
         const auto total = drawLockRunCounts[kind].load(std::memory_order_relaxed);
