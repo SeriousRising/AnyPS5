@@ -159,6 +159,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     const auto dmaStart = dmaClock(dmaTimed);
     DmaTimes dmaTimes;
     wroteOnGpu = false;
+    LabelStepTimer steps(profile);
 
     bool orderedAlready = false;
 
@@ -172,8 +173,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             bumpEpoch(&EpochBumps::drains);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            steps.Mark(InterruptLockWait);
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
+            steps.Mark(InterruptRecord);
             const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
             int reason = localDevice != nullptr ? 0 : 1;
             if (label.has_value()) {
@@ -190,10 +193,15 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             } else {
                 ++noOpLabels;
             }
+            steps.Mark(InterruptStore);
             if (reason == 0 || reason == 5) {
                 const auto queueId = submission.queue;
                 interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
-                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
+                steps.Mark(InterruptCompletion);
+                if (interruptDeferred && workOpen) {
+                    localDevice->SubmitRecorded(submission.queue == 0);
+                    steps.Mark(InterruptSubmit);
+                }
                 wroteOnGpu = true;
             } else if (reason == 1) {
                 wroteOnGpu = true;
@@ -221,6 +229,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
                 ++queuedLabels;
                 wroteOnGpu = true;
+                steps.Mark(LabelQueued);
             } else {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -239,10 +248,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 countLabelOutcome(reason);
                 ++immediateLabels;
+                steps.Mark(LabelLocked);
             }
         } else if (opcode == 0x49 ? ((packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0) : (packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)) == 0) {
             orderedAlready = true;
             ++noOpLabels;
+            steps.Mark(LabelNoOp);
         } else {
             ++labelFallbacks[4];
         }
@@ -409,6 +420,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             draining->ReapRecorded(epoch);
             draining.reset();
         }
+        steps.Mark(PacketDrain);
     }
     if (dmaTimed) noteDma(packet, dmaTimes, dmaSince(true, dmaStart));
     return drains;

@@ -31,6 +31,11 @@ std::chrono::steady_clock::time_point lastSyncReport = std::chrono::steady_clock
 
 std::atomic<std::uint64_t> pollLabelRecords{0}, hookLabelRecords{0};
 
+LabelStepProfile& labelSteps() {
+    static thread_local LabelStepProfile profile;
+    return profile;
+}
+
 SubmissionCosts& submissionCosts(std::uint32_t queue) {
     static std::array<SubmissionCosts, 64> costs;
     return costs[queue == 0 ? 0 : std::min<std::uint32_t>(queue - 0x20 + 1, 63)];
