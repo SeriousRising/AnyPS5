@@ -1148,6 +1148,15 @@ std::optional<float> SmallFloat(std::uint32_t code, std::uint32_t bits, bool den
 // to the same code), float ones the decoded value. Codes a clear might store differently are
 // refused: NaNs and denormals (an implementation may canonicalize or flush them) and the most
 // negative SNORM code (stored as its neighbour, the same -1.0).
+bool RepeatsTexel(std::span<const std::uint32_t, 4> pattern, std::uint32_t elementBytes) {
+    if (elementBytes == 0 || elementBytes > 16 || 16 % elementBytes != 0) return false;
+    const auto bytes = std::as_bytes(pattern);
+    for (std::size_t at = elementBytes; at < bytes.size(); at += elementBytes) {
+        if (std::memcmp(bytes.data(), bytes.data() + at, elementBytes) != 0) return false;
+    }
+    return true;
+}
+
 bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const std::uint32_t, 4> pattern, VkClearColorValue& clear, bool denormals = false) {
     ClearLayout layout{};
     if (elementBytes == 0 || elementBytes > 16 || 16 % elementBytes != 0 || !ClearLayoutFor(format, layout)) return false;
@@ -3600,8 +3609,11 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         }
     } traceRefusal{*this, pattern, layer, refusal};
     VkClearColorValue clearValue{};
-    const auto elementBytes = BytesPerElement(descriptor.format);
-    if (!FillClearColor(storageFormat, elementBytes, pattern, clearValue) && !(ClearKeepsDenormals(context, storageFormat) && FillClearColor(storageFormat, elementBytes, pattern, clearValue, true))) {
+    const auto texelBytes = BytesPerElement(descriptor.format);
+    const bool clearable = FillClearColor(storageFormat, texelBytes, pattern, clearValue) || (ClearKeepsDenormals(context, storageFormat) && FillClearColor(storageFormat, texelBytes, pattern, clearValue, true));
+    static const bool copyClear = std::getenv("APS5_NO_COPY_CLEAR") == nullptr;
+    ClearLayout texelLayout{};
+    if (!clearable && !(copyClear && ClearLayoutFor(storageFormat, texelLayout) && RepeatsTexel(pattern, texelBytes) && descriptor.mipCount == 1 && !geometry.thick && geometry.imageDepth == 1)) {
         refusal = "pattern";
         return false;
     }
@@ -3698,7 +3710,26 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     toClear.image = image;
     toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, layer == WholeImage ? 0u : layer, layer == WholeImage ? geometry.imageLayers : 1u};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
-    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
+    if (clearable) {
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
+    } else {
+        const auto rowBytes = static_cast<std::size_t>(descriptor.width) * texelBytes;
+        const auto rows = static_cast<std::uint32_t>(std::clamp<std::size_t>(262144 / rowBytes, 1, descriptor.height));
+        auto texels = std::make_shared<Buffer>(context, rowBytes * rows, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (std::size_t offset = 0; offset < rowBytes * rows; offset += texelBytes) std::memcpy(texels->Bytes().data() + offset, pattern.data(), texelBytes);
+        std::vector<VkBufferImageCopy> regions;
+        for (auto target = toClear.subresourceRange.baseArrayLayer; target < toClear.subresourceRange.baseArrayLayer + toClear.subresourceRange.layerCount; ++target) {
+            for (std::uint32_t y = 0; y < descriptor.height; y += rows) {
+                VkBufferImageCopy region{};
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, target, 1};
+                region.imageOffset = {0, static_cast<std::int32_t>(y), 0};
+                region.imageExtent = {descriptor.width, std::min(rows, descriptor.height - y), 1u};
+                regions.push_back(region);
+            }
+        }
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, texels->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        recorder->Keep(std::move(texels));
+    }
     VkImageMemoryBarrier toGeneral = toClear;
     toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
