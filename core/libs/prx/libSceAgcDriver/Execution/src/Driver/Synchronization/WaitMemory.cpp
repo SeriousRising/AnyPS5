@@ -82,7 +82,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ++outcomes.atEntry;
         return;
     }
-    if (heldAtSubmit || storedSince(packet, awaited, awaitedBytes, received)) return;
+    if (heldAtSubmit) return;
+    static const bool ownStoreEpoch = std::getenv("APS5_NO_OWN_LABEL_EPOCH_KEEP") != nullptr;
+    bool newestOwn = false;
+    if (storedSince(packet, awaited, awaitedBytes, received, queue, &newestOwn)) {
+        if (newestOwn && !ownStoreEpoch && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes)) epochPoint.bump = false;
+        return;
+    }
 
     static const bool labelShortcut = std::getenv("APS5_NO_LABEL_SHORTCUT") == nullptr;
     static const bool overlapSubmit = std::getenv("APS5_NO_WAIT_OVERLAP_SUBMIT") == nullptr;
