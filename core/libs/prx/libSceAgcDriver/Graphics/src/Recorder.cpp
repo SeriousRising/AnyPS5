@@ -160,6 +160,28 @@ std::atomic<std::uint64_t> unlockedWaits{0}, unlockedWaitedUs{0};
 // vkQueueSubmit calls and their time (APS5_PROFILE_DRAW; Submit runs under the GpuMutex).
 std::atomic<std::uint64_t> submitCount{0}, submitNs{0}, submitMaxNs{0};
 std::atomic<int> submitFailure{VK_SUCCESS};
+std::atomic<std::uint64_t> threadSubmits{0}, threadSubmitNs{0}, threadSubmitMaxNs{0};
+std::atomic<std::uint64_t> reapHolds{0}, reapHeldNs{0}, reapHoldMaxNs{0}, reapBatches{0}, reapYields{0};
+std::atomic<std::int64_t> flushThreadsReported{0};
+
+void RaiseMax(std::atomic<std::uint64_t>& maximum, std::uint64_t value) {
+    auto seen = maximum.load(std::memory_order_relaxed);
+    while (value > seen && !maximum.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+    }
+}
+
+void ReportFlushThreads() {
+    if (!DrawProfiled()) return;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = flushThreadsReported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        flushThreadsReported.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10000 || !flushThreadsReported.compare_exchange_strong(last, now)) return;
+    const auto submits = threadSubmits.exchange(0), holds = reapHolds.exchange(0), batches = reapBatches.exchange(0);
+    AgcDriver::ProfilePrint_nid_no_patch("[flush-threads] submit thread: %llu submits in %.1f ms (max %.2f); reap thread: %llu holds, held %.1f ms (max %.2f), %llu batches retired (%.2f a hold), gave the mutex up to a waiting thread %llu times\n", static_cast<unsigned long long>(submits), threadSubmitNs.exchange(0) / 1e6, threadSubmitMaxNs.exchange(0) / 1e6, static_cast<unsigned long long>(holds), reapHeldNs.exchange(0) / 1e6, reapHoldMaxNs.exchange(0) / 1e6, static_cast<unsigned long long>(batches), holds != 0 ? static_cast<double>(batches) / static_cast<double>(holds) : 0.0, static_cast<unsigned long long>(reapYields.exchange(0)));
+}
 void JoinSubmitThread();
 // Threads inside a timeline wait with the GpuMutex released (WaitSerial, syncThroughUnlocked): a
 // recorder's teardown, after its Sync() made every wait satisfiable, waits until they left the
@@ -2774,7 +2796,9 @@ namespace {
 // which a batch still queued here reaches once the thread submitted it. Every other use of the
 // device queue takes a DeviceQueueUse first, which waits until the queued submits were made, so
 // the order of submissions on the queue is the order of the calls, as before.
-// APS5_NO_FLUSH_THREADS=1 submits and reaps on the calling threads as before.
+// The reap thread runs only with APS5_REAP_THREAD=1: it moved the reaps off the worker but made
+// the worker wait for the mutex as long. APS5_NO_FLUSH_THREADS=1 submits and reaps on the calling
+// threads as before.
 struct QueuedSubmit {
     VkQueue queue;
     PFN_vkQueueSubmit submit;
@@ -2842,7 +2866,15 @@ void SubmitThreadMain() {
         queue.items.pop_front();
         queue.busy = true;
         lock.unlock();
+        const auto submitStart = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto result = SubmitNow(item);
+        if (DrawProfiled()) {
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submitStart).count());
+            threadSubmits.fetch_add(1, std::memory_order_relaxed);
+            threadSubmitNs.fetch_add(ns, std::memory_order_relaxed);
+            RaiseMax(threadSubmitMaxNs, ns);
+            ReportFlushThreads();
+        }
         if (result != VK_SUCCESS) {
             int none = VK_SUCCESS;
             submitFailure.compare_exchange_strong(none, static_cast<int>(result));
@@ -2939,7 +2971,7 @@ bool Recorder::ReapLeftToThread() const {
 
 void Recorder::wakeReapThread() {
     auto& state = ReapThreadState();
-    static const bool reapThread = std::getenv("APS5_NO_REAP_THREAD") == nullptr;
+    static const bool reapThread = std::getenv("APS5_REAP_THREAD") != nullptr;
     if (!reapThread || !state.allowed.load(std::memory_order_acquire)) return;
     try {
         std::lock_guard lock(state.mutex);
@@ -3084,6 +3116,43 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 
 }
 
+// Reap(), giving the mutex up between two completions when another thread waits for it: the batch
+// goes back to the front of the batches in flight with the completions it ran counted off, and
+// whoever finishes it next (this thread at its next hold, or any thread that syncs) runs the rest,
+// so completions run once each in batch order whoever runs them. While its completions run the
+// batch is out of the list, as in finish(). True when it gave the mutex up.
+bool Recorder::reapYielding(std::uint64_t& retired) {
+    auto& mutex = GuestMemory::GpuMutex();
+    while (!inFlight.empty() && fenceStatus(inFlight.front()->fence) == VK_SUCCESS) {
+        if (mutex.Contended()) return true;
+        auto batch = std::move(inFlight.front());
+        inFlight.pop_front();
+        finishing.push_back(batch.get());
+        bool yielded = false;
+        ++completionDepth;
+        while (batch->nextCompletion < batch->completions.size()) {
+            if (mutex.Contended()) {
+                yielded = true;
+                break;
+            }
+            try {
+                batch->completions[batch->nextCompletion++]();
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
+            }
+        }
+        --completionDepth;
+        finishing.erase(std::remove(finishing.begin(), finishing.end(), batch.get()), finishing.end());
+        if (yielded) {
+            inFlight.push_front(std::move(batch));
+            return true;
+        }
+        finish(std::move(batch), false, 4);
+        ++retired;
+    }
+    return false;
+}
+
 void Recorder::reapThreadMain() {
     CpuTopology::PinHelperThread("reap thread");
     auto& state = ReapThreadState();
@@ -3108,10 +3177,16 @@ void Recorder::reapThreadMain() {
             VkSemaphore semaphore = VK_NULL_HANDLE;
             PFN_vkWaitSemaphoresKHR waitSemaphores = nullptr;
             std::optional<UnlockedWaiter> waiter;
+            bool yielded = false;
+            const auto holdStart = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             try {
                 if (auto* recorder = activeRecorder; recorder != nullptr && recorder->timeline != VK_NULL_HANDLE) {
-                    recorder->Reap();
-                    if (!recorder->inFlight.empty()) {
+                    std::uint64_t retired = 0;
+                    yielded = recorder->reapYielding(retired);
+                    reapBatches.fetch_add(retired, std::memory_order_relaxed);
+                    if (yielded) {
+                        reapYields.fetch_add(1, std::memory_order_relaxed);
+                    } else if (!recorder->inFlight.empty()) {
                         waitSemaphores = recorder->context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
                         device = recorder->context.device;
                         semaphore = recorder->timeline;
@@ -3124,7 +3199,22 @@ void Recorder::reapThreadMain() {
                 std::lock_guard lock(state.mutex);
                 state.failure = error.what();
             }
+            if (DrawProfiled()) {
+                const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - holdStart).count());
+                reapHolds.fetch_add(1, std::memory_order_relaxed);
+                reapHeldNs.fetch_add(ns, std::memory_order_relaxed);
+                RaiseMax(reapHoldMaxNs, ns);
+            }
             mutex.unlock();
+            if (yielded) {
+                // The thread that waited takes the mutex before this one tries again.
+                std::unique_lock lock(state.mutex);
+                while (mutex.Contended()) {
+                    if (state.wake.wait_for(lock, std::chrono::microseconds(20), [&] { return state.stop; })) return;
+                }
+                if (state.stop) return;
+                continue;
+            }
             if (serial == 0) break;
             const auto result = serial == awaited ? VK_SUCCESS : WaitTimeline(device, semaphore, waitSemaphores, serial);
             waiter.reset();
@@ -3572,9 +3662,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             InCompletion() { ++completionDepth; }
             ~InCompletion() { --completionDepth; }
         } inCompletion;
-        for (auto& action : batch->completions) {
+        while (batch->nextCompletion < batch->completions.size()) {
             try {
-                action();
+                batch->completions[batch->nextCompletion++]();
             } catch (const std::exception& error) {
                 std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
             }
