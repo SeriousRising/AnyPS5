@@ -20,6 +20,7 @@
 #include <new>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -273,10 +274,15 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 // A materialized result of one variant over one snapshot (Recompile(request, capture)): the
 // shared immutable object every later capture that reproduces the snapshot receives, so Populate
 // and the per-request copy run once per distinct snapshot.
+inline constexpr std::size_t ResultMemoFields = 8;
+inline constexpr std::size_t ResultMemoUserWords = 40;
+
 struct ResultMemoEntry {
     std::uint64_t variantId;
     std::uint64_t hash;
     std::shared_ptr<const RecompileResult> result;
+    std::array<std::uint64_t, ResultMemoFields> fields{};
+    std::vector<std::uint32_t> userData;
 };
 
 struct EmissionFailure {
@@ -302,6 +308,7 @@ struct SourceEntry {
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
+    std::unordered_set<std::uint64_t> memoEvicted;
 };
 
 namespace {
@@ -957,6 +964,9 @@ constexpr std::size_t ResultMemoEntries = 256;
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
+    std::atomic<std::uint64_t> evictedBefore{0}, firstOfVariant{0}, sourcesFull{0};
+    std::array<std::atomic<std::uint64_t>, ResultMemoFields> fieldDiffers{};
+    std::array<std::atomic<std::uint64_t>, ResultMemoUserWords + 1> userWordDiffers{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -980,17 +990,26 @@ void reportResultMemo() {
     const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
+    static constexpr std::array<const char*, ResultMemoFields> fieldNames{"buffer descriptors", "image descriptors", "sampler descriptors", "flattened SRT", "user data", "uniform fill", "layout, threads and export mapping", "vertex inputs"};
+    std::string fields, words;
+    for (std::size_t field = 0; field < ResultMemoFields; ++field) fields += std::string(field == 0 ? " " : ", ") + fieldNames[field] + " " + std::to_string(counters.fieldDiffers[field].exchange(0, std::memory_order_relaxed));
+    for (std::size_t word = 0; word <= ResultMemoUserWords; ++word) {
+        if (const auto differs = counters.userWordDiffers[word].exchange(0, std::memory_order_relaxed); differs != 0) words += " " + (word == ResultMemoUserWords ? std::string("later or size") : std::to_string(word)) + ":" + std::to_string(differs);
+    }
+    std::fprintf(stderr, "[recompile] result memo misses (10 s, %zu entries a program): %llu had been evicted from their program's memo, %llu were a variant's first; the others against the variant's newest entry differ in:%s; first differing user data word:%s\n", ResultMemoEntries, static_cast<unsigned long long>(counters.evictedBefore.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.firstOfVariant.exchange(0, std::memory_order_relaxed)), fields.c_str(), words.c_str());
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
 // flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
 // attributes are resolved from.
-std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, std::array<std::uint64_t, ResultMemoFields>* fields = nullptr) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
+    std::size_t field = 0;
     const auto mix = [&](std::uint64_t value) {
         hash ^= value;
         hash *= 0x100000001b3ull;
+        if (fields != nullptr) (*fields)[field] = ((*fields)[field] ^ value) * 0x100000001b3ull;
     };
     const auto mixWords = [&](std::span<const std::uint32_t> words) {
         mix(words.size());
@@ -1004,15 +1023,21 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         }
     };
     mixDescriptors(snapshot.buffers);
+    field = 1;
     mixDescriptors(snapshot.images);
+    field = 2;
     mixDescriptors(snapshot.samplers);
+    field = 3;
     mixWords(snapshot.flattenedSrt);
+    field = 4;
     mixWords(snapshot.userData);
+    field = 5;
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
     mix(snapshot.uniformFill.words);
     mix(snapshot.uniformFill.value);
+    field = 6;
     for (const auto threads : partialThreads(request)) mix(threads);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
@@ -1020,6 +1045,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
     }
+    field = 7;
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;
         const auto count = std::min<std::uint32_t>(vertex.resourcesNum, ShaderVertexStageInfo::MaxResources);
@@ -1039,7 +1065,8 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
 // as good). `memoHit` reports the hit.
 std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const auto hash = snapshotHash(request, snapshot);
+    std::array<std::uint64_t, ResultMemoFields> fields{};
+    const auto hash = snapshotHash(request, snapshot, profile ? &fields : nullptr);
     std::uint64_t index = 0;
     auto& counters = resultMemoCounters();
     {
@@ -1073,10 +1100,33 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
-            source.memo.push_front({variant->artifact.variantId, hash, shared});
+            if (profile) {
+                if (source.memoEvicted.erase(index) != 0) {
+                    counters.evictedBefore.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    const auto newest = std::find_if(source.memo.begin(), source.memo.end(), [&](const ResultMemoEntry& entry) { return entry.variantId == variant->artifact.variantId; });
+                    if (newest == source.memo.end()) {
+                        counters.firstOfVariant.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        for (std::size_t field = 0; field < ResultMemoFields; ++field) {
+                            if (newest->fields[field] != fields[field]) counters.fieldDiffers[field].fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (newest->fields[4] != fields[4]) {
+                            std::size_t word = 0;
+                            while (word < newest->userData.size() && word < snapshot.userData.size() && newest->userData[word] == snapshot.userData[word]) ++word;
+                            counters.userWordDiffers[std::min(word, ResultMemoUserWords)].fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+            source.memo.push_front({variant->artifact.variantId, hash, shared, fields, profile ? std::vector<std::uint32_t>(snapshot.userData.begin(), snapshot.userData.end()) : std::vector<std::uint32_t>{}});
             source.memoIndex.emplace(index, source.memo.begin());
             while (source.memo.size() > ResultMemoEntries) {
                 const auto& last = source.memo.back();
+                if (profile) {
+                    if (source.memoEvicted.size() >= 65536) source.memoEvicted.clear();
+                    source.memoEvicted.insert((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
+                }
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
                 source.memo.pop_back();
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
