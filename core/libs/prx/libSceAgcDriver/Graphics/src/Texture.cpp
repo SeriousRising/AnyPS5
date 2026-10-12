@@ -2984,11 +2984,13 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
         // Under a clear code reads see that value whatever the texels hold, and keys a recorded
         // kernel still writes are not in the bytes yet: only keys that read as uncompressed now let
         // the image stand for the texels.
+        static const bool behindKeys = std::getenv("APS5_NO_CLEAR_BEHIND_KEYS") == nullptr;
         if (Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256))) {
-            refusal = "keys pending";
-            return false;
-        }
-        if (TextureClearKeys(descriptor, guestBytes) != DccKeys::Uncompressed) {
+            if (!behindKeys || PendingClearKeys(descriptor, guestBytes) != DccKeys::Uncompressed) {
+                refusal = "keys pending";
+                return false;
+            }
+        } else if (TextureClearKeys(descriptor, guestBytes) != DccKeys::Uncompressed) {
             refusal = "keys";
             return false;
         }

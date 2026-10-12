@@ -89,6 +89,7 @@ DccKeyProofCounts KeyProofCounts();
 void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std::span<std::byte> bytes);
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys);
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes);
+std::optional<DccKeys> PendingClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes);
 
 }
 
