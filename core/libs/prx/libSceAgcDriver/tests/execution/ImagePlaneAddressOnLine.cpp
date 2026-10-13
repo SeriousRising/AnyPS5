@@ -41,7 +41,7 @@ alignas(256) constexpr std::array<std::uint32_t, 36> Code{
 
 alignas(256) constexpr std::array<std::uint32_t, 16> ExplicitLodCode{
     0x34020087, 0xe0301000, 0x80000201, 0xe0301004, 0x80000301, 0xe0301008, 0x80000401, 0xe030100c,
-    0x80000501, 0xbf8c3f70, 0xf0900f08, 0x00610c02, 0xbf8c3f70, 0xe0701020, 0x80000c01, 0xbf810000,
+    0x80000501, 0xbf8c3f70, 0xf0900208, 0x00610c02, 0xbf8c3f70, 0xe0701020, 0x80000c01, 0xbf810000,
 };
 
 constexpr std::array<float, 8> LineV{0.0f, 0.5f, 1.0f, 1.5f, -0.25f, 3.0f, 0.25f, 0.75f};
@@ -164,14 +164,13 @@ void CheckPlane() {
     }
 }
 
-void RequireRefused(AgcDriver::VulkanDevice& device) {
-    std::string refusal;
-    try {
-        Run(device, ExplicitLodCode, LineDescriptor());
-    } catch (const std::exception& error) {
-        refusal = error.what();
+void CheckExplicitLod(AgcDriver::VulkanDevice& device) {
+    FillInput(true);
+    Run(device, ExplicitLodCode, LineDescriptor());
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        const float value = std::bit_cast<float>(Buffer[tid * Words + SampleResult]) * 255.0f;
+        Require(std::lround(value) == static_cast<long>(TexelOf(tid)), "image_sample_l 2d on a 1D texture with v " + std::to_string(LineV[tid % LineV.size()]) + ": thread " + std::to_string(tid) + " is " + std::to_string(value) + ", expected " + std::to_string(TexelOf(tid)));
     }
-    Require(refusal.find("incompatible with the static runtime image interface") != std::string::npos, "image_sample_l 2d on a 1D texture was not refused: " + refusal);
 }
 
 }
@@ -188,7 +187,7 @@ int main() {
         FillInput(false);
         Run(*device, Code, PlaneDescriptor());
         CheckPlane();
-        RequireRefused(*device);
+        CheckExplicitLod(*device);
         std::puts("image plane address on line tests passed");
         return 0;
     } catch (const std::exception& error) {
