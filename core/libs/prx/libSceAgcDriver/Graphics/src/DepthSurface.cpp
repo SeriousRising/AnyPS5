@@ -7,6 +7,7 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -557,11 +558,36 @@ bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t addre
     return address + bytes - htile >= HtileMetadataBytes(extent);
 }
 
+std::array<std::uint64_t, 2> HtileSliceStrides(VkExtent2D extent) {
+    const auto bytes = HtileMetadataBytes(extent);
+    return {bytes, std::bit_ceil(bytes)};
+}
+
+bool HtileFillCoversSlice(std::uint64_t htile, std::uint32_t slice, VkExtent2D extent, std::uint64_t address, std::size_t bytes) {
+    if (htile == 0) return false;
+    const auto strides = HtileSliceStrides(extent);
+    return std::any_of(strides.begin(), strides.end(), [&](std::uint64_t stride) { return HtileFillCovers(htile + slice * stride, extent, address, bytes); });
+}
+
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         const auto& target = surface->target;
-        if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
+        if (target.htileAddress == 0) continue;
+        if (!HtileFillCoversSlice(target.htileAddress, target.htileSlice, target.extent, address, bytes)) {
+            const auto strides = HtileSliceStrides(target.extent);
+            const auto tiles = HtileMetadataBytes(target.extent);
+            const bool overlapsBoth = std::all_of(strides.begin(), strides.end(), [&](std::uint64_t stride) {
+                const auto first = target.htileAddress + target.htileSlice * stride;
+                return address < first + tiles && first < address + bytes;
+            });
+            static auto* reported = new std::set<std::uint64_t>();
+            if (overlapsBoth && reported->size() < 64 && reported->insert(address).second) {
+                std::fprintf(stderr, "[gpu] fill 0x%llx+0x%zx with %08x overlaps the HTILE tiles of depth surface 0x%llx (%ux%u, slice %u, HTILE 0x%llx, 0x%llx bytes of tiles a slice) without covering them at a slice stride of 0x%llx or 0x%llx: the surface is not cleared\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, target.htileSlice,
+                             static_cast<unsigned long long>(target.htileAddress), static_cast<unsigned long long>(tiles), static_cast<unsigned long long>(strides[0]), static_cast<unsigned long long>(strides[1]));
+            }
+            continue;
+        }
         const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);
     }

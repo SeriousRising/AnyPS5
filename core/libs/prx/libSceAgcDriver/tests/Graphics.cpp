@@ -1202,6 +1202,11 @@ void DepthStencilTests() {
         // 260, AMD PAL), so a fill of the words a linear layout would hold covers nothing.
         Require(!HtileFillCovers(0x10000, {16, 16}, 0x10000, 16) && !HtileFillCovers(0x10000, {16, 16}, 0x10000, 264), "a fill of the linear HTILE size of a 16x16 surface misses its pipe-aligned words");
         Require(AgcDriver::Graphics::HtileMetadataBytes({1024, 512}) == 0x8000u && AgcDriver::Graphics::HtileMetadataBytes({1025, 512}) == 0x10000u && AgcDriver::Graphics::HtileMetadataBytes({3840, 2160}) == 20u * 0x8000u, "the HTILE metadata is 32 KiB per 1024x512 block");
+        using AgcDriver::Graphics::HtileFillCoversSlice;
+        Require(AgcDriver::Graphics::HtileSliceStrides({1536, 1536}) == (std::array<std::uint64_t, 2>{0x30000u, 0x40000u}) && AgcDriver::Graphics::HtileSliceStrides({2048, 2048}) == (std::array<std::uint64_t, 2>{0x40000u, 0x40000u}), "the HTILE slice strides tried are the tiles of a slice and the next power of two");
+        Require(HtileFillCoversSlice(0x100000, 0, {1536, 1536}, 0x100000, 0x30000) && !HtileFillCoversSlice(0x100000, 1, {1536, 1536}, 0x100000, 0x30000), "a fill of the first slice's tiles covers only the first slice");
+        Require(HtileFillCoversSlice(0x100000, 1, {1536, 1536}, 0x130000, 0x30000) && HtileFillCoversSlice(0x100000, 1, {1536, 1536}, 0x140000, 0x40000) && !HtileFillCoversSlice(0x100000, 0, {1536, 1536}, 0x140000, 0x40000), "a fill of a later slice's tiles covers that slice at either stride and not the first slice");
+        Require(HtileFillCoversSlice(0x100000, 2, {1536, 1536}, 0x100000, 0xc0000) && !HtileFillCoversSlice(0x100000, 2, {1536, 1536}, 0x150000, 0x20000) && !HtileFillCoversSlice(0, 1, {1536, 1536}, 0, 0x100000), "a fill of the whole HTILE covers every slice, a partial fill or no HTILE none");
     }
     Require(state.renderExtent.width == 4 && state.renderExtent.height == 2, "render extent ignores the depth surface");
     Require(!state.depthTest && !state.depthWrite && state.stencilTest, "depth/stencil enables changed");

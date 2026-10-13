@@ -29,6 +29,8 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
 std::uint64_t HtileMetadataBytes(VkExtent2D extent);
 bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
+std::array<std::uint64_t, 2> HtileSliceStrides(VkExtent2D extent);
+bool HtileFillCoversSlice(std::uint64_t htile, std::uint32_t slice, VkExtent2D extent, std::uint64_t address, std::size_t bytes);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
 VkFormat HostDepthFormat(const Context& context, VkFormat format);
 float HostDepthBiasConstant(const Context& context, VkFormat format, float constant);

@@ -294,11 +294,32 @@ std::vector<std::uint8_t> ClearedThenDrawn(AgcDriver::VulkanDevice& device, bool
     return stored;
 }
 
+void ClearedAgain(AgcDriver::VulkanDevice& device, bool waited) {
+    Scene scene(device);
+    scene.Fill(0, CmaskBytes, Cleared);
+    scene.Draw();
+    if (waited) device.WaitIdle();
+    scene.Fill(0, CmaskBytes, Cleared);
+    if (waited) device.WaitIdle();
+    scene.state.scissor = {{Width / 2, 0}, {Width / 2, Height}};
+    scene.Draw();
+    const auto stored = scene.Stored();
+    std::size_t clearTexels = 0;
+    for (std::size_t offset = 0; offset < scene.surface.bytes; offset += 4) {
+        std::uint32_t texel;
+        std::memcpy(&texel, stored.data() + offset, 4);
+        if (texel == ClearWord) ++clearTexels;
+    }
+    Require(clearTexels == std::size_t{Width} * Height / 2, std::string(waited ? "waited" : "pending") + ": a target fast-cleared, drawn over its left half, fast-cleared again by the same fill and drawn over its right half holds " + std::to_string(clearTexels) + " clear texels, expected " + std::to_string(std::size_t{Width} * Height / 2) + " (the second clear must take the first frame's left half)");
+}
+
 void PendingFillTests(AgcDriver::VulkanDevice& device) {
     const auto waited = ClearedThenDrawn(device, true, Fills::Whole);
     Require(ClearedThenDrawn(device, false, Fills::Whole) == waited, "a draw over a CMASK cleared by a pending fill stored other bytes than one that waited for the fill");
     Require(ClearedThenDrawn(device, false, Fills::OverUnknown) == waited, "a pending fill over an earlier recorded write of the CMASK stored other bytes than one that was waited for");
     Require(ClearedThenDrawn(device, false, Fills::HalfOverZeros) == waited, "a pending fill beside cleared bytes of the CMASK stored other bytes than one that was waited for");
+    ClearedAgain(device, true);
+    ClearedAgain(device, false);
 }
 
 }
