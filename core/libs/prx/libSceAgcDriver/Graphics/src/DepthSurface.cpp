@@ -528,7 +528,17 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
         return surface->context.device == context.device && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
     });
-    return found != list.rend() && (*found)->Holds(texture);
+    return found != list.rend() && !(*found)->handedOff && (*found)->pendingClear == 0 && (*found)->Holds(texture);
+}
+
+bool DepthPlaneKept(const Context& context, const GuestTextureResource& resource) {
+    if (resource.dimension != TextureDimension::k2D) return false;
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.address == resource.baseAddress; });
+    if (found == list.rend() || (*found)->handedOff || !(*found)->Storable()) return false;
+    const auto& target = (*found)->target;
+    return resource.width == target.extent.width && resource.height == target.extent.height && BytesPerElement(resource.format) == (target.format == VK_FORMAT_D16_UNORM ? 2u : 4u);
 }
 
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile) {

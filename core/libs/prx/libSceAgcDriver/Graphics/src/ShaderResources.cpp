@@ -2120,6 +2120,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        if (DepthPlaneKept(context, own)) return fail(FastFail::Depth);
         if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
@@ -2221,6 +2222,7 @@ bool ShaderResources::fastRevalidateEach() {
         // happened, and the memory checks below are Refresh's.
         const auto& own = image->Descriptor();
         if (own.dccAddress != 0) return false;
+        if (DepthPlaneKept(context, own)) return false;
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
         if (GuestMemory::CollectWrites(address, bytes) == 0) return false;
