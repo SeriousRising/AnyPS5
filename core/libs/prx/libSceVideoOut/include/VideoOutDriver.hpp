@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/BufferReuseTracker.hpp"
+#include "prx/libSceVideoOut/include/PresentProfile.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 
@@ -132,6 +133,7 @@ struct VideoOutConfig {
     int flipRate = 0;
     uint64_t lastFlipVblank = 0;
     std::chrono::steady_clock::time_point lastTimingFlip{};
+    PresentProfile presentProfile;
     uint64_t outputMode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
     float gamma = 1.0f;
 
@@ -227,7 +229,7 @@ private:
     void vblankLoop(std::stop_token token);
     void vblankEnd(std::uint64_t tick);
     void updateDisplayRefreshRate();
-    void processFlip(FlipRequest& req);
+    bool processFlip(FlipRequest& req);
     void triggerEvents(VideoOutConfig& cfg, int eventKind, void* triggerData);
 
     std::mutex mutex;

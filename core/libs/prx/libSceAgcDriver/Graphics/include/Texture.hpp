@@ -96,6 +96,7 @@ public:
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
     const std::shared_ptr<StorageTexture>& SharedStorageSource() const { return storageSource; }
+    VkImage BorrowedDepthImage() const { return borrowedDepthImage; }
     // The last key scan of the sampled surface (ProvedClearKeys), for surfaces whose keys are not
     // the source image's own (snapshots, views over other metadata); one per cache entry, so every
     // object binding the texture shares it. Under GuestMemory::GpuMutex only.
@@ -111,6 +112,7 @@ private:
     mutable DccKeyProof keyProof;
     // The snapshot constructor's image (null for a view of a storage image); `owned` frees it.
     VkImage image = VK_NULL_HANDLE;
+    VkImage borrowedDepthImage = VK_NULL_HANDLE;
     std::shared_ptr<OwnedImage> owned;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView firstLayerView = VK_NULL_HANDLE;

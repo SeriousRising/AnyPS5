@@ -17,10 +17,59 @@ void check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void timestampPacketTests() {
+    using AgcDriver::DriverDetail::TimestampPacketCounts;
+    TimestampPacketCounts counts;
+    std::array<std::uint32_t, 8> packet{};
+    counts.Note(0x49, std::span(packet).first(6));
+    counts.Note(0x49, std::span(packet).first(7));
+    counts.Note(0x40, std::span(packet).first(5));
+    counts.Note(0x15, packet);
+    check(counts.releaseMem == 0 && counts.copyData == 0, "unrelated or short packets counted as timestamp packets");
+    packet[2] = 2u << 29u;
+    counts.Note(0x49, packet);
+    packet[2] = (3u << 29u) | (3u << 24u);
+    counts.Note(0x49, packet);
+    packet[4] = 1;
+    counts.Note(0x49, packet);
+    packet[3] = 4;
+    packet[4] = 0;
+    counts.Note(0x49, packet);
+    check(counts.releaseMem == 4 && counts.releaseClock == 3 && counts.releaseClockWrites == 2, "release timestamps did not distinguish immediate data and null destinations");
+    packet[1] = 9u | (1u << 8u);
+    counts.Note(0x40, packet);
+    packet[1] |= 1u << 16u;
+    counts.Note(0x40, packet);
+    packet[1] |= 1u << 30u;
+    counts.Note(0x40, packet);
+    packet[1] = 5u | (1u << 8u);
+    counts.Note(0x40, packet);
+    check(counts.copyData == 4 && counts.copyClock == 2, "copy timestamps did not distinguish both widths, source extension and immediate data");
+    counts = {};
+    packet[1] = 0x80000514;
+    counts.Note(0x49, packet);
+    packet[1] = 0x0400062f;
+    counts.Note(0x49, packet);
+    packet[1] = 0x02000630;
+    counts.Note(0x49, packet);
+    packet[1] = 0x80000631;
+    counts.Note(0x49, packet);
+    packet[1] = 0x04000714;
+    counts.Note(0x49, packet);
+    packet[3] = 0;
+    counts.Note(0x49, packet);
+    check(counts.releaseEop == 1 && counts.releaseCs == 1 && counts.releasePs == 1 && counts.releaseOther == 2 && counts.firstOtherEvent == 0x631, "timestamp stages or first unsupported event were classified incorrectly");
+    check(counts.releaseClock == 6 && counts.releaseClockWrites == counts.releaseEop + counts.releaseCs + counts.releasePs + counts.releaseOther, "timestamp stages included a null destination or missed a write");
+    counts = {};
+    check(counts.releaseMem == 0 && counts.releaseClock == 0 && counts.releaseClockWrites == 0 && counts.copyData == 0 && counts.copyClock == 0, "timestamp packet counts survived a window reset");
+    check(counts.releaseEop == 0 && counts.releaseCs == 0 && counts.releasePs == 0 && counts.releaseOther == 0 && counts.firstOtherEvent == 0, "timestamp stage counts survived a window reset");
+}
+
 }
 
 int main() {
     try {
+        timestampPacketTests();
 #ifdef _WIN32
         _putenv_s("APS5_PROFILE_DRAW", "1");
 #else

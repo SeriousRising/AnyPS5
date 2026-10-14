@@ -415,6 +415,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     IrProgram program;
     program.SetWaveSize(options.waveSize);
     std::uint32_t windowBase = NumVectorRegs;
+    bool indexedWrites = false;
     for (const auto& cfgBlock : cfg.blocks) {
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
@@ -425,11 +426,13 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                     break;
                 case RdnaOpcode::VMovreldB32:
                     windowBase = std::min(windowBase, instruction.destination.reg);
+                    indexedWrites = true;
                     break;
                 case RdnaOpcode::VMovrelsdB32:
                 case RdnaOpcode::VMovrelsd2B32:
                 case RdnaOpcode::VSwaprelB32:
                     windowBase = std::min({windowBase, instruction.source0.reg, instruction.destination.reg});
+                    indexedWrites = true;
                     break;
                 default:
                     break;
@@ -440,6 +443,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     if (windowBase < vectorLimit && !ancillaryWindow) {
         program.Metadata().vectorWindowBase = windowBase;
         program.Metadata().vectorWindowSize = vectorLimit - windowBase;
+        program.Metadata().vectorWindowIndexedWrites = indexedWrites;
     }
     program.Resources().stage = toIrShaderStage(options.stage);
     program.Resources().shaderHash = options.shaderHash;

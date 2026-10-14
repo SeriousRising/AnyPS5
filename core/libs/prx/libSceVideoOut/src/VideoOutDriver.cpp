@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -31,6 +32,21 @@ namespace {
 
 constexpr std::uint64_t FLIP_ROOM_WAIT_MICROS = 60000000;
 constexpr std::uint64_t PRESENT_POLL_MICROS = 10000;
+
+bool presentProfileEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_PRESENT") != nullptr;
+    return enabled;
+}
+
+void reportPresentProfile(int handle, std::uint64_t generation, const PresentProfile::Summary& summary, bool partial) {
+    const auto seconds = std::chrono::duration<double>(summary.elapsed).count();
+    const auto maximumMs = std::chrono::duration<double, std::milli>(summary.maximum).count();
+    AgcDriver::ProfilePrint_nid_no_patch("[present-interval] output=%d generation=%llu partial=%u intervals=%llu elapsed_s=%.6f mean_fps=%.3f max_ms=%.6f over_60hz=%llu over_30hz=%llu over_50ms=%llu over_100ms=%llu\n",
+        handle, static_cast<unsigned long long>(generation), static_cast<unsigned>(partial), static_cast<unsigned long long>(summary.intervals), seconds,
+        seconds > 0 ? static_cast<double>(summary.intervals) / seconds : 0.0, maximumMs,
+        static_cast<unsigned long long>(summary.over60Hz), static_cast<unsigned long long>(summary.over30Hz),
+        static_cast<unsigned long long>(summary.over50Ms), static_cast<unsigned long long>(summary.over100Ms));
+}
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("VideoOut: ") + reason);
@@ -376,7 +392,7 @@ bool VideoOutDriver::close(int handle) {
     AgcDriverUnregisterVideoOutput_nid_postfix(static_cast<uint32_t>(handle), outputs[handle]);
     outputs[handle].reset();
     auto cfg = contexts[handle];
-    std::lock_guard cfgLock(cfg->mutex);
+    std::unique_lock cfgLock(cfg->mutex);
     cfg->opened = false;
     cfg->closing = true;
     const auto removeEvents = [](const auto& events, int kind) {
@@ -397,6 +413,9 @@ bool VideoOutDriver::close(int handle) {
     cfg->vrrStatusEvents.clear();
     cfg->vblankCond.notify_all();
     flipQueue->changed.NotifyAll();
+    const auto summary = presentProfileEnabled() ? cfg->presentProfile.Finish() : std::nullopt;
+    cfgLock.unlock();
+    if (summary) reportPresentProfile(handle, cfg->generation, *summary, true);
     return true;
 }
 
@@ -495,7 +514,7 @@ void VideoOutDriver::vblankEnd(std::uint64_t tick) {
     }
 }
 
-void VideoOutDriver::processFlip(FlipRequest& req) {
+bool VideoOutDriver::processFlip(FlipRequest& req) {
     AgcDriver::PerformanceContext timingContext(req.timing.get());
     AgcDriver::PerformanceTimer timing("VideoOut.Flip");
     {
@@ -504,7 +523,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
-            return;
+            return false;
         }
         require(req.cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ || SupportsHighFrameRate(), "display no longer supports 119.88 Hz output");
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
@@ -517,7 +536,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
-            return;
+            return false;
         }
         req.cfg->lastFlipVblank = req.cfg->vblankStatus.count;
     }
@@ -558,7 +577,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.cfg->CheckAlive();
     if (req.cfg->Closed()) {
         req.ReleaseLocked();
-        return;
+        return false;
     }
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
@@ -580,6 +599,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     timing.Mark("notify_game");
+    return true;
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
@@ -594,6 +614,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         return;
     }
     started.set_value();
+    const bool profilePresent = presentProfileEnabled();
     std::shared_ptr<FlipRequest> current;
 #if APS5_ENABLE_TIMING_LOG
     std::unique_ptr<FrameTimingLog> timingLog;
@@ -635,15 +656,18 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 require(current->timing != nullptr, "missing presentation timing");
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
                 current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
-                processFlip(*current);
+                const bool completed = processFlip(*current);
                 const auto finished = AgcDriver::FrameTiming::Clock::now();
                 AgcDriver::FrameTiming::Clock::duration interval{};
+                std::optional<PresentProfile::Summary> summary;
                 {
                     std::lock_guard lock(current->cfg->mutex);
                     const auto previous = current->cfg->lastTimingFlip;
                     if (previous != AgcDriver::FrameTiming::Clock::time_point{}) interval = finished - previous;
                     current->cfg->lastTimingFlip = finished;
+                    if (profilePresent) summary = current->cfg->presentProfile.Record(finished, completed && !current->cfg->Closed(), current->cfg->busType == VIDEO_OUT_BUS_TYPE_OVERLAY);
                 }
+                if (summary) reportPresentProfile(current->outputHandle, current->generation, *summary, false);
 #if APS5_ENABLE_TIMING_LOG
                 timingLog->Enqueue(current->timing->Capture(current->outputHandle, current->index, current->flipArg, finished, interval));
 #endif
@@ -681,7 +705,30 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         }
     }
     try {
+        if (profilePresent) {
+            std::array<std::shared_ptr<VideoOutConfig>, VIDEO_OUT_NUM_MAX> configs;
+            {
+                std::lock_guard lock(mutex);
+                configs = contexts;
+            }
+            for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; ++handle) {
+                const auto& cfg = configs[handle];
+                if (!cfg) continue;
+                std::optional<PresentProfile::Summary> summary;
+                {
+                    std::lock_guard lock(cfg->mutex);
+                    summary = cfg->presentProfile.Finish();
+                }
+                if (summary) reportPresentProfile(handle, cfg->generation, *summary, true);
+            }
+        }
         AgcDriverShutdown_nid_postfix();
+    } catch (...) {
+        std::lock_guard lock(flipQueue->mutex);
+        if (!flipQueue->failure) flipQueue->failure = std::current_exception();
+    }
+    try {
+        if (profilePresent) AgcDriver::StopProfileOutput_nid_no_patch();
     } catch (...) {
         std::lock_guard lock(flipQueue->mutex);
         if (!flipQueue->failure) flipQueue->failure = std::current_exception();

@@ -64,6 +64,7 @@ struct PipelineTrace {
     std::mutex mutex;
     std::condition_variable released;
     bool allowOptimization = false;
+    bool failOptimization = false;
     std::vector<VkPipeline> fast;
     std::vector<VkPipeline> optimized;
     VkCommandBuffer boundCommands = VK_NULL_HANDLE;
@@ -86,6 +87,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreatePipelines(VkDevice device, VkPipelineCache 
     if (optimizing) {
         std::unique_lock lock(Trace->mutex);
         Trace->released.wait(lock, [] { return Trace->allowOptimization; });
+        if (Trace->failOptimization) {
+            std::fill(pipelines, pipelines + count, VK_NULL_HANDLE);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
     }
     const auto result = Trace->create(device, cache, count, infos, allocator, pipelines);
     std::lock_guard lock(Trace->mutex);
@@ -149,6 +154,8 @@ void CheckDrawn(PipelineTrace& trace, bool optimized) {
 }
 
 void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize, VkFormat depthFormat, bool optimize) {
+    const auto profileBefore = PipelineProfileSnapshot_nid_no_patch();
+    const bool profiling = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const bool masked = depthFormat == VK_FORMAT_UNDEFINED;
     const auto target = device.Target();
     const auto vertices = masked ? std::span<const std::array<float, 4>>(Triangle) : std::span<const std::array<float, 4>>(DepthTriangles);
@@ -217,12 +224,31 @@ void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace,
         CheckPixels(masked, phase);
     };
     render(false, "fast link");
+    const auto held = PipelineProfileSnapshot_nid_no_patch();
+    if (profiling) {
+        const auto kind = optimize ? PipelineBindKind::FastWithSlot : PipelineBindKind::FastWithoutSlot;
+        Require(held.binds[static_cast<std::size_t>(kind)] - profileBefore.binds[static_cast<std::size_t>(kind)] == 1, "the first fast-linked bind was not counted");
+        Require(held.enqueued - profileBefore.enqueued == (optimize ? 1u : 0u), "the held optimization enqueue count is wrong");
+        Require(held.queued + held.running == (optimize ? 1u : 0u), "held optimization is missing from the queue/running snapshot");
+        Require(held.completed == profileBefore.completed && held.failed == profileBefore.failed, "held optimization completed before release");
+    }
     trace.ReleaseOptimization();
     WaitForOptimizedPipelines(context.device);
     Require(PipelineLibraryCountersOf(context.device).linked == 1, "the readback pipeline was not linked from graphics libraries");
-    Require(trace.optimized.size() == (optimize ? 1u : 0u), "the optimized pipeline creation count differs from the requested mode");
-    render(optimize, "completed link");
-    std::printf("pipeline readback passed: fast draws %u, optimized draws %u, optimized creations %zu\n", optimize ? 1u : 2u, optimize ? 1u : 0u, trace.optimized.size());
+    const bool promoted = optimize && !trace.failOptimization;
+    Require(trace.optimized.size() == (promoted ? 1u : 0u), "the optimized pipeline creation count differs from the requested mode");
+    render(promoted, "completed link");
+    const auto finished = PipelineProfileSnapshot_nid_no_patch();
+    const std::array<std::uint64_t, 4> expectedBinds{promoted ? 1u : 0u, optimize ? (promoted ? 1u : 2u) : 0u, optimize ? 0u : 2u, 0u};
+    for (std::size_t index = 0; index < expectedBinds.size(); ++index) {
+        Require(finished.binds[index] - profileBefore.binds[index] == (profiling ? expectedBinds[index] : 0u), "pipeline profiling misclassified a bind or counted while disabled");
+    }
+    Require(finished.queued == 0 && finished.running == 0, "drained optimization still appears pending");
+    Require(finished.enqueued - profileBefore.enqueued == (profiling && optimize ? 1u : 0u), "optimization enqueue count is wrong");
+    Require(finished.completed - profileBefore.completed == (profiling && promoted ? 1u : 0u), "optimization completion count is wrong");
+    Require(finished.failed - profileBefore.failed == (profiling && trace.failOptimization ? 1u : 0u), "failed optimization was not reported separately from completion");
+    Require(finished.canceled == profileBefore.canceled && finished.discarded == profileBefore.discarded, "a retained optimization was canceled or discarded");
+    std::printf("pipeline readback passed: fast draws %u, optimized draws %u, optimized creations %zu\n", promoted ? 1u : 2u, promoted ? 1u : 0u, trace.optimized.size());
 }
 
 }
@@ -231,15 +257,18 @@ int main(int argc, char** argv) {
     try {
         std::string_view mode = "d32";
         bool force = false;
+        bool failOptimization = false;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument = argv[index];
             if (argument == "--force-lto") force = true;
+            else if (argument == "--fail-lto") failOptimization = true;
             else {
                 Require(argument == "color32" || argument == "color64" || argument == "d32" || argument == "d16", "unknown pipeline readback case");
                 mode = argument;
             }
         }
         PipelineTrace trace;
+        trace.failOptimization = failOptimization;
         Trace = &trace;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -255,6 +284,7 @@ int main(int argc, char** argv) {
         }
         if (force) context.pipelineLinkTimeOptimization = true;
         const bool optimize = context.pipelineLinkTimeOptimization && std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
+        Require(!failOptimization || optimize, "the failed-LTO test requires enabled link-time optimization");
         std::printf("pipeline readback: %s, %.*s, LTO %s%s\n", device->DeviceName().c_str(), static_cast<int>(mode.size()), mode.data(), optimize ? "enabled" : "disabled", force ? " (explicit test override)" : " (production policy)");
         trace.resolve = context.deviceProc;
         trace.create = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines");

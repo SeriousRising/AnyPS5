@@ -17,6 +17,7 @@ struct Options {
     std::filesystem::path output;
     std::filesystem::path fixtureDirectory;
     bool fixture = false;
+    bool statistics = false;
 };
 
 Options Parse(int argc, char** argv) {
@@ -32,12 +33,13 @@ Options Parse(int argc, char** argv) {
         else if (argument == "--output") value(result.output);
         else if (argument == "--write-fixture") value(result.fixtureDirectory);
         else if (argument == "--fixture" && !result.fixture) result.fixture = true;
+        else if (argument == "--stats" && !result.statistics) result.statistics = true;
         else if (argument.starts_with("--") || !result.source.empty()) throw std::runtime_error("unknown or repeated argument: " + std::string(argument));
         else result.source = argument;
     }
     const auto sources = static_cast<int>(!result.source.empty()) + static_cast<int>(result.fixture) + static_cast<int>(!result.fixtureDirectory.empty());
     if (sources != 1) throw std::runtime_error("select a capture file, --fixture, or --write-fixture DIRECTORY");
-    if (!result.fixtureDirectory.empty() && (!result.cacheIn.empty() || !result.cacheOut.empty() || !result.output.empty())) throw std::runtime_error("--write-fixture cannot be combined with replay options");
+    if (!result.fixtureDirectory.empty() && (!result.cacheIn.empty() || !result.cacheOut.empty() || !result.output.empty() || result.statistics)) throw std::runtime_error("--write-fixture cannot be combined with replay options");
     for (const auto& path : {result.cacheOut, result.output}) {
         if (!path.empty() && std::filesystem::exists(path)) throw std::runtime_error("output already exists: " + path.string());
     }
@@ -101,7 +103,7 @@ std::string Report(const Options& options, const AgcDriver::ComputePipelineCaptu
            << ",\n  \"push_constant_ranges\":" << capture.pushConstants.size()
            << ",\n  \"specialization_constants\":" << capture.specialization.size()
            << ",\n  \"required_subgroup_size\":" << capture.requiredSubgroupSize
-           << ",\n  \"pipeline_flags\":" << capture.flags
+           << ",\n  \"pipeline_flags\":" << (capture.flags | (options.statistics ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0u))
            << ",\n  \"stage_flags\":" << capture.stageFlags
            << ",\n  \"captured_device\":";
     WriteDevice(output, capture);
@@ -113,7 +115,7 @@ std::string Report(const Options& options, const AgcDriver::ComputePipelineCaptu
            << ",\n  \"cache_export_path\":" << Quote(options.cacheOut.string())
            << ",\n  \"cache_export_bytes\":" << (options.cacheOut.empty() ? 0u : replay.cache.size())
            << ",\n  \"driver_cache_state\":\"uncontrolled\""
-           << ",\n  \"dispatch_count\":0,\n  \"pipeline_statistics\":false"
+           << ",\n  \"dispatch_count\":0,\n  \"pipeline_statistics\":" << (options.statistics ? "true" : "false")
            << ",\n  \"milliseconds\":{\"shader_module\":" << replay.moduleMilliseconds
            << ",\"layout\":" << replay.layoutMilliseconds << ",\"pipeline_create\":" << replay.pipelineMilliseconds
            << ",\"cache\":" << replay.cacheMilliseconds << ",\"replay_total\":" << replay.totalMilliseconds << "}\n}\n";
@@ -124,9 +126,10 @@ std::string Report(const Options& options, const AgcDriver::ComputePipelineCaptu
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        std::cout << "agc_compute_pipeline_replay CAPTURE|--fixture [--cache-in FILE] [--cache-out FILE] [--output FILE]\n"
+        std::cout << "agc_compute_pipeline_replay CAPTURE|--fixture [--stats] [--cache-in FILE] [--cache-out FILE] [--output FILE]\n"
                      "agc_compute_pipeline_replay --write-fixture DIRECTORY\n"
-                     "Compiles one compute pipeline without dispatch. Fresh application cache does not clear driver caches.\n";
+                     "Compiles one compute pipeline without dispatch. Fresh application cache does not clear driver caches.\n"
+                     "--stats collects native executable statistics on stderr; its timings are diagnostic, not compilation benchmarks.\n";
         return 0;
     }
     try {
@@ -136,10 +139,18 @@ int main(int argc, char** argv) {
             return 0;
         }
         const auto* statistics = std::getenv("APS5_PIPELINE_STATS");
-        if (statistics != nullptr && std::string_view(statistics) != "0" && *statistics != '\0') throw std::runtime_error("unset APS5_PIPELINE_STATS before benchmarking");
+        if (!options.statistics && statistics != nullptr && std::string_view(statistics) != "0" && *statistics != '\0') throw std::runtime_error("unset APS5_PIPELINE_STATS before benchmarking");
         const auto capture = options.fixture ? AgcDriver::ComputePipelineFixture() : AgcDriver::ComputePipelineCapture::Read(options.source);
-        if ((capture.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) != 0) throw std::runtime_error("capture requests pipeline statistics; capture again with APS5_PIPELINE_STATS disabled");
+        if (!options.statistics && (capture.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) != 0) throw std::runtime_error("capture requests pipeline statistics; capture again with APS5_PIPELINE_STATS disabled");
         const auto cache = ReadCache(options.cacheIn);
+        if (options.statistics) {
+#ifdef _WIN32
+            const auto status = _putenv_s("APS5_PIPELINE_STATS", "1");
+#else
+            const auto status = setenv("APS5_PIPELINE_STATS", "1", 1);
+#endif
+            if (status != 0) throw std::runtime_error("cannot enable pipeline statistics");
+        }
         AgcDriver::VulkanDevice device(AgcDriver::VulkanDevice::CompileOnly{});
         const auto replay = device.ReplayComputePipeline(capture, cache);
         if (!options.cacheOut.empty()) WriteBytes(options.cacheOut, replay.cache);

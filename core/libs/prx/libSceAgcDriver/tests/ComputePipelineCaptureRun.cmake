@@ -1,12 +1,78 @@
-foreach(required IN ITEMS FIXTURE REPLAY OUTPUT_ROOT)
+foreach(required IN ITEMS REPLAY OUTPUT_ROOT)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "Missing ${required}")
     endif()
 endforeach()
+if(NOT REPLAY_STATS_ONLY AND NOT DEFINED FIXTURE)
+    message(FATAL_ERROR "Missing FIXTURE")
+endif()
 string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef runId)
 set(runDirectory "${OUTPUT_ROOT}/compute-capture-${runId}")
 set(captureDirectory "${runDirectory}/captures")
 file(MAKE_DIRECTORY "${runDirectory}")
+if(REPLAY_STATS_ONLY)
+    set(normalReport "${runDirectory}/fixture-normal.json")
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "APS5_PIPELINE_STATS=0" "${REPLAY}" --fixture --output "${normalReport}"
+            WORKING_DIRECTORY "${runDirectory}"
+            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20
+    )
+    file(WRITE "${runDirectory}/fixture-normal.log" "${output}\n${error}")
+    if(result STREQUAL "1" AND NOT DEFINED ENV{ANYPS5_REQUIRE_VULKAN})
+        if((error MATCHES "compute pipeline replay: Vulkan loader: " AND NOT error MATCHES "compute pipeline replay: Vulkan loader: vkGetInstanceProcAddr missing") OR error MATCHES "compute pipeline replay: Vulkan: no Vulkan 1.1 graphics and compute queue[\r\n]" OR error MATCHES "compute pipeline replay: vkCreateInstance: Vulkan result -9[\r\n]")
+            message(STATUS "compute pipeline replay statistics: skipped, no usable Vulkan device")
+            file(REMOVE_RECURSE "${runDirectory}")
+            return()
+        endif()
+    endif()
+    if(NOT result STREQUAL "0" OR error MATCHES "\\[pipeline-stats\\]")
+        message(FATAL_ERROR "Ordinary compile-only fixture failed: ${result}\n${output}\n${error}")
+    endif()
+    file(READ "${normalReport}" normalJson)
+    string(JSON normalIdentity GET "${normalJson}" capture_identity)
+    string(JSON normalStats GET "${normalJson}" pipeline_statistics)
+    string(JSON normalFlags GET "${normalJson}" pipeline_flags)
+    string(JSON normalDispatches GET "${normalJson}" dispatch_count)
+    if(normalStats OR NOT normalFlags EQUAL 16 OR NOT normalDispatches EQUAL 0)
+        message(FATAL_ERROR "Ordinary compile-only fixture metadata mismatch: ${normalJson}")
+    endif()
+    set(statsReport "${runDirectory}/fixture-stats.json")
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "APS5_PIPELINE_STATS=0" "${REPLAY}" --fixture --stats --output "${statsReport}"
+            WORKING_DIRECTORY "${runDirectory}"
+            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20
+    )
+    file(WRITE "${runDirectory}/fixture-stats.log" "${output}\n${error}")
+    if(result STREQUAL "1" AND NOT DEFINED ENV{ANYPS5_REQUIRE_VULKAN} AND error MATCHES "compute pipeline replay: AGC graphics: APS5_PIPELINE_STATS requires (VK_KHR_pipeline_executable_properties|pipelineExecutableInfo)[\r\n]")
+        message(STATUS "compute pipeline replay statistics: skipped, native statistics unavailable")
+        file(REMOVE_RECURSE "${runDirectory}")
+        return()
+    endif()
+    string(REGEX REPLACE "\\[pipeline-stats\\] pipeline=0x[0-9a-f]+ executable=[0-9]+ stages=[^\r\n]*" "" statisticRecords "${error}")
+    if(NOT result STREQUAL "0" OR NOT error MATCHES "\\[pipeline-stats\\] pipeline=0x[0-9a-f]+ executable=[0-9]+ stages=" OR NOT statisticRecords MATCHES "\\[pipeline-stats\\] pipeline=0x[0-9a-f]+ executable=[0-9]+ [^\r\n]*=[^\r\n]* \\([^\r\n]*\\)")
+        message(FATAL_ERROR "Statistics compile-only fixture failed: ${result}\n${output}\n${error}")
+    endif()
+    file(READ "${statsReport}" statsJson)
+    string(JSON statsIdentity GET "${statsJson}" capture_identity)
+    string(JSON statsEnabled GET "${statsJson}" pipeline_statistics)
+    string(JSON statsFlags GET "${statsJson}" pipeline_flags)
+    string(JSON statsDispatches GET "${statsJson}" dispatch_count)
+    if(NOT statsEnabled OR NOT statsFlags EQUAL 80 OR NOT statsDispatches EQUAL 0 OR NOT statsIdentity STREQUAL normalIdentity)
+        message(FATAL_ERROR "Statistics compile-only fixture metadata mismatch: ${statsJson}")
+    endif()
+    execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env "APS5_PIPELINE_STATS=1" "${REPLAY}" --fixture
+            WORKING_DIRECTORY "${runDirectory}"
+            RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 20
+    )
+    file(WRITE "${runDirectory}/fixture-ambient-refusal.log" "${output}\n${error}")
+    if(NOT result STREQUAL "1" OR NOT error MATCHES "unset APS5_PIPELINE_STATS before benchmarking")
+        message(FATAL_ERROR "Ambient statistics were not refused: ${result}\n${output}\n${error}")
+    endif()
+    message(STATUS "Compile-only replay ordinary/statistics fixtures and ambient refusal passed; input identity preserved; zero dispatches")
+    file(REMOVE_RECURSE "${runDirectory}")
+    return()
+endif()
 execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env "ANYPS5_NO_SHADER_CACHE=1" "APS5_PIPELINE_STATS=0" "APS5_DUMP_COMPUTE_PIPELINES=" "APS5_DUMP_COMPUTE_MIN_WORDS=0" "${FIXTURE}"
         WORKING_DIRECTORY "${runDirectory}"

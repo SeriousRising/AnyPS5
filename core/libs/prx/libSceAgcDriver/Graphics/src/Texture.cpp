@@ -108,6 +108,8 @@ struct StorageTraffic {
     std::mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
     std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
+    std::pair<std::uint64_t, std::uint64_t> nonBlockUploads{};
+    std::array<std::array<std::uint64_t, 3>, 5> uploadShadowCoverage{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::uint64_t directWriteBacks = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -140,6 +142,17 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         std::snprintf(text, sizeof(text), " %llu/%.1f", static_cast<unsigned long long>(totals.first), totals.second / 1048576.0);
         line += " " + reason + text;
     }
+    std::snprintf(text, sizeof(text), "; non-block uploads %llu/%.1f", static_cast<unsigned long long>(traffic.nonBlockUploads.first), traffic.nonBlockUploads.second / 1048576.0);
+    line += text;
+    line += "; upload shadow coverage (count/footprint MiB/published MiB):";
+    static constexpr std::array<const char*, 5> coverageNames{"geometry", "unobserved", "uncovered", "multiple-slabs", "single-slab"};
+    for (std::size_t i = 0; i < coverageNames.size(); ++i) {
+        const auto& totals = traffic.uploadShadowCoverage[i];
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f/%.1f", coverageNames[i], static_cast<unsigned long long>(totals[0]), totals[1] / 1048576.0, totals[2] / 1048576.0);
+        line += text;
+    }
+    traffic.nonBlockUploads = {};
+    traffic.uploadShadowCoverage = {};
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
@@ -178,6 +191,17 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     ++reason.first;
     reason.second += bytes;
     reportStorageTraffic(traffic);
+}
+
+void countUploadShadow(std::uint64_t bytes, bool geometry, const UploadShadowObservation& observation) {
+    auto& traffic = Traffic();
+    std::lock_guard lock(traffic.mutex);
+    ++traffic.nonBlockUploads.first;
+    traffic.nonBlockUploads.second += bytes;
+    auto& totals = traffic.uploadShadowCoverage[geometry ? 1 + static_cast<std::size_t>(observation.coverage) : 0];
+    ++totals[0];
+    totals[1] += bytes;
+    totals[2] += observation.publishedBytes;
 }
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct) {
@@ -693,7 +717,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, std::uint32_t arrayLayers) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, std::uint32_t arrayLayers) : context(context), borrowedDepthImage(depthImage) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
@@ -2062,7 +2086,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             ++Profile().storageWaitedClears;
         }
         VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toClear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -2074,7 +2098,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
         VkImageMemoryBarrier toGeneral = toClear;
         toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
         toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
@@ -2115,7 +2139,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             return;
         }
         // Units another image's results shadow reach the import before the detile reads it in place.
-        PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
+        UploadShadowObservation shadowObservation;
+        PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload, profile && !blockUnits ? &shadowObservation : nullptr);
         forgetBorrowed(0, trackedLayers);
         std::uint64_t uploadedBytes = layers == nullptr ? guestBytes : 0;
         if (layers != nullptr) {
@@ -2124,6 +2149,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             }
         }
         const bool direct = singlePass();
+        if (profile && !blockUnits) {
+            const bool geometryCandidate = layers == nullptr && descriptor.tileMode == TextureTileMode::kLinear && descriptor.dimension == TextureDimension::k2D && descriptor.mipCount == 1 && geometry.imageLayers == 1 && geometry.imageDepth == 1 && (elementBytes == 4 || elementBytes == 8) && direct;
+            countUploadShadow(guestBytes, geometryCandidate, shadowObservation);
+        }
         auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         detiler.BeginBatch();
         auto* recorder = Recorder::Active();

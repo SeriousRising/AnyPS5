@@ -408,8 +408,19 @@ constexpr std::array<const char*, SyncCount> SyncReasonNames{"none", "non-reside
 constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawPath::Count);
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled"};
 
+enum DrawInputKind : std::size_t { InputVertexBuffer, InputVertexImport, InputIndexBuffer, InputIndexImport, InputCount };
+
+struct DrawInputExtents {
+    std::array<std::uint64_t, InputCount> ranges{};
+    std::array<std::uint64_t, InputCount> bytes{};
+    ShaderResources::DrawSnapshotExtents snapshots;
+};
+
 // What became of one draw, for the totals.
 struct DrawOutcome {
+    bool inputExtentsCovered = false;
+    bool inputExtentsBda = false;
+    DrawInputExtents inputExtents;
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
     bool recorded = false;
     bool waited = false;
@@ -459,6 +470,9 @@ constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "templa
 
 struct DrawProfile {
     std::mutex mutex;
+    std::uint64_t inputExtentsDraws = 0;
+    std::uint64_t inputExtentsBda = 0;
+    DrawInputExtents inputExtents;
     std::array<double, KindCount> kindUs{};
     std::array<std::uint64_t, KindCount> kindCounts{};
     std::uint64_t fullScissorLookups = 0;
@@ -578,6 +592,20 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         profile.kindUs[outcome.kind] += drawUs;
     }
     if (outcome.validateMemoized) ++(outcome.validateHit ? profile.validateHits : profile.validateMisses);
+    if (outcome.inputExtentsCovered) {
+        ++profile.inputExtentsDraws;
+        if (outcome.inputExtentsBda) ++profile.inputExtentsBda;
+        for (std::size_t i = 0; i < InputCount; ++i) {
+            profile.inputExtents.ranges[i] += outcome.inputExtents.ranges[i];
+            profile.inputExtents.bytes[i] += outcome.inputExtents.bytes[i];
+        }
+        auto& snapshots = profile.inputExtents.snapshots;
+        snapshots.selectedViews += outcome.inputExtents.snapshots.selectedViews;
+        snapshots.selectedBytes += outcome.inputExtents.snapshots.selectedBytes;
+        snapshots.capImportViews += outcome.inputExtents.snapshots.capImportViews;
+        snapshots.capImportBytes += outcome.inputExtents.snapshots.capImportBytes;
+        snapshots.reuse.Add(outcome.inputExtents.snapshots.reuse);
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - profile.lastReport < std::chrono::seconds(10)) return;
     profile.lastReport = now;
@@ -627,6 +655,25 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     std::fprintf(stderr, "%s\n", line);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    const auto& extents = profile.inputExtents;
+    std::fprintf(stderr, "[draw-inputs] logical draws: %llu covered / %llu reported / %llu uncovered (%llu recorded uncovered); BDA %llu covered (descriptor route excluded); supplied extents: vertex buffer %llu ranges/%llu bytes, vertex import %llu ranges/%llu bytes, index buffer %llu ranges/%llu bytes, index import %llu ranges/%llu bytes; RO snapshots %llu views/%llu bytes; cap imports %llu views/%llu bytes\n",
+                 static_cast<unsigned long long>(profile.inputExtentsDraws), static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.draws - profile.inputExtentsDraws), static_cast<unsigned long long>(profile.recorded + profile.waited - profile.inputExtentsDraws), static_cast<unsigned long long>(profile.inputExtentsBda),
+                 static_cast<unsigned long long>(extents.ranges[InputVertexBuffer]), static_cast<unsigned long long>(extents.bytes[InputVertexBuffer]), static_cast<unsigned long long>(extents.ranges[InputVertexImport]), static_cast<unsigned long long>(extents.bytes[InputVertexImport]),
+                 static_cast<unsigned long long>(extents.ranges[InputIndexBuffer]), static_cast<unsigned long long>(extents.bytes[InputIndexBuffer]), static_cast<unsigned long long>(extents.ranges[InputIndexImport]), static_cast<unsigned long long>(extents.bytes[InputIndexImport]),
+                 static_cast<unsigned long long>(extents.snapshots.selectedViews), static_cast<unsigned long long>(extents.snapshots.selectedBytes), static_cast<unsigned long long>(extents.snapshots.capImportViews), static_cast<unsigned long long>(extents.snapshots.capImportBytes));
+    const auto& reuse = extents.snapshots.reuse;
+    std::fprintf(stderr, "[draw-snapshot-reuse] covered %llu draws; selected %llu views/%llu bytes; odd %llu/%llu; cold %llu/%llu; invalidated %llu/%llu; held %llu/%llu; unchanged %llu/%llu; equal %llu/%llu; patched %llu/%llu; patched-bytes %llu\n",
+                 static_cast<unsigned long long>(profile.inputExtentsDraws), static_cast<unsigned long long>(extents.snapshots.selectedViews), static_cast<unsigned long long>(extents.snapshots.selectedBytes),
+                 static_cast<unsigned long long>(reuse.oddViews), static_cast<unsigned long long>(reuse.oddBytes),
+                 static_cast<unsigned long long>(reuse.views[0]), static_cast<unsigned long long>(reuse.bytes[0]),
+                 static_cast<unsigned long long>(reuse.views[1]), static_cast<unsigned long long>(reuse.bytes[1]),
+                 static_cast<unsigned long long>(reuse.views[2]), static_cast<unsigned long long>(reuse.bytes[2]),
+                 static_cast<unsigned long long>(reuse.views[3]), static_cast<unsigned long long>(reuse.bytes[3]),
+                 static_cast<unsigned long long>(reuse.views[4]), static_cast<unsigned long long>(reuse.bytes[4]),
+                 static_cast<unsigned long long>(reuse.views[5]), static_cast<unsigned long long>(reuse.bytes[5]),
+                 static_cast<unsigned long long>(reuse.patchedBytes));
+    profile.inputExtentsDraws = profile.inputExtentsBda = 0;
+    profile.inputExtents = {};
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -882,7 +929,7 @@ Recorder::AddressSites ProgramAddressSites(std::span<const std::uint32_t> spirv)
         } else if (op == spv::OpFunctionCall && count >= 4 && !helper) {
             const auto callee = name(words[3]);
             if (callee.starts_with("read_bda_dword_bytes") || callee == "get_bda_pointer") ++sites.byteReads;
-            else if (callee.starts_with("read_bda_span") || callee.starts_with("read_bda_dword") || callee == "probe_bda_pointer") ++sites.reads;
+            else if (callee.starts_with("read_bda_span") || callee.starts_with("read_bda_dword") || callee.starts_with("read_bda_direct_dword") || callee == "probe_bda_pointer") ++sites.reads;
             else if (callee.starts_with("write_bda_bytes") || callee == "probe_bda_write_pointer" || callee == "get_bda_write_pointer" || callee == "get_bda_atomic_pointer") ++sites.stores;
         }
     }
@@ -1354,6 +1401,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
         }
+        if (timer.profile) {
+            const auto kind = import != nullptr ? InputIndexImport : InputIndexBuffer;
+            ++outcome.inputExtents.ranges[kind];
+            outcome.inputExtents.bytes[kind] += indexBytes;
+        }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
@@ -1413,6 +1465,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(begin - import->base);
             inputs.inPlaceReads.emplace_back(begin, end);
+            if (timer.profile) {
+                ++outcome.inputExtents.ranges[InputVertexImport];
+                outcome.inputExtents.bytes[InputVertexImport] += bytes;
+            }
             continue;
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
@@ -1420,6 +1476,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
+        if (timer.profile) {
+            ++outcome.inputExtents.ranges[InputVertexBuffer];
+            outcome.inputExtents.bytes[InputVertexBuffer] += bytes;
+        }
     }
     std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
@@ -1784,6 +1844,7 @@ struct RecordedDraw {
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
     std::span<const VkImageView> targetViews;
+    VkImage depthImage = VK_NULL_HANDLE;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::vector<std::shared_ptr<StorageTexture>> proxies;
     const IndirectRecord* indirect = nullptr;
@@ -1904,10 +1965,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
-    // The pass is named by its attachment views (stable while the kept targets live, so unique
-    // within the open batch) and the extent. The previous draw's pass is continued only when this
-    // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
-    // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
     const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
@@ -1922,7 +1979,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.profile ? &outcome.inputExtents.snapshots : nullptr);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -1932,15 +1989,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     const auto passImages = resources.StorageImages();
+    const bool writesDepth = state.depthWrite || state.stencilTest;
+    const bool depthFeedback = record.depthImage != VK_NULL_HANDLE && std::any_of(passImages.begin(), passImages.end(), [&](const auto& image) { return image.first == record.depthImage && (writesDepth || image.second); });
     std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
+    passAttachments.reserve(record.targets.size() + (record.depthImage != VK_NULL_HANDLE ? 1u : 0u));
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
+    if (record.depthImage != VK_NULL_HANDLE) passAttachments.emplace_back(record.depthImage, writesDepth);
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, resources.StoresByAddress() || resources.HasCopiedWrites()};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || depthFeedback || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -1963,7 +2023,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         for (const auto& target : record.targets) {
             if (target != nullptr) images.emplace_back(target->Image(), true);
         }
-        recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
+        if (record.depthImage != VK_NULL_HANDLE) images.emplace_back(record.depthImage, true);
+        const VkPipelineStageFlags depthStages = record.depthImage != VK_NULL_HANDLE ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : 0u;
+        recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages | depthStages, resources.HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
     std::shared_ptr<Buffer> meshArguments;
@@ -2042,6 +2104,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->Sync();
         if (timer.profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
         timer.phase(PhaseSync);
+    }
+    if (timer.profile) {
+        outcome.inputExtentsBda = resources.UsesAddressTable();
+        outcome.inputExtentsCovered = true;
     }
 }
 
@@ -2220,7 +2286,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
-    if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
+    VkImage depthImage = VK_NULL_HANDLE;
+    if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth, &depthImage));
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
@@ -2380,6 +2447,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
+        record.depthImage = depthImage;
         record.targets = owners;
         for (const auto& binding : targets) {
             if (binding.proxied) record.proxies.push_back(binding.resident);
@@ -2456,7 +2524,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         for (const auto& binding : targets) {
             if (binding.resident != nullptr) images.emplace_back(binding.resident->Image(), true);
         }
-        recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources->GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources->HoldsLease()});
+        if (depthImage != VK_NULL_HANDLE) images.emplace_back(depthImage, true);
+        const VkPipelineStageFlags depthStages = depthImage != VK_NULL_HANDLE ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : 0u;
+        recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources->GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages | depthStages, resources->HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;

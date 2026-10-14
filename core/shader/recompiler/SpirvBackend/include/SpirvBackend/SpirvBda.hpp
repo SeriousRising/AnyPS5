@@ -16,6 +16,7 @@ std::uint32_t BdaLoadAddress(SpirvEmitterState& state, std::uint32_t index);
 // Reads the direct table's header into the program's per-invocation variables; emitted at the start
 // of the entry point of a program made for the direct table. Nothing in other programs.
 void PrepareBdaDirectLookups(SpirvEmitterState& state);
+std::uint32_t EmitBdaDirectDwordPointer(SpirvEmitterState& state, std::uint32_t address);
 void DefineBdaFaultFunction(SpirvEmitterState& state);
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state);
 void DefineBdaSpanReadFunctions(SpirvEmitterState& state);

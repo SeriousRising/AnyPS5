@@ -47,6 +47,23 @@ struct PipelineLibraryCounters {
 
 PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device);
 
+enum class PipelineBindKind : std::size_t { Optimized, FastWithSlot, FastWithoutSlot, Whole, Count };
+
+struct PipelineProfileCounters {
+    std::array<std::uint64_t, static_cast<std::size_t>(PipelineBindKind::Count)> binds{};
+    std::uint64_t enqueued = 0;
+    std::uint64_t completed = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t canceled = 0;
+    std::uint64_t discarded = 0;
+    std::uint64_t queued = 0;
+    std::uint64_t running = 0;
+};
+
+extern const bool PipelineProfiling_nid_no_patch;
+void RecordPipelineBind_nid_no_patch(PipelineBindKind kind);
+PipelineProfileCounters PipelineProfileSnapshot_nid_no_patch();
+
 }
 
 #endif

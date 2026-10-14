@@ -7,6 +7,7 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -117,6 +118,28 @@ void Dispatch(AgcDriver::VulkanDevice& device) {
     }
 }
 
+void DispatchWindow(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, bool indexedWrite) {
+    output.fill(0xdeadbeefu);
+    std::vector<std::uint32_t> code{0xbefc0382u, 0x7e028700u, 0x34020283u, 0x4a000300u, 0x34000082u, 0x4a040083u};
+    if (indexedWrite) code.insert(code.end(), {0x7e080289u, 0x7e008504u});
+    code.insert(code.end(), {0x7e060302u, 0x7e028700u, 0x4a020701u, 0xe0701000u, 0x80000100u, 0xbf810000u});
+    const auto userData = BufferDescriptor(output.data(), 0u, sizeof(output));
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{8u, 1u, 2u}, 0u, {false, false, false}, false, 3u};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {waveSize, 0u, userData, compute, std::nullopt, std::nullopt, {}}, device.Target(), {0u, 0u, 0u, 128u}
+    };
+    request.useCache = false;
+    const auto result = ShaderRecompiler::Recompile(request);
+    device.Dispatch(result, 1u, 1u, 1u);
+    device.WaitIdle();
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        const auto expected = indexedWrite ? 18u : static_cast<std::uint32_t>(8u * index + 6u);
+        Require(output[index] == expected, "relative window direct/relative reads disagree after a write at output " + std::to_string(index)
+            + ": got " + std::to_string(output[index]) + ", expected " + std::to_string(expected));
+    }
+}
+
 template<typename TAction>
 bool Run(const char* name, TAction action) {
     try {
@@ -138,6 +161,10 @@ int main() {
         bool passed = Run("vertex", [&] { Draw(*device, true); });
         passed &= Run("pixel", [&] { Draw(*device, false); });
         passed &= Run("compute", [&] { Dispatch(*device); });
+        for (const auto wave : {32u, 64u}) {
+            passed &= Run("read-only window direct-write mirrors", [&] { DispatchWindow(*device, wave, false); });
+            passed &= Run("indexed window direct-read control", [&] { DispatchWindow(*device, wave, true); });
+        }
         if (!passed) return 1;
         std::cout << "relative stage input tests passed\n";
         return 0;

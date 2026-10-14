@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -25,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -369,6 +371,49 @@ void RunReusedKeys(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(Count(texels, SurfaceBytes, 0xff) == Threads * 4u, "reused keys: the write-back lost the image's results");
 }
 
+void RunSampledKeysBehindKernel(AgcDriver::VulkanDevice& device, std::uint8_t* block, bool uniform) {
+    auto* texels = block;
+    auto* keys = block + KeysOffset;
+    std::memset(block, 0xa5, BlockBytes);
+    std::memset(texels, 0x55, SurfaceBytes);
+    if (uniform) std::memset(keys, 0xff, KeyBytes);
+    else {
+        constexpr std::array<std::uint8_t, 4> oldWord{0x00, 0x00, 0x80, 0x3f};
+        for (std::size_t i = 0; i < KeyBytes; i += oldWord.size()) std::memcpy(keys + i, oldWord.data(), oldWord.size());
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto texture = TextureDescriptor(texels, keys);
+    const auto resource = AgcDriver::Graphics::DecodeTextureResource(texture);
+    std::vector<std::uint32_t> clearData(16, 0u), clearTailData(16, 0u);
+    const auto head = BufferDescriptor(keys, KeyBytes / 2);
+    const auto tail = BufferDescriptor(keys + KeyBytes / 2, KeyBytes / 2);
+    std::copy(head.begin(), head.end(), clearData.begin());
+    std::copy(tail.begin(), tail.end(), clearTailData.begin());
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    struct Drain {
+        AgcDriver::VulkanDevice& device;
+        ~Drain() {
+            try { device.WaitIdle(); }
+            catch (...) { std::terminate(); }
+        }
+    } drain{device};
+    Require(AgcDriver::Graphics::TextureClearKeys(resource, SurfaceBytes) == DccKeys::Uncompressed, "sampled key ordering: initial keys did not read as stored");
+    Dispatch(device, ClearKeysCode, clearData, false);
+    Dispatch(device, ClearKeysCode, clearTailData, false);
+    const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(AddressOf(keys), KeyBytes);
+    const bool stale = Count(keys, KeyBytes, 0x00) == (uniform ? 0u : KeyBytes / 2);
+    const auto read = AgcDriver::Graphics::TextureClearKeys(resource, SurfaceBytes);
+    device.WaitIdle();
+    Require(pending && stale, "sampled key ordering: the fixed kernel writes were not still pending over stale key bytes");
+    RequireKeys(keys, 0x00, "sampled key ordering: actual kernel-written key bytes");
+    Require(Count(texels, SurfaceBytes, 0x55) == SurfaceBytes, "sampled key ordering: untouched texels changed");
+    constexpr auto guardBytes = BlockBytes - KeysOffset - KeyBytes;
+    Require(Count(keys + KeyBytes, guardBytes, 0xa5) == guardBytes, "sampled key ordering: trailing guard bytes changed");
+    Require(read == DccKeys::Clear0000, "sampled key ordering: sampled lookup used stale keys before the queued kernels completed");
+    std::printf("Sampled key ordering %s: pending stale keys, two kernel writes, Clear0000 read, texel/guard bytes verified\n", uniform ? "uniform" : "mixed");
+}
+
 void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto address = AddressOf(block);
     std::memset(block, 0x55, BlockBytes);
@@ -494,15 +539,25 @@ void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         std::optional<GuestBlock> block;
         std::optional<GuestBlock> watched;
         std::optional<GuestBlock> untracked;
         std::optional<GuestBlock> shared;
         std::optional<GuestBlock> window;
+        std::optional<GuestBlock> sampledMixed;
+        std::optional<GuestBlock> sampledUniform;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        const bool sampledOnly = argc == 2 && std::strcmp(argv[1], "--sampled-key-order-only") == 0;
+        Require(argc == 1 || sampledOnly, "unknown DCC keys first write test selector");
+        sampledMixed.emplace(false);
+        sampledUniform.emplace(false);
+        RunSampledKeysBehindKernel(*device, sampledMixed->Data(), false);
+        RunSampledKeysBehindKernel(*device, sampledUniform->Data(), true);
+        std::puts("Sampled DCC key ordering tests passed");
+        if (sampledOnly) return 0;
         block.emplace(false);
         Run(*device, block->Data());
         untracked.emplace(false);

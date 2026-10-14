@@ -13,7 +13,13 @@
 
 namespace AgcDriver::Graphics {
 
+const bool PipelineProfiling_nid_no_patch = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+
 namespace {
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PipelineBindKind::Count)> profiledBinds{};
+
+enum class OptimizationOutcome { Completed, Failed, Canceled, Discarded };
 
 constexpr std::array<VkDynamicState, 15> dynamicStates{
     VK_DYNAMIC_STATE_VIEWPORT,
@@ -50,8 +56,9 @@ struct LibraryStore {
     std::map<VkDevice, DeviceLibraries> devices;
     std::condition_variable idle;
     std::condition_variable work;
-    std::deque<std::pair<VkDevice, std::function<void()>>> jobs;
+    std::deque<std::pair<VkDevice, std::function<OptimizationOutcome()>>> jobs;
     std::map<VkDevice, std::size_t> pending;
+    PipelineProfileCounters profile;
     bool started = false;
 };
 
@@ -67,19 +74,36 @@ void runJobs(LibraryStore& store) {
         auto [device, job] = std::move(store.jobs.front());
         store.jobs.pop_front();
         lock.unlock();
-        job();
+        const auto outcome = job();
         lock.lock();
+        if (PipelineProfiling_nid_no_patch) {
+            switch (outcome) {
+            case OptimizationOutcome::Discarded:
+                ++store.profile.discarded;
+                [[fallthrough]];
+            case OptimizationOutcome::Completed:
+                ++store.profile.completed;
+                break;
+            case OptimizationOutcome::Failed:
+                ++store.profile.failed;
+                break;
+            case OptimizationOutcome::Canceled:
+                ++store.profile.canceled;
+                break;
+            }
+        }
         if (--store.pending[device] == 0) store.idle.notify_all();
     }
 }
 
-void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
+void enqueue(LibraryStore& store, VkDevice device, std::function<OptimizationOutcome()> job) {
     if (!store.started) {
         std::thread(runJobs, std::ref(store)).detach();
         store.started = true;
     }
     ++store.pending[device];
     store.jobs.emplace_back(device, std::move(job));
+    if (PipelineProfiling_nid_no_patch) ++store.profile.enqueued;
     store.work.notify_one();
 }
 
@@ -146,8 +170,16 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     };
     const std::array<const Key*, 4> partKeys{&keys.vertexInput, &keys.preRasterization, &keys.fragmentShader, &keys.fragmentOutput};
     const Key none;
-    const std::array<const Key*, 4> contextKeys{&none, &keys.preRasterizationLayout, &keys.fragmentLayout, &keys.renderPass};
-    const VkPipelineRenderingCreateInfoKHR shaderRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    VkPipelineRenderingCreateInfoKHR shaderRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    shaderRendering.viewMask = rendering.viewMask;
+    shaderRendering.depthAttachmentFormat = rendering.depthAttachmentFormat;
+    shaderRendering.stencilAttachmentFormat = rendering.stencilAttachmentFormat;
+    const std::array<std::uint32_t, 3> attachments{shaderRendering.viewMask, static_cast<std::uint32_t>(shaderRendering.depthAttachmentFormat), static_cast<std::uint32_t>(shaderRendering.stencilAttachmentFormat)};
+    const auto attachmentBytes = std::as_bytes(std::span(attachments));
+    const Key attachmentKey(attachmentBytes.begin(), attachmentBytes.end());
+    const auto preRasterizationContext = Combined(keys.preRasterizationLayout, attachmentKey);
+    const auto fragmentContext = Combined(keys.fragmentLayout, attachmentKey);
+    const std::array<const Key*, 4> contextKeys{&none, &preRasterizationContext, &fragmentContext, &keys.renderPass};
     VkPipelineDepthStencilStateCreateInfo dynamicDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;
@@ -234,7 +266,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto cache = context.pipelineCache;
         const auto libraryLayout = fullLayout;
         enqueue(store, context.device, [slot, createPipelines, cache, libraryLayout, libraries, &store, devicePointer = &device] {
-            if (slot->released.load()) return;
+            if (slot->released.load()) return OptimizationOutcome::Canceled;
             VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
             linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
             linked.pLibraries = libraries.data();
@@ -242,13 +274,15 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
             create.layout = libraryLayout;
             VkPipeline result = VK_NULL_HANDLE;
-            if (createPipelines(slot->device, cache, 1, &create, nullptr, &result) != VK_SUCCESS) return;
+            if (createPipelines(slot->device, cache, 1, &create, nullptr, &result) != VK_SUCCESS) return OptimizationOutcome::Failed;
             slot->handle.store(result);
-            if (slot->released.load()) {
+            const bool discarded = slot->released.load();
+            if (discarded) {
                 if (const auto handle = slot->handle.exchange(VK_NULL_HANDLE)) slot->destroy(slot->device, handle, nullptr);
             }
             std::lock_guard lock(store.mutex);
             ++devicePointer->counters.optimized;
+            return discarded ? OptimizationOutcome::Discarded : OptimizationOutcome::Completed;
         });
     }
     return pipeline;
@@ -285,6 +319,23 @@ PipelineLibraryCounters PipelineLibraryCountersOf(VkDevice device) {
     std::lock_guard lock(store.mutex);
     const auto found = store.devices.find(device);
     return found == store.devices.end() ? PipelineLibraryCounters{} : found->second.counters;
+}
+
+void RecordPipelineBind_nid_no_patch(PipelineBindKind kind) {
+    if (PipelineProfiling_nid_no_patch) profiledBinds[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+PipelineProfileCounters PipelineProfileSnapshot_nid_no_patch() {
+    if (!PipelineProfiling_nid_no_patch) return {};
+    auto& store = Libraries();
+    std::lock_guard lock(store.mutex);
+    auto result = store.profile;
+    for (std::size_t index = 0; index < result.binds.size(); ++index) result.binds[index] = profiledBinds[index].load(std::memory_order_relaxed);
+    result.queued = store.jobs.size();
+    std::uint64_t pending = 0;
+    for (const auto& entry : store.pending) pending += entry.second;
+    result.running = pending - result.queued;
+    return result;
 }
 
 }

@@ -33,6 +33,13 @@ target_link_libraries(video_out_flip_tests PRIVATE libSceVideoOut libSceAgcDrive
 set_target_properties(video_out_flip_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(video_out_flip_tests)
 if(BUILD_TESTING)
+    add_test_executable(video_out_present_profile_tests tests/PresentProfile.cpp)
+    target_include_directories(video_out_present_profile_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    set_target_properties(video_out_present_profile_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(video_out_present_profile_tests)
+    add_test(NAME video_out_present_profile COMMAND video_out_present_profile_tests)
+    set_tests_properties(video_out_present_profile PROPERTIES TIMEOUT 20)
+
     add_test_executable(video_out_output_mode_policy_tests tests/OutputModePolicy.cpp)
     target_include_directories(video_out_output_mode_policy_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
     target_link_libraries(video_out_output_mode_policy_tests PRIVATE libSceVideoOut libc libkernel)

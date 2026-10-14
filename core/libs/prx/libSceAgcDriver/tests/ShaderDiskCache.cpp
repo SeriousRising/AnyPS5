@@ -19,6 +19,7 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -612,29 +613,160 @@ struct ComputeRequest {
     }
 };
 
-int runLoadingProcess() {
+int runLoadingProcess(bool rebuild = false) {
     ComputeRequest cached(true);
     const auto loaded = Recompile(cached.request);
+    ShaderDiskCache::Flush();
     const auto totals = ShaderDiskCache::Totals();
-    require(totals.hits == 1 && totals.misses == 0 && totals.loadFailures == 0, "the second process did not load the stored variant (hits " + std::to_string(totals.hits) + ", misses " + std::to_string(totals.misses) + ")");
+    require(totals.hits == (rebuild ? 1u : 2u) && totals.specializedHits == (rebuild ? 0u : 1u) && totals.misses == 0 && totals.loadFailures == (rebuild ? 1u : 0u) && totals.writes == (rebuild ? 1u : 0u), "the second process did not load or rebuild the specialized module (hits " + std::to_string(totals.hits) + ", misses " + std::to_string(totals.misses) + ")");
+    require(totals.specializedLookups == 1, "a valid or rejected specialization did not count exactly one lookup");
     ComputeRequest fresh(false);
     const auto compiled = Recompile(fresh.request);
     requireSameResult(compiled, loaded, "loaded against compiled");
+    require(ShaderDiskCache::Totals().hits == totals.hits && ShaderDiskCache::Totals().misses == totals.misses, "an uncached request accessed the disk cache");
+    require(compiled.specializationId != loaded.specializationId, "a disk specialization reused its process-local ID");
     require(!loaded.spirv.empty(), "the loaded SPIR-V is empty");
     std::cout << "second process loaded " << loaded.spirv.size() << " SPIR-V words from the disk cache\n";
     return 0;
 }
 
+void verifySpecializedStorage(const RecompileResult& result, const SpirvTarget& target) {
+    std::array<PipelineSpecializationConstant, 2> constants{{{7, 11}, {8, 19}}};
+    const auto keyOf = [](std::span<const std::uint32_t> words, std::span<const PipelineSpecializationConstant> values, const SpirvTarget& profile) {
+        std::vector<std::byte> key;
+        ShaderDiskCache::BuildSpecializedKey(words, values, profile, key);
+        return key;
+    };
+    const auto key = keyOf(result.spirv.Words(), constants, target);
+    require(keyOf(result.spirv.Words(), constants, target) == key, "the specialized key is not stable");
+    auto changed = constants;
+    ++changed[0].value;
+    require(keyOf(result.spirv.Words(), changed, target) != key, "the specialized key ignores a constant value");
+    changed = constants;
+    ++changed[0].id;
+    require(keyOf(result.spirv.Words(), changed, target) != key, "the specialized key ignores a constant ID");
+    require(keyOf(result.spirv.Words(), std::span(constants).first(1), target) != key, "the specialized key ignores constant count");
+    for (const auto field : {0, 1, 2}) {
+        auto profile = target;
+        if (field == 0) ++profile.vulkanVersion;
+        if (field == 1) ++profile.spirvVersion;
+        if (field == 2) profile.nonConstantImageOffsets = !profile.nonConstantImageOffsets;
+        require(keyOf(result.spirv.Words(), constants, profile) != key, "the specialized key ignores a target field");
+    }
+    CompiledShaderArtifact vertex;
+    vertex.spirv = result.spirv;
+    vertex.vertexInputPatches = {{0, 2, {17, 23, 29}}};
+    const auto patched = keyOf(SpecializeVertexInputTypes(vertex, std::array{0u}).Words(), constants, target);
+    const auto integer = keyOf(SpecializeVertexInputTypes(vertex, std::array{1u}).Words(), constants, target);
+    require(patched != integer && patched != key, "the specialized key ignores patched input words");
+    ++vertex.vertexInputPatches[0].values[1];
+    require(keyOf(SpecializeVertexInputTypes(vertex, std::array{1u}).Words(), constants, target) != integer, "the specialized key ignores vertex patch values");
+    const auto file = ShaderDiskCache::EncodeSpecializedEntry(key, result.spirv);
+    SharedSpirv decoded;
+    require(ShaderDiskCache::DecodeSpecializedEntry(file, key, decoded) == ShaderDiskCache::LoadStatus::Loaded && decoded == result.spirv, "specialized SPIR-V did not round trip");
+    CompiledVariant generic;
+    require(ShaderDiskCache::DecodeEntry(file, key, generic) == ShaderDiskCache::LoadStatus::Rejected, "a specialized payload decoded as a generic artifact");
+    require(ShaderDiskCache::DecodeSpecializedEntry(ShaderDiskCache::EncodeEntry(key, sampleVariant()), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "a generic payload decoded as specialized SPIR-V");
+    for (const auto size : {std::size_t{0}, file.size() / 2, file.size() - 1}) {
+        require(ShaderDiskCache::DecodeSpecializedEntry(std::span(file).first(size), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "a truncated specialized entry decoded");
+    }
+    for (const auto field : {0, 1, 3, 4, 5, 6}) {
+        auto words = result.spirv.Words();
+        if (field == 4) words[4] = 1;
+        else if (field == 5) words[5] &= 0xffffu;
+        else if (field == 6) words[5] |= 0xffff0000u;
+        else words[field] = 0;
+        require(ShaderDiskCache::DecodeSpecializedEntry(ShaderDiskCache::EncodeSpecializedEntry(key, SharedSpirv(std::move(words))), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "malformed specialized SPIR-V decoded");
+    }
+    const auto before = ShaderDiskCache::Totals();
+    ShaderDiskCache::StoreSpecialized(key, result.spirv);
+    ShaderDiskCache::Flush();
+    require(ShaderDiskCache::LoadSpecialized(key, target, decoded) && decoded == result.spirv, "stored specialized SPIR-V did not load");
+    require(ShaderDiskCache::Totals().specializedHits == before.specializedHits + 1, "a specialized hit was not counted");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    auto invalid = result.spirv.Words();
+    invalid[3] = 1;
+    ShaderDiskCache::StoreSpecialized(key, SharedSpirv(std::move(invalid)));
+    ShaderDiskCache::Flush();
+    require(!ShaderDiskCache::LoadSpecialized(key, target, decoded), "semantically invalid cached SPIR-V passed validation");
+    require(ShaderDiskCache::Totals().loadFailures == before.loadFailures + 1 && ShaderDiskCache::Totals().specializedHits == before.specializedHits + 1, "a rejected specialization counted as a hit");
+#endif
+}
+
+int runBypassingProcess(bool debugProbe) {
+    if (debugProbe) SetDebugProbeActive(true);
+    else setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
+    ComputeRequest request(true);
+    const auto compiled = Recompile(request.request);
+    ShaderDiskCache::Flush();
+    const auto totals = ShaderDiskCache::Totals();
+    require(!compiled.spirv.empty(), "a cache-bypassing request produced no SPIR-V");
+    require(totals.hits == 0 && totals.misses == 0 && totals.writes == 0 && totals.loadFailures == 0, "a disabled or debug-probe request accessed the disk cache");
+    require(totals.specializedLookups == 0, "a cache-bypassing request counted a specialized lookup");
+    return 0;
+}
+
+int runChangedSpecializationSwitch(std::string_view previous) {
+    const auto* mode = std::getenv("APS5_SPIRV_OPT");
+    setEnvironment("APS5_SPIRV_OPT", mode != nullptr && std::string_view(mode) == "none" ? "full" : "none");
+    ComputeRequest request(true);
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildSpecializedKey(request.code, {}, request.request.target, key);
+    require(ShaderDiskCache::EntryName(key) != previous, "the specialized key ignores the optimizer switch");
+    return 0;
+}
+
 void verifyAcrossProcesses(const char* self) {
     ComputeRequest request(true);
+    std::set<std::filesystem::path> existing;
+    for (const auto& entry : std::filesystem::directory_iterator(ShaderDiskCache::EntryDirectory())) existing.insert(entry.path());
     const auto before = ShaderDiskCache::Totals();
     const auto compiled = Recompile(request.request);
     ShaderDiskCache::Flush();
     const auto after = ShaderDiskCache::Totals();
-    require(after.misses == before.misses + 1 && after.writes == before.writes + 1, "the first compile was not looked up and stored");
+    require(after.misses == before.misses + 2 && after.writes == before.writes + 2, "the first compile did not look up and store generic and specialized modules");
+    require(after.specializedLookups == before.specializedLookups + 1, "a missing specialization did not count exactly one lookup");
     require(!compiled.spirv.empty(), "the compile produced no SPIR-V");
     const std::string command = "\"" + std::string(self) + "\" --load";
     require(std::system(command.c_str()) == 0, "the loading process failed");
+    std::vector<std::byte> genericKey;
+    ShaderDiskCache::BuildKey(request.request, 32, genericKey);
+    const auto genericName = ShaderDiskCache::EntryName(genericKey);
+    std::filesystem::path specializedPath;
+    for (const auto& entry : std::filesystem::directory_iterator(ShaderDiskCache::EntryDirectory())) {
+        if (!existing.contains(entry.path()) && entry.path().extension() == ".bin" && entry.path().filename() != genericName) {
+            require(specializedPath.empty(), "multiple new specialized entries for one compile");
+            specializedPath = entry.path();
+        }
+    }
+    require(!specializedPath.empty(), "the compile stored no specialized entry");
+    std::vector<std::byte> file;
+    require(ReadWholeFile(specializedPath, file) && !file.empty(), "cannot read the specialized entry");
+    file.back() ^= std::byte{1};
+    require(WriteFileAtomically(specializedPath, file), "cannot damage the specialized entry");
+    require(std::system(("\"" + std::string(self) + "\" --load-rebuild").c_str()) == 0, "a corrupt specialization was not rebuilt");
+    require(std::system(command.c_str()) == 0, "the rebuilt specialization did not load");
+    for (const auto option : {"--disabled", "--debug-probe"}) {
+        const std::string bypass = "\"" + std::string(self) + "\" " + option;
+        require(std::system(bypass.c_str()) == 0, "the cache-bypassing process failed");
+    }
+    verifySpecializedStorage(compiled, request.request.target);
+    std::vector<std::byte> switchKey;
+    ShaderDiskCache::BuildSpecializedKey(request.code, {}, request.request.target, switchKey);
+    require(std::system(("\"" + std::string(self) + "\" --specialized-switch " + ShaderDiskCache::EntryName(switchKey)).c_str()) == 0, "specialization switch separation failed");
+
+    request.request.layout.pushConstantOffsetBytes = 16;
+    request.request.layout.pushConstantSizeBytes = 112;
+    const auto concurrentBefore = ShaderDiskCache::Totals();
+    std::array<std::future<RecompileResult>, 4> results;
+    for (auto& result : results) result = std::async(std::launch::async, [&] { return Recompile(request.request); });
+    const auto first = results.front().get();
+    for (std::size_t index = 1; index < results.size(); ++index) {
+        const auto result = results[index].get();
+        require(result.spirv.data() == first.spirv.data() && result.specializationId == first.specializationId, "concurrent requests did not share one specialization");
+    }
+    ShaderDiskCache::Flush();
+    require(ShaderDiskCache::Totals().misses == concurrentBefore.misses + 2 && ShaderDiskCache::Totals().writes == concurrentBefore.writes + 2, "concurrent requests duplicated generic or specialized cache work");
 }
 
 struct ClockRequest {
@@ -799,7 +931,7 @@ void verifyBufferAlignmentSpecialization() {
     for (std::uint32_t offset = 1; offset < 4u; ++offset) {
         request.userData[0] = 0x10000000u + offset;
         const auto unaligned = Recompile(request.request);
-        require(unaligned.variantId == aligned.variantId && diskMisses() == misses, "base alignment repeated static shader preparation");
+        require(unaligned.variantId == aligned.variantId && diskMisses() == misses + 1 + offset, "base alignment did not perform exactly one specialized lookup");
         require(countAtomics(unaligned) == 2u, "unaligned DWORD store did not split into two atomic updates");
         request.userData[0] += 0x10000u;
         const auto relocated = Recompile(request.request);
@@ -1098,6 +1230,10 @@ void verifyDefaultDirectory(const char* self) {
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-rebuild") return runLoadingProcess(true);
+        if (argc == 2 && std::string_view(argv[1]) == "--disabled") return runBypassingProcess(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--debug-probe") return runBypassingProcess(true);
+        if (argc == 3 && std::string_view(argv[1]) == "--specialized-switch") return runChangedSpecializationSwitch(argv[2]);
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);

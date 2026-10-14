@@ -363,6 +363,12 @@ static void RunBdaDirectTests(const Context& context) {
         }
         for (const std::uint32_t dwords : {2u, 3u, 4u}) compare(std::to_string(dwords) + " dwords written", address, [&] { return MakeBdaDwordWriteTestShader(address, dwords, values.data()); });
     }
+    compare("a negative dword offset", guest + 4u, [&] { return MakeBdaDwordReadTestShader(guest + 4u, 1u, false, true, static_cast<std::uint32_t>(-4)); });
+    compare("a positive dword offset", guest, [&] { return MakeBdaDwordReadTestShader(guest, 1u, true, false, 4u); });
+    compare("an offset across a range seam", guest, [&] { return MakeBdaDwordReadTestShader(guest, 1u, true, false, 13u); });
+    compare("a dword offset underflow", 2u, [&] { return MakeBdaDwordReadTestShader(2u, 1u, true, false, static_cast<std::uint32_t>(-4)); });
+    compare("a dword offset overflow", UINT64_MAX - 1u, [&] { return MakeBdaDwordReadTestShader(UINT64_MAX - 1u, 1u, false, true, 4u); });
+    compare("a dword extent overflow", UINT64_MAX - 2u, [&] { return MakeBdaDwordReadTestShader(UINT64_MAX - 2u, 1u, false, false); });
     Require(faults != 0 && stored != 0, "BDA direct table: the comparison with the search met no fault or no store");
     std::vector<std::uint32_t> invalid = direct;
     invalid[0] = Abi::Version;

@@ -173,6 +173,7 @@ void Driver::execute(const Submission& submission) {
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 
         if (profilePackets) {
+            packetProfile.timestamps.Note(packetTimer.key, packet);
             if (submission.queue == 0) GuestMemory::HitchPacketBegin(header == FlipPacketHeader ? GuestMemory::HitchFlipKind : opcode);
             packetStartedAt() = packetTimer.start;
             pendingDispatchPhases() = {};

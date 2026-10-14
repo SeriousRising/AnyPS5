@@ -182,6 +182,33 @@ void testAttachments() {
     Expect(hazards.Check(renderIntoStored.View(), true) == PassHazard::Image, "rendering into an image a draw stored to");
 }
 
+void testReadOnlyDepth() {
+    PassHazards hazards;
+    hazards.BeginPass();
+    Use producer;
+    producer.attachments = {{image(40), true}, {image(41), true}};
+    hazards.Add(producer.View());
+    Use depthTest;
+    depthTest.attachments = {{image(40), true}, {image(41), false}};
+    Expect(hazards.Check(depthTest.View(), true) == PassHazard::None, "read-only depth testing continues the producer pass");
+    hazards.Add(depthTest.View());
+    Use sampler = depthTest;
+    sampler.images = {{image(41), false}};
+    Expect(hazards.Check(sampler.View(), true) == PassHazard::Image, "a read-only draw cannot erase the earlier depth writer before sampling");
+    hazards.Clear();
+    hazards.BeginPass();
+    Expect(hazards.Check(sampler.View(), true) == PassHazard::None, "the depth sampler is safe after the producer barrier");
+    hazards.Add(sampler.View());
+    Expect(hazards.Check(sampler.View(), true) == PassHazard::None, "consecutive read-only depth samplers share a pass");
+    Expect(hazards.Check(producer.View(), true) == PassHazard::Image, "a depth writer after sampling requires a barrier");
+    Use storageWriter = sampler;
+    storageWriter.images = {{image(41), true}};
+    Expect(hazards.Check(storageWriter.View(), true) == PassHazard::Image, "a shader image write after depth sampling requires a barrier");
+    Use colorSampler = sampler;
+    colorSampler.images = {{image(40), false}};
+    Expect(hazards.Check(colorSampler.View(), true) == PassHazard::Image, "read-only depth does not hide sampling the written color attachment");
+}
+
 }
 
 int main() {
@@ -190,6 +217,7 @@ int main() {
     testUnknown();
     testImages();
     testAttachments();
+    testReadOnlyDepth();
     if (failures != 0) {
         std::fprintf(stderr, "%d pass hazard checks failed\n", failures);
         return 1;

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -42,26 +43,26 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
         Check(getStatistics(context.device, &executable, &count, statistics.data()), "vkGetPipelineExecutableStatisticsKHR");
         statistics.resize(count);
         const auto& property = properties[index];
-        std::fprintf(stderr, "[pipeline-stats] executable=%u stages=0x%x subgroup=%u name=%s\n", index, property.stages, property.subgroupSize, property.name);
+        std::fprintf(stderr, "[pipeline-stats] pipeline=0x%llx executable=%u stages=0x%x subgroup=%u name=%s\n", static_cast<unsigned long long>(std::bit_cast<std::uint64_t>(pipeline)), index, property.stages, property.subgroupSize, property.name);
         for (const auto& statistic : statistics) {
-            std::fprintf(stderr, "[pipeline-stats] executable=%u %s=", index, statistic.name);
+            char value[64];
             switch (statistic.format) {
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
-                std::fprintf(stderr, "%s", statistic.value.b32 ? "true" : "false");
+                std::snprintf(value, sizeof(value), "%s", statistic.value.b32 ? "true" : "false");
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
-                std::fprintf(stderr, "%lld", static_cast<long long>(statistic.value.i64));
+                std::snprintf(value, sizeof(value), "%lld", static_cast<long long>(statistic.value.i64));
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
-                std::fprintf(stderr, "%llu", static_cast<unsigned long long>(statistic.value.u64));
+                std::snprintf(value, sizeof(value), "%llu", static_cast<unsigned long long>(statistic.value.u64));
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
-                std::fprintf(stderr, "%.17g", statistic.value.f64);
+                std::snprintf(value, sizeof(value), "%.17g", statistic.value.f64);
                 break;
             default:
                 throw std::runtime_error("unsupported pipeline statistic format");
             }
-            std::fprintf(stderr, " (%s)\n", statistic.description);
+            std::fprintf(stderr, "[pipeline-stats] pipeline=0x%llx executable=%u %s=%s (%s)\n", static_cast<unsigned long long>(std::bit_cast<std::uint64_t>(pipeline)), index, statistic.name, value, statistic.description);
         }
     }
 }
@@ -507,6 +508,11 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();
         timing.Mark("create");
+        if (context.pipelineExecutableInfo) {
+            for (const auto& shader : shaders) {
+                std::fprintf(stderr, "[pipeline-stats] pipeline=0x%llx kind=graphics stage=0x%x pipeline_variant=0x%llx variant=0x%llx words=%zu\n", static_cast<unsigned long long>(std::bit_cast<std::uint64_t>(pipeline)), static_cast<unsigned>(VulkanStage(shader.stage)), static_cast<unsigned long long>(shader.program->PipelineVariantId()), static_cast<unsigned long long>(shader.program->variantId), shader.program->spirv.size());
+            }
+        }
         LogPipelineStatistics_nid_no_patch(context, pipeline);
     } catch (...) {
         release();
@@ -663,6 +669,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
+    if (PipelineProfiling_nid_no_patch) RecordPipelineBind_nid_no_patch(!libraries ? PipelineBindKind::Whole : best != VK_NULL_HANDLE ? PipelineBindKind::Optimized : optimized != nullptr ? PipelineBindKind::FastWithSlot : PipelineBindKind::FastWithoutSlot);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     if (libraries) {
@@ -874,14 +881,19 @@ std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::lis
 }
 
 void reportPipelines(PipelineStore& store) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
+    if (!PipelineProfiling_nid_no_patch) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
     AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
     store.hits = store.misses = store.uncached = store.evicted = 0;
+    const auto profile = PipelineProfileSnapshot_nid_no_patch();
+    const auto binds = [&](PipelineBindKind kind) { return static_cast<unsigned long long>(profile.binds[static_cast<std::size_t>(kind)]); };
+    AgcDriver::ProfilePrint_nid_no_patch("[pipeline-lto] totals: primary_binds optimized=%llu fast_with_slot=%llu fast_without_slot=%llu whole=%llu; jobs enqueued=%llu completed=%llu failed=%llu canceled=%llu discarded=%llu; current queued=%llu running=%llu\n",
+        binds(PipelineBindKind::Optimized), binds(PipelineBindKind::FastWithSlot), binds(PipelineBindKind::FastWithoutSlot), binds(PipelineBindKind::Whole),
+        static_cast<unsigned long long>(profile.enqueued), static_cast<unsigned long long>(profile.completed), static_cast<unsigned long long>(profile.failed),
+        static_cast<unsigned long long>(profile.canceled), static_cast<unsigned long long>(profile.discarded), static_cast<unsigned long long>(profile.queued), static_cast<unsigned long long>(profile.running));
 }
 
 }

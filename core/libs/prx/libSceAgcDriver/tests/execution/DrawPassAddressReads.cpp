@@ -15,6 +15,7 @@
 #else
 #include <unistd.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -90,6 +91,12 @@ alignas(256) constexpr std::array<std::uint32_t, 7> ReadCode{0x7e1e0280, 0xdc308
 alignas(256) constexpr std::array<std::uint32_t, 8> AddressStoreCode{0x7e020208, 0x7e040209, 0x7e1202f2, 0xdc708000, 0x007d0901, 0xf800180f, 0x09090909, 0xbf810000};
 // 1.0 stored to the first dword of the buffer whose descriptor is in s4..s7, and exported.
 alignas(256) constexpr std::array<std::uint32_t, 7> BufferStoreCode{0x7e040280, 0x7e0202f2, 0xe0701000, 0x80010102, 0xf800180f, 0x01010101, 0xbf810000};
+alignas(256) constexpr std::array<std::uint32_t, 4> WhiteCode{0x7e0e02f2, 0xf800180f, 0x07070707, 0xbf810000};
+alignas(256) constexpr std::array<std::uint32_t, 8> DepthReadCode{0x7e3c0280, 0x7e3e0280, 0xf0001f08, 0x0001141e, 0xbf8c3f70, 0xf800180f, 0x14141414, 0xbf810000};
+
+std::array<std::uint32_t, 8> DepthDescriptor(std::uint64_t address) {
+    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((Width - 1u) & 3u) << 30u), ((Width - 1u) >> 2u) | ((Height - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
+}
 
 // What `run` wrote to the standard error stream, which gets it afterwards as well.
 std::string Captured(const std::function<void()>& run) {
@@ -166,13 +173,16 @@ struct Scene {
         vertex = ShaderRecompiler::Recompile(request);
     }
 
-    Pass Draw(const Step& step) {
+    const ShaderRecompiler::RecompileResult& Compile(const Step& step) {
         std::vector<std::uint32_t> userData(12, 0u);
         if (step.code.data() == BufferStoreCode.data()) {
             userData[4] = static_cast<std::uint32_t>(step.address);
             userData[5] = static_cast<std::uint32_t>((step.address >> 32u) & 0xffffu);
             userData[6] = 64u;
             userData[7] = 0x31016facu;
+        } else if (step.code.data() == DepthReadCode.data()) {
+            const auto descriptor = DepthDescriptor(step.address);
+            std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
         } else {
             userData[8] = static_cast<std::uint32_t>(step.address);
             userData[9] = static_cast<std::uint32_t>(step.address >> 32u);
@@ -188,6 +198,13 @@ struct Scene {
         request.useCache = false;
         const auto& program = programs.emplace_back(ShaderRecompiler::Recompile(request));
         Require(program.bdaWrites == (step.code.data() == AddressStoreCode.data()), "draw pass: the compiled program misstates whether it stores through an address");
+        return program;
+    }
+
+    Pass Draw(const Step& step) { return Draw(Compile(step), step.left); }
+
+    Pass Draw(const ShaderRecompiler::RecompileResult& program, std::uint32_t left, const AgcDriver::Graphics::DepthTarget* depth = nullptr, bool depthWrite = false, float maxDepth = 1.0f) {
+        const auto vertexPush = AgcDriver::Graphics::StagePushOffset(static_cast<std::uint32_t>(vertex.pushConstants.size()), ShaderStage::Fragment, device.GraphicsPipelineLibraries());
         const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0}, {ShaderStage::Fragment, &program, vertexPush}}};
         AgcDriver::Graphics::State state{};
         state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
@@ -197,8 +214,15 @@ struct Scene {
         state.renderExtent = {Width, Height};
         state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
+        if (depth != nullptr) {
+            state.depth = *depth;
+            state.depthTest = true;
+            state.depthWrite = depthWrite;
+            state.depthCompare = VK_COMPARE_OP_ALWAYS;
+            state.viewport.maxDepth = maxDepth;
+        }
         state.negativeOneToOne = false;
-        state.scissor = {{static_cast<std::int32_t>(step.left), 0}, {Width - step.left, Height}};
+        state.scissor = {{static_cast<std::int32_t>(left), 0}, {Width - left, Height}};
         state.cullMode = VK_CULL_MODE_NONE;
         state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         state.blend.colorWriteMask = 15;
@@ -237,6 +261,52 @@ struct Scene {
     }
 };
 
+void CheckDepthSampling(AgcDriver::VulkanDevice& device, std::size_t targetBytes, std::size_t allocationBytes) {
+    GuestBlock target(allocationBytes, allocationBytes);
+    GuestBlock depth(BlockBytes, BlockBytes);
+    Scene scene(device, target, targetBytes);
+    const AgcDriver::Graphics::DepthTarget attachment{depth.Address(), 0u, {Width, Height}, VK_FORMAT_D32_SFLOAT, 1.0f, 0u};
+    const auto& white = scene.Compile({WhiteCode, 0u, 0u});
+    const auto& sample = scene.Compile({DepthReadCode, depth.Address(), 0u});
+    const auto descriptor = DepthDescriptor(depth.Address());
+    const auto imageBindings = std::count_if(sample.bindings.begin(), sample.bindings.end(), [](const auto& binding) {
+        return (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage || binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) && std::any_of(binding.guestDescriptor.begin(), binding.guestDescriptor.end(), [](auto word) { return word != 0u; });
+    });
+    const bool directDepth = imageBindings == 1 && std::any_of(sample.bindings.begin(), sample.bindings.end(), [&](const auto& binding) {
+        return binding.kind == ShaderRecompiler::DescriptorKind::SampledImage && binding.role == ShaderRecompiler::DescriptorRole::GuestImages && binding.count == 1 && binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && binding.guestDescriptor == std::vector<std::uint32_t>(descriptor.begin(), descriptor.end());
+    });
+    std::array<Pass, 4> passes{};
+    try {
+        scene.Draw(white, 0, &attachment, true);
+        scene.Draw(white, 0, &attachment, false);
+        scene.Draw(sample, 0, &attachment, false);
+        device.WaitIdle();
+        passes = {scene.Draw(white, 0, &attachment, true, 0.0f), scene.Draw(white, 0, &attachment, false, 0.0f), scene.Draw(sample, 0, &attachment, false, 0.0f), scene.Draw(sample, Width / 2, &attachment, false, 0.0f)};
+        AgcDriver::Graphics::StorageTexture::FlushPending(scene.color.address, scene.color.bytes, nullptr, "depth sample pass test");
+        device.WaitIdle();
+    } catch (...) {
+        device.WaitIdle();
+        throw;
+    }
+    std::vector<std::uint32_t> pixels(Width * Height);
+    AgcDriver::Graphics::ReadColorTarget(scene.color, std::as_writable_bytes(std::span(pixels)));
+    const bool pixelsMatch = std::all_of(pixels.begin(), pixels.end(), [](auto pixel) { return pixel == 0u; });
+    const auto name = [](Pass pass) { return pass == Pass::Begun ? "begun" : pass == Pass::Continued ? "continued" : "synchronous"; };
+    std::printf("depth sample passes: %s/%s/%s/%s; direct2D=%s; pixels=%s\n", name(passes[0]), name(passes[1]), name(passes[2]), name(passes[3]), directDepth ? "yes" : "no", pixelsMatch ? "zero" : "mismatch");
+    if (!directDepth) {
+        for (const auto& binding : sample.bindings) {
+            std::printf("depth sample binding: kind=%u count=%u shape=%d words=", static_cast<unsigned>(binding.kind), binding.count, binding.imageShape ? static_cast<int>(*binding.imageShape) : -1);
+            for (const auto word : binding.guestDescriptor) std::printf("%08x ", word);
+            std::putchar('\n');
+        }
+    }
+    Require(directDepth, "depth sample: the fragment binding is not the direct 2D depth descriptor");
+    Require(passes[0] == Pass::Begun && passes[1] == Pass::Continued, "depth sample: disabling depth writes alone did not continue the producer pass");
+    Require(passes[2] == Pass::Begun, "depth sample: sampling the depth attachment continued its producer pass");
+    Require(passes[3] == Pass::Continued, "depth sample: consecutive read-only consumers did not share a render pass");
+    Require(pixelsMatch, "depth sample: the read-only consumer did not read the producer's zero depth");
+}
+
 }
 
 int main() {
@@ -261,7 +331,7 @@ int main() {
         auto passes = scene.Run(std::array<Step, 3>{{{read, one, 0}, {read, zero, Width / 2}, {read, one, Width * 3 / 4}}}, faults);
         if (passes[0] == Pass::Synchronous) {
             std::puts("draws are not recorded on this device: render passes of draws that read by address not tested");
-            return 0;
+            return VulkanTestSkipped;
         }
         Require(passes == Passes{Pass::Begun, Pass::Continued, Pass::Continued}, "draw pass: consecutive draws that read by address did not share one render pass");
         Require(faults.empty(), "draw pass: draws that read mapped memory reported a fault");
@@ -291,6 +361,7 @@ int main() {
         Require(passes == Passes{Pass::Begun, Pass::Continued}, "draw pass: a draw and the faulting one after it did not share one render pass");
         Require(faults == std::vector<std::uint64_t>{unmapped + 8u}, "draw pass: the fault of the second draw of a pass was not reported once, for its address");
         Require(scene.Holds(0, Width / 2, 0u), "draw pass: the draw before a faulting one did not draw what it read");
+        CheckDepthSampling(*device, layout.Bytes(), targetBytes);
         std::puts("draw pass address reads tests passed");
         return 0;
     } catch (const std::exception& error) {

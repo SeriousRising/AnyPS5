@@ -2687,12 +2687,16 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, DrawSnapshotReuse* reuse) {
+    if (use != SnapshotUse::Storage) reuse = nullptr;
+    if (reuse != nullptr) *reuse = {};
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
+    if (reuse != nullptr) reuse->kind = DrawSnapshotReuseKind::Unchanged;
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
-        if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
+        if (reuse != nullptr) reuse->kind = DrawSnapshotReuseKind::Invalidated;
+        if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes, reuse)) {
             eraseDrawSnapshot(found);
             return {};
         }
@@ -2704,7 +2708,7 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     return found->second.buffer;
 }
 
-bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
+bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes, DrawSnapshotReuse* reuse) {
     const auto held = entry.buffer->Bytes();
     if (held.size() != bytes || bytes == 0) return false;
     constexpr std::uint64_t block = 65536;
@@ -2743,11 +2747,18 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (equal[k] != 0) continue;
         const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - held.data());
         const auto length = spans[k].bytes;
-        if (!sole) return false;
+        if (!sole) {
+            if (reuse != nullptr) reuse->kind = DrawSnapshotReuseKind::Held;
+            return false;
+        }
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
     }
-    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+    if (reuse != nullptr) reuse->kind = differing.empty() ? DrawSnapshotReuseKind::Equal : DrawSnapshotReuseKind::Patched;
+    for (const auto& [offset, length] : differing) {
+        std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+        if (reuse != nullptr) reuse->patchedBytes += length;
+    }
     return true;
 }
 

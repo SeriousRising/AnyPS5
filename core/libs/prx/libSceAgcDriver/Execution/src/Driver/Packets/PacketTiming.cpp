@@ -15,6 +15,9 @@ PacketTimer::~PacketTimer() {
     if (queue == 0) GuestMemory::HitchPacketEnd(key == 0xffffu ? GuestMemory::HitchFlipKind : key, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()));
     if (now - profile.lastReport < std::chrono::seconds(10)) return;
     profile.lastReport = now;
+    const auto& timestamps = profile.timestamps;
+    AgcDriver::ProfilePrint_nid_no_patch("[packet-timestamps] queue 0x%x decoded (10 s): release_mem %llu, release_clock %llu, release_clock_writes %llu, copy_data %llu, copy_clock %llu; release_eop %llu, release_cs %llu, release_ps %llu, release_other %llu, first_other_event 0x%x\n", queue, static_cast<unsigned long long>(timestamps.releaseMem), static_cast<unsigned long long>(timestamps.releaseClock), static_cast<unsigned long long>(timestamps.releaseClockWrites), static_cast<unsigned long long>(timestamps.copyData), static_cast<unsigned long long>(timestamps.copyClock), static_cast<unsigned long long>(timestamps.releaseEop), static_cast<unsigned long long>(timestamps.releaseCs), static_cast<unsigned long long>(timestamps.releasePs), static_cast<unsigned long long>(timestamps.releaseOther), timestamps.firstOtherEvent);
+    profile.timestamps = {};
     std::vector<std::pair<std::uint32_t, std::pair<std::uint64_t, double>>> hot(profile.byOpcode.begin(), profile.byOpcode.end());
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
     std::string report;

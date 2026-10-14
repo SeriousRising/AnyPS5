@@ -40,7 +40,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 std::vector<std::uint32_t> RecompileProgram(std::span<const std::uint32_t> code) {
-    const std::array<std::uint32_t, 7> capabilities{spv::CapabilityShader, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses};
+    const std::array<std::uint32_t, 8> capabilities{spv::CapabilityShader, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
     const std::array<std::uint32_t, 4> userData{0x10000000u, 0u, 0x40u, 0x31016facu};
     const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     RecompileRequest request{};
@@ -102,7 +102,7 @@ Shape Scan(std::span<const std::uint32_t> words) {
     return shape;
 }
 
-IrProgram TranslateStage(ShaderStageKind stage, std::uint32_t waveSize, std::uint32_t base = 0u, std::uint32_t fetchStart = 0u, std::uint32_t fetchCount = 0u) {
+IrProgram TranslateStage(ShaderStageKind stage, std::uint32_t waveSize, std::uint32_t base = 0u, std::uint32_t fetchStart = 0u, std::uint32_t fetchCount = 0u, bool indexedWrites = false) {
     ShaderComputeInputInfo compute{};
     compute.threadIdsNum = 3;
     compute.threadsNum[0] = waveSize;
@@ -129,6 +129,7 @@ IrProgram TranslateStage(ShaderStageKind stage, std::uint32_t waveSize, std::uin
         vertex.resourcesDst[0] = {static_cast<int>(fetchStart), static_cast<int>(fetchCount), 0, 0u};
     }
     code.push_back(0x7e008700u | base);
+    if (indexedWrites) code.push_back(0x7e008500u | (base << 17u));
     code.push_back(EndProgram);
     const auto decoded = RdnaInstructionDecoder{}.Decode(code);
     if (fetchCount != 0u) {
@@ -149,9 +150,10 @@ IrProgram TranslateStage(ShaderStageKind stage, std::uint32_t waveSize, std::uin
     return InstructionTranslator{}.Translate(decoded, graph, options);
 }
 
-void RequireWindow(const IrProgram& program, std::uint32_t base, std::uint32_t limit, std::span<const std::uint32_t> initialized) {
+void RequireWindow(const IrProgram& program, std::uint32_t base, std::uint32_t limit, std::span<const std::uint32_t> initialized, bool indexedWrites = false) {
     Require(program.Metadata().vectorWindowBase == base && program.Metadata().vectorWindowSize == limit - base, "relative window does not include exactly the initialized stage registers");
-    std::array<bool, NumVectorRegs> stored{};
+    Require(program.Metadata().vectorWindowIndexedWrites == indexedWrites, "relative window indexed-write classification is incorrect");
+    std::array<bool, NumVectorRegs> stored{}, ssa{};
     for (const auto* instruction : program.BlockOrder().front()->Instructions()) {
         if (instruction->Opcode() == IrOpcode::StoreVectorWindow) {
             Require(instruction->Argument(0)->HasImmediate(), "stage input uses a dynamic window index");
@@ -160,11 +162,15 @@ void RequireWindow(const IrProgram& program, std::uint32_t base, std::uint32_t l
             stored[index] = true;
         } else if (instruction->Opcode() == IrOpcode::SetVectorRegister) {
             const auto index = instruction->Argument(0)->Register().index;
-            Require(index < base, "stage input escaped the relative window into SSA");
-            stored[index] = true;
+            Require(index < limit, "stage input lies past the initialized register limit");
+            Require(!indexedWrites || index < base, "indexed window has a potentially stale SSA register");
+            ssa[index] = true;
         }
     }
-    for (const auto index : initialized) Require(stored[index], "stage input v" + std::to_string(index) + " was not initialized");
+    for (const auto index : initialized) {
+        if (index >= base) Require(stored[index], "stage input v" + std::to_string(index) + " was not mirrored into the window");
+        if (index < base || !indexedWrites) Require(ssa[index], "stage input v" + std::to_string(index) + " was not initialized in SSA");
+    }
     bool bounded = false;
     for (const auto& block : program.Blocks()) {
         for (const auto* instruction : block->Instructions()) {
@@ -200,6 +206,10 @@ bool StageInputs() {
     stage("tessellation evaluation", ShaderStageKind::TessellationEvaluation, 9u, {0u, 5u, 6u, 7u, 8u});
     stage("mesh", ShaderStageKind::Mesh, 9u, {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u});
     stage("pixel", ShaderStageKind::Pixel, 16u, {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u});
+    passed &= RunStage("indexed-write control", [] {
+        const std::array<std::uint32_t, 3> initialized{0u, 1u, 2u};
+        for (const auto wave : {32u, 64u}) RequireWindow(TranslateStage(ShaderStageKind::Compute, wave, 0u, 0u, 0u, true), 0u, 3u, initialized, true);
+    });
     passed &= RunStage("SSA prefix", [] {
         const std::array<std::uint32_t, 3> local{2u, 3u, 5u};
         const std::array<std::uint32_t, 2> vertex{5u, 8u};
@@ -269,6 +279,18 @@ int main(int argc, char** argv) {
         const std::array<std::uint32_t, 7> code{MoveV4One, MoveV5Two, MoveV6Four, MoveV1V5, 0xe0700000u, 0x80000100u, EndProgram};
         const auto shape = Scan(RecompileProgram(code));
         return shape.functionArrays == 0 && shape.accessChains == 0;
+    });
+
+    passed &= run("a descriptor spilled into lanes survives a relative-read-only window", [] {
+        const std::array<std::uint32_t, 22> code{
+            0x7e080280u, 0xd7610004u, 0x00010000u, 0xd7610004u, 0x00010201u,
+            0xd7610004u, 0x00010402u, 0xd7610004u, 0x00010603u,
+            MoveM0GroupX, 0x7e0a8704u,
+            0xd7600000u, 0x00010104u, 0xd7600001u, 0x00010304u,
+            0xd7600002u, 0x00010504u, 0xd7600003u, 0x00010704u,
+            0xe0700000u, 0x80000500u, EndProgram
+        };
+        return !RecompileProgram(code).empty();
     });
 
     if (passed) std::puts("Vector window shape and SSA control tests passed");

@@ -84,13 +84,19 @@ struct ShadowedRange {
     std::shared_ptr<ShadowSlab> slab;
 };
 
+struct UploadShadowObservation {
+    enum class Coverage : std::uint8_t { Unobserved, Uncovered, MultipleSlabs, SingleFreshSlab };
+    Coverage coverage = Coverage::Unobserved;
+    std::uint64_t publishedBytes = 0;
+};
+
 // Records vkCmdCopyBuffer(slab -> import) for every fresh unpublished unit the scope selects over
 // [address, address + bytes) into the active recorder's open batch (a waited CommandBatch without
 // one), with the barriers, the pending-write note and the timing class of a fill; marks them
 // published, clears stale ones. Returns the units copied. Inside a completion action a store's
 // publish records nothing (the store's own stamp makes the unit stale; a recorded publish would land
 // over the store later).
-std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason);
+std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason, UploadShadowObservation* observation = nullptr);
 // No GpuMutex, no tracker: conservative (a unit with a generation and no publish counts), for
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);

@@ -350,6 +350,10 @@ void AddressSiteTests() {
         {"main", calls({42, 42, 44, 43, 45, 45, 45, 46, 47, 48, 41})}}));
     Require(sites.reads == 3 && sites.byteReads == 4 && sites.stores == 2, "address-based sites were counted as " + std::to_string(sites.reads) + "/" + std::to_string(sites.byteReads) + "/" + std::to_string(sites.stores) + ", expected 3/4/2");
     Require(AgcDriver::Graphics::ProgramAddressSites(NamedModule({{"helper", calls({41})}, {"main", calls({40})}})) == AgcDriver::Graphics::Recorder::AddressSites{}, "calls of other functions were counted as address-based sites");
+    for (const auto name : {"read_bda_direct_dword", "read_bda_direct_dword_stop", "read_bda_direct_dword_coherent", "read_bda_direct_dword_stop_coherent"}) {
+        const auto direct = AgcDriver::Graphics::ProgramAddressSites(NamedModule({{"read_bda_dword_bytes", {}}, {name, calls({40})}, {"main", calls({41})}}));
+        Require(direct == AgcDriver::Graphics::Recorder::AddressSites{1, 0, 0}, "a direct dword helper or its internal byte fallback was counted incorrectly");
+    }
     // A compute module's shape: the local size, and the loops, image accesses and atomics outside the helpers.
     constexpr std::uint32_t loop = (4u << 16u) | 246u, fetch = (5u << 16u) | 95u, sample = (5u << 16u) | 87u, gather = (6u << 16u) | 96u, imageRead = (5u << 16u) | 98u, imageWrite = (4u << 16u) | 99u, atomicAdd = (7u << 16u) | 234u, atomicLoad = (6u << 16u) | 227u, localSize = (6u << 16u) | 16u;
     const std::vector<std::uint32_t> looping{loop, 1, 2, 0, atomicAdd, 30, 61, 4, 5, 6, 7};

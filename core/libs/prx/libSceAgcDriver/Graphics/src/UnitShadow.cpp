@@ -290,7 +290,7 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
 }
 
 // The publish of one shadow: `selected[k]` (k = unit - first) names the units the scope chose.
-std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason) {
+std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason, UploadShadowObservation* observation = nullptr, bool observeCoverage = false) {
     auto& registry = Registry();
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -313,13 +313,24 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const auto walkBegin = std::max(shadow->UnitBegin(walkFirst), shadow->importBase);
         const auto walkEnd = std::min(shadow->UnitBegin(walkLast + 1), shadow->ImportEnd());
         if (walkEnd > walkBegin) GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+        observeCoverage = observeCoverage && walkFirst == first && walkLast == last && walkEnd > walkBegin;
     }
     {
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
         changedUnits(*shadow, first, last, changed, cpu);
+        const ShadowSlab* observedSlab = nullptr;
+        if (observeCoverage) observation->coverage = UploadShadowObservation::Coverage::SingleFreshSlab;
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
+            if (observeCoverage) {
+                const auto* slab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())].get();
+                if (shadow->generation[unit] == 0 || changed[k] != GuestMemory::BlockUnchanged || slab == nullptr) observation->coverage = UploadShadowObservation::Coverage::Uncovered;
+                else if (observation->coverage != UploadShadowObservation::Coverage::Uncovered) {
+                    if (observedSlab != nullptr && observedSlab != slab) observation->coverage = UploadShadowObservation::Coverage::MultipleSlabs;
+                    observedSlab = slab;
+                }
+            }
             if (!selected[k] || !shadow->Live(unit)) continue;
             if (changed[k] == GuestMemory::BlockWritten) {
                 // Newer bytes reached the import since the retile: the slab's are dead.
@@ -351,6 +362,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         }
         shadow->Recount();
     }
+    if (observation != nullptr) observation->publishedBytes += bytes;
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
@@ -363,7 +375,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     return units;
 }
 
-std::size_t publishRange(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t address, std::uint64_t end, PublishScope scope, PublishReason reason) {
+std::size_t publishRange(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t address, std::uint64_t end, PublishScope scope, PublishReason reason, UploadShadowObservation* observation = nullptr, bool observeCoverage = false) {
     const auto begin = std::max(address, shadow->importBase);
     const auto stop = std::min(end, shadow->ImportEnd());
     if (stop <= begin || shadow->liveUnits == 0) return 0;
@@ -378,7 +390,7 @@ std::size_t publishRange(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         selected[static_cast<std::size_t>(unit - first)] = 1;
         any = true;
     }
-    return any ? publishUnits(shadow, first, last, selected, reason) : 0;
+    return any ? publishUnits(shadow, first, last, selected, reason, observation, observeCoverage) : 0;
 }
 
 // Frees the least recently used unpinned slab of any shadow after publishing its fresh units; false
@@ -469,7 +481,8 @@ ShadowSlabPin::~ShadowSlabPin() {
     slab->pins.fetch_sub(1, std::memory_order_relaxed);
 }
 
-std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason) {
+std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason, UploadShadowObservation* observation) {
+    if (observation != nullptr) *observation = {};
     if (!UnitShadowEnabled() || scope == PublishScope::None || bytes == 0) return 0;
     if (Recorder::InCompletion() && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Store) {
         // The store's own stamp makes the unit stale; a publish recorded now would land over the
@@ -484,8 +497,9 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
         std::lock_guard lock(registry.mutex);
         shadows = overlapping(registry, address, end);
     }
+    const bool observeCoverage = observation != nullptr && scope == PublishScope::Whole && reason == PublishReason::Upload && bytes <= std::numeric_limits<std::uint64_t>::max() - address && shadows.size() == 1 && shadows.front()->importBase <= address && shadows.front()->ImportEnd() >= end;
     std::size_t units = 0;
-    for (const auto& shadow : shadows) units += publishRange(shadow, address, end, scope, reason);
+    for (const auto& shadow : shadows) units += publishRange(shadow, address, end, scope, reason, observation, observeCoverage);
     return units;
 }
 

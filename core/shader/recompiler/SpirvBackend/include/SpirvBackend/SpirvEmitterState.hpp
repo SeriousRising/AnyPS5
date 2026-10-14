@@ -136,6 +136,7 @@ struct SpirvEmitterState {
     bool nativeF16ModesEmitted = false;
     std::uint32_t dot2F32F16Function = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
+    std::array<std::array<std::uint32_t, 2>, 2> bdaDirectDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;

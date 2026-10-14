@@ -47,6 +47,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -644,22 +645,24 @@ void unchangedSinceTests() {
     ReleaseWatched(block, bytes);
 }
 
-// (9) ProvedClearKeys: a surface's DCC keys are scanned once and answered from the proof after,
-// until the key range is stamped (a GPU key store's MarkWritten) or the CPU writes it; a scan made
-// while recorded work still writes the keys is not kept. With APS5_NO_KEY_FAST_PATH=1 every call
-// scans and no proof is stored.
 void keyProofTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t bytes = 65536;
     void* block = AllocateWatched(bytes, bytes);
     if (block == nullptr) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "required key proof fixture has no write-watched memory");
         std::cout << "no write watching: key proofs not tested\n";
         return;
     }
     struct Release {
         void* block;
-        ~Release() { ReleaseWatched(block, bytes); }
-    } release{block};
+        Recorder& recorder;
+        ~Release() {
+            try { recorder.Sync(); }
+            catch (...) { std::terminate(); }
+            ReleaseWatched(block, bytes);
+        }
+    } release{block, recorder};
     constexpr std::size_t keyCount = 1024;
     constexpr std::uint64_t surfaceBytes = keyCount * 256;
     auto* keys = static_cast<std::uint8_t*>(block);
@@ -699,15 +702,16 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     before = KeyProofCounts();
     Require(before.scanned == after.scanned + 1 && proof.keys == DccKeys::Clear0001, "(9) the CPU write did not make a scan");
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the new keys were not proved");
-    // A recorded write over the keys (noted and stamped as the driver's key stores are): the scans
-    // are not kept until its batch signaled.
     recorder.NotePendingWrite(address, keyCount);
     MarkWritten(address, keyCount);
     before = KeyProofCounts();
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a scan under a pending write was kept");
-    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation == 0, "(9) a second scan under a pending write was kept");
+    const auto completedKeys = ProvedClearKeys(resource, surfaceBytes, proof);
+    const bool completed = !recorder.PendingWriteOverlaps(address, keyCount);
+    recorder.Sync();
+    Require(completedKeys == DccKeys::Clear0001 && completed && proof.generation != 0, "(9) the key read did not complete its pending writer before proving keys");
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) completed keys were not proved");
     after = KeyProofCounts();
-    Require(after.scanned == before.scanned + 2 && after.unstable == before.unstable + 2 && after.proved == before.proved, "(9) unstable scans were miscounted");
+    Require(after.scanned == before.scanned + 1 && after.unstable == before.unstable && after.proved == before.proved + 1, "(9) completed key scans were miscounted");
     recorder.Submit();
     device.WaitQueue();
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && proof.generation != 0, "(9) a signaled write kept the scan unstable");
@@ -1546,9 +1550,13 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
         const auto original = updates.calls.front();
         Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
+        std::array<ShaderResources::DrawSnapshotExtents, 2> extents;
         for (std::size_t allocation = 0; allocation < 2; ++allocation) {
             const ShaderResources::MovedBuffer moved{allocation, 0, 16, {5, 6, 7, 8}};
-            const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            extents[allocation] = {7, 11, 13, 17};
+            extents[allocation].reuse.Add(8, {DrawSnapshotReuseKind::Patched, 4});
+            extents[allocation].reuse.Add(7, {});
+            const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1), &extents[allocation]);
             Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
             Require(updates.calls.size() == allocation + 2 && updates.copies == 0, "draw descriptors copied GPU memory or needed multiple updates");
             const auto& actual = updates.calls.back();
@@ -1564,46 +1572,80 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
             }
         }
         snapshots.Sync();
+        Require(std::all_of(extents.begin(), extents.end(), [](const auto& value) { return value.selectedViews == 0 && value.selectedBytes == 0 && value.capImportViews == 0 && value.capImportBytes == 0 && value.reuse == DrawSnapshotReuseCensus{}; }), "metadata snapshot extents were not reset or counted as guest input");
     }
     recorder.Activate();
+    std::cout << "Draw input extents metadata exclusion exercised\n";
 }
 
-void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
-    const auto& context = device.GetContext();
-    constexpr std::size_t bytes = 65536;
-    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
-    if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: draw snapshot reuse not tested\n";
-        return;
-    }
-    struct Release {
-        void* block;
-        ~Release() { ReleaseWatched(block, bytes); }
-    } release{block};
-    std::memset(block, 0x11, bytes);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true, true);
-    }
-    struct Unregister {
-        const Context& context;
-        void* block;
-        ~Unregister() {
+struct SnapshotGuestBlock {
+    const Context& context;
+    Recorder& recorder;
+    std::size_t bytes;
+    void* block = nullptr;
+    std::int64_t physical = -1;
+    ~SnapshotGuestBlock() {
+        recorder.Sync();
+        if (block != nullptr) {
             {
                 GuestAllocations::Mutation mutation;
                 mutation.Remove(block);
             }
             HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Add(block, bytes, true, true, true);
+            }
+            sceKernelMunmap(block, bytes);
         }
-    } unregister{context, block};
-    if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
-        return;
+        if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
     }
+};
+
+void requireSnapshotReuse(const ShaderResources::DrawSnapshotExtents& extents, DrawSnapshotReuseKind kind, std::size_t bytes, std::size_t patchedBytes) {
+    DrawSnapshotReuseCensus expected;
+    expected.Add(bytes, {kind, patchedBytes});
+    Require(extents.selectedViews == 1 && extents.selectedBytes == bytes && extents.capImportViews == 0 && extents.capImportBytes == 0 && extents.reuse == expected, "snapshot reuse census does not match its actual transition");
+}
+
+void drawSnapshotCensusArithmeticTests() {
+    DrawSnapshotReuseCensus first;
+    for (std::size_t i = 0; i < DrawSnapshotReuseCensus::Kinds; ++i) first.Add(8, {static_cast<DrawSnapshotReuseKind>(i), i == 5 ? 4u : 0u});
+    first.Add(7, {DrawSnapshotReuseKind::Patched, 7});
+    DrawSnapshotReuseCensus total;
+    total.Add(first);
+    total.Add(first);
+    Require(total.views == std::array<std::uint64_t, 6>{2, 2, 2, 2, 2, 2} && total.bytes == std::array<std::uint64_t, 6>{16, 16, 16, 16, 16, 16}, "census category merge is wrong");
+    Require(total.oddViews == 2 && total.oddBytes == 14 && total.patchedBytes == 8, "census odd gate or patched-byte accounting is wrong");
+    total = {};
+    Require(total == DrawSnapshotReuseCensus{}, "census window reset retained counts");
+    std::cout << "Draw snapshot census arithmetic exercised\n";
+}
+
+bool drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    if (context.hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "host imports or write watching unavailable: draw snapshot reuse not tested\n";
+        return false;
+    }
+    SnapshotGuestBlock release{context, recorder, bytes};
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 65536, 0, &release.physical) == 0, "cannot allocate snapshot direct memory");
+    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, 65536) == 0, "cannot map snapshot direct memory");
+    void* block = release.block;
+    Require(block != nullptr, "snapshot direct mapping is null");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::memset(block, 0x11, bytes);
+    const auto* imported = HostImportFor(context, address, bytes);
+    if (imported == nullptr) {
+        std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
+        return false;
+    }
+    Require(imported->base == address && imported->bytes == bytes, "snapshot direct import changed its logical extent");
     if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "host imports are compared, not watched: draw snapshot reuse not tested\n";
-        return;
+        return false;
     }
     const auto element = address + 4096;
     constexpr std::size_t elementBytes = 1024;
@@ -1625,79 +1667,83 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
-        const auto snapshot = [&](std::byte expected) {
-            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        struct Drain {
+            Recorder& recorder;
+            ~Drain() { recorder.Sync(); recorder.FlushDeferredReleases(); }
+        } drain{snapshotRecorder};
+        DrawSnapshotReuseCensus total;
+        const auto snapshot = [&](std::byte expected, DrawSnapshotReuseKind kind) {
+            ShaderResources::DrawSnapshotExtents extents;
+            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &extents);
+            requireSnapshotReuse(extents, kind, elementBytes, 0);
+            total.Add(extents.reuse);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             const auto buffer = bindings->snapshots[0].buffer;
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
         };
-        const auto first = snapshot(std::byte{0x11});
-        Require(snapshot(std::byte{0x11}) == first, "an unchanged draw input was copied again");
+        const auto first = snapshot(std::byte{0x11}, DrawSnapshotReuseKind::Cold);
+        Require(snapshot(std::byte{0x11}, DrawSnapshotReuseKind::Unchanged) == first, "an unchanged draw input was copied again");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
-        const auto afterCpu = snapshot(std::byte{0x22});
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto afterCpu = snapshot(std::byte{0x22}, DrawSnapshotReuseKind::Held);
         Require(afterCpu != first, "a draw snapshot outlived a CPU store to its range");
-        Require(snapshot(std::byte{0x22}) == afterCpu, "the recopied draw input was not kept");
+        Require(snapshot(std::byte{0x22}, DrawSnapshotReuseKind::Unchanged) == afterCpu, "the recopied draw input was not kept");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         AgcDriver::GuestMemory::MarkWritten(element, 4);
-        const auto afterStore = snapshot(std::byte{0x33});
+        const auto afterStore = snapshot(std::byte{0x33}, DrawSnapshotReuseKind::Held);
         Require(afterStore != afterCpu, "a draw snapshot outlived a driver store to its range");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
-        Require(snapshot(std::byte{0x33}) == afterStore, "a CPU store of the same bytes made the draw input copy again");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(snapshot(std::byte{0x33}, DrawSnapshotReuseKind::Equal) == afterStore, "a CPU store of the same bytes made the draw input copy again");
         AgcDriver::GuestMemory::MarkWritten(element, 4);
-        Require(snapshot(std::byte{0x33}) == afterStore, "a driver store of the same bytes made the draw input copy again");
+        Require(snapshot(std::byte{0x33}, DrawSnapshotReuseKind::Equal) == afterStore, "a driver store of the same bytes made the draw input copy again");
         reinterpret_cast<std::uint8_t*>(element)[elementBytes - 1] = 0x34;
-        const auto tail = resources.PrepareDrawBindings(snapshotRecorder);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        ShaderResources::DrawSnapshotExtents tailExtents;
+        const auto tail = resources.PrepareDrawBindings(snapshotRecorder, {}, &tailExtents);
+        requireSnapshotReuse(tailExtents, DrawSnapshotReuseKind::Held, elementBytes, 0);
+        total.Add(tailExtents.reuse);
         Require(tail != nullptr && tail->snapshots.size() == 1 && tail->snapshots[0].buffer != afterStore && tail->snapshots[0].buffer->Bytes()[elementBytes - 1] == std::byte{0x34}, "a draw snapshot outlived a store that changed its last byte");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         {
             GuestAllocations::Mutation mutation;
         }
-        Require(snapshot(std::byte{0x33}) != afterStore, "a draw snapshot outlived a registry mutation");
+        Require(snapshot(std::byte{0x33}, DrawSnapshotReuseKind::Invalidated) != afterStore, "a draw snapshot outlived a registry mutation");
         snapshotRecorder.Sync();
+        Require(total.views == std::array<std::uint64_t, 6>{1, 1, 3, 2, 2, 0} && total.oddViews == 0 && total.patchedBytes == 0, "reuse census aggregate partition is wrong");
     }
     recorder.Activate();
+    std::cout << "Draw snapshot census reuse exercised: 9 views, cold 1, invalidated 1, held 3, unchanged 2, equal 2\n";
+    return true;
 }
 
-void drawSnapshotPatchTests(const Device& device) {
+bool drawSnapshotPatchTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
     std::unique_lock gpu(GpuMutex());
-    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
-    if (block == nullptr) {
+    if (context.hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) {
         std::cout << "host imports or write watching unavailable: snapshot patching not tested\n";
-        return;
+        return false;
     }
-    struct Release {
-        void* block;
-        ~Release() { ReleaseWatched(block, bytes); }
-    } release{block};
+    SnapshotGuestBlock release{context, recorder, bytes};
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 65536, 0, &release.physical) == 0, "cannot allocate snapshot direct memory");
+    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, 65536) == 0, "cannot map snapshot direct memory");
+    void* block = release.block;
+    Require(block != nullptr, "snapshot direct mapping is null");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
     auto* guest = static_cast<std::uint8_t*>(block);
     for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 13u + 5u);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true, true);
-    }
-    struct Unregister {
-        const Context& context;
-        void* block;
-        ~Unregister() {
-            {
-                GuestAllocations::Mutation mutation;
-                mutation.Remove(block);
-            }
-            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
-        }
-    } unregister{context, block};
-    if (HostImportFor(context, address, bytes) == nullptr) {
+    const auto* imported = HostImportFor(context, address, bytes);
+    if (imported == nullptr) {
         std::cout << "host import of the watched block refused: snapshot patching not tested\n";
-        return;
+        return false;
     }
+    Require(imported->base == address && imported->bytes == bytes, "snapshot direct import changed its logical extent");
     if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "host imports are compared, not watched: snapshot patching not tested\n";
-        return;
+        return false;
     }
     constexpr std::size_t elementOffset = 4096;
     constexpr std::size_t elementBytes = 3 * 65536;
@@ -1720,8 +1766,16 @@ void drawSnapshotPatchTests(const Device& device) {
     snapshotRecorder.Activate();
     {
         ShaderResources resources(snapshotContext, compute);
-        const auto snapshot = [&] {
-            auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        struct Drain {
+            Recorder& recorder;
+            ~Drain() { recorder.Sync(); recorder.FlushDeferredReleases(); }
+        } drain{snapshotRecorder};
+        DrawSnapshotReuseCensus total;
+        const auto snapshot = [&](DrawSnapshotReuseKind kind, std::size_t patchedBytes = 0) {
+            ShaderResources::DrawSnapshotExtents extents;
+            auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &extents);
+            requireSnapshotReuse(extents, kind, elementBytes, patchedBytes);
+            total.Add(extents.reuse);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             auto buffer = bindings->snapshots[0].buffer;
             const auto contents = buffer->Bytes();
@@ -1736,7 +1790,7 @@ void drawSnapshotPatchTests(const Device& device) {
             gpu.lock();
             Require(buffer.use_count() == 1, "a finished draw still holds its snapshot");
         };
-        std::weak_ptr<Buffer> first = snapshot();
+        std::weak_ptr<Buffer> first = snapshot(DrawSnapshotReuseKind::Cold);
         settle(first);
         guest[elementOffset + 10] ^= 0xffu;
         guest[elementOffset + 65536 + 300] ^= 0xffu;
@@ -1744,27 +1798,30 @@ void drawSnapshotPatchTests(const Device& device) {
         guest[elementOffset + elementBytes - 1] ^= 0x5au;
         AgcDriver::GuestMemory::BumpCollectEpoch();
         {
-            const auto patched = snapshot();
+            const auto patched = snapshot(DrawSnapshotReuseKind::Patched, 2 * 65536);
             Require(patched == first.lock(), "a stale snapshot nothing else holds was copied whole instead of patched");
         }
         settle(first);
         std::memset(guest + elementOffset + 65536, 0x77, 65536);
         AgcDriver::GuestMemory::BumpCollectEpoch();
         {
-            const auto patched = snapshot();
+            const auto patched = snapshot(DrawSnapshotReuseKind::Patched, 2 * 65536);
             Require(patched == first.lock(), "a snapshot whose whole middle block changed was not patched");
         }
         settle(first);
-        const auto held = snapshot();
+        const auto held = snapshot(DrawSnapshotReuseKind::Unchanged);
         Require(held == first.lock(), "an unchanged snapshot was not reused");
         const std::vector<std::byte> before(held->Bytes().begin(), held->Bytes().end());
         guest[elementOffset + 2 * 65536 + 100] ^= 0xffu;
         AgcDriver::GuestMemory::BumpCollectEpoch();
-        const auto fresh = snapshot();
+        const auto fresh = snapshot(DrawSnapshotReuseKind::Held);
         Require(fresh != held, "a snapshot a recorded draw still holds was patched");
         Require(std::memcmp(held->Bytes().data(), before.data(), before.size()) == 0, "a held snapshot's bytes changed");
         snapshotRecorder.Sync();
+        Require(total.views == std::array<std::uint64_t, 6>{1, 0, 1, 1, 0, 2} && total.patchedBytes == 4 * 65536 && total.oddViews == 0, "patch census aggregate partition is wrong");
     }
+    std::cout << "Draw snapshot census patch exercised: 5 views, cold 1, held 1, unchanged 1, patched 2, patched bytes 262144\n";
+    return true;
 }
 
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
@@ -1854,7 +1911,8 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
-        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        ShaderResources::DrawSnapshotExtents extents{7, 11, 13, 17};
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &extents);
         Require(bindings != nullptr, "read-only draw bindings were not prepared");
         Require(bindings->snapshots.size() == 1, "an input exceeding the draw snapshot cap was snapshotted");
         Require(bindings->snapshots[0].address == smallAddress, "the snapshotted input does not match the smaller buffer below the cap");
@@ -1871,6 +1929,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Require(inPlace[0] == std::byte{0x33} && std::all_of(inPlace, inPlace + largeBytes, [](std::byte value) { return value == std::byte{0x33}; }), "in-place bound input did not observe CPU write");
         std::memset(block, 0x11, bytes);
         snapshotRecorder.Sync();
+        Require(extents.selectedViews == 1 && extents.selectedBytes == smallBytes && extents.capImportViews == 1 && extents.capImportBytes == largeBytes, "individual snapshot cap extents are wrong or were not reset");
     }
     const auto firstAddress = address + 4096;
     constexpr std::size_t firstBytes = 600 * 1024;
@@ -1903,13 +1962,16 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, cumulativeCompute);
-        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+        ShaderResources::DrawSnapshotExtents extents{7, 11, 13, 17};
+        const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, {}, &extents);
         Require(bindings != nullptr, "read-only draw bindings were not prepared for cumulative test");
         Require(bindings->snapshots.size() == 1, "cumulative cap permitted both inputs to snapshot");
         Require(bindings->snapshots[0].address == firstAddress, "the earlier binding in the layout was not prioritised for the snapshot budget");
         snapshotRecorder.Sync();
+        Require(extents.selectedViews == 1 && extents.selectedBytes == firstBytes && extents.capImportViews == 1 && extents.capImportBytes == secondBytes, "cumulative snapshot cap extents are wrong or were not reset");
     }
     recorder.Activate();
+    std::cout << "Draw input extents individual and cumulative caps exercised\n";
 }
 
 void drawSnapshotEvictionTests(const Device& device) {
@@ -2136,48 +2198,55 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         return;
     }
     if (context.hostImportAlignment == 0) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "unit shadows require host imports");
         std::cout << "host imports unavailable: unit shadows not tested\n";
         return;
     }
     constexpr std::uint64_t unit = 65536;
     // Three slabs at the default 8 MiB: units 0..127, 128..255, 256..271.
     constexpr std::size_t bytes = (17u << 20u);
-    void* block = AllocateWatched(bytes, 65536);
-    Require(block != nullptr, "unit shadows are on without write watching");
     struct Release {
-        void* block;
-        ~Release() { ReleaseWatched(block, bytes); }
-    } release{block};
-    std::memset(block, 0x11, bytes);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true, true);
-    }
-    struct Unregister {
         const Context& context;
-        void* block;
-        std::uint64_t address;
-        bool armed = true;
-        ~Unregister() {
-            if (!armed) return;
-            {
-                GuestAllocations::Mutation mutation;
-                mutation.Remove(block);
+        Recorder& recorder;
+        void* block = nullptr;
+        std::int64_t physical = -1;
+        ~Release() {
+            recorder.Sync();
+            if (block != nullptr) {
+                {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(block);
+                }
+                HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+                recorder.Sync();
+                {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Add(block, bytes, true, true, true);
+                }
+                sceKernelMunmap(block, bytes);
             }
-            HostImportFor(context, address, bytes);
+            if (physical >= 0) sceKernelReleaseDirectMemory(physical, bytes);
         }
-    } unregister{context, block, address};
+    } release{context, recorder};
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, unit, 0, &release.physical) == 0, "allocate unit shadow backing");
+    Require(sceKernelMapDirectMemory(&release.block, bytes, 0x33, 0, release.physical, unit) == 0, "map unit shadow backing");
+    void* block = release.block;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    Require(block != nullptr && Watched(address, bytes), "the direct unit shadow allocation is not watched");
+    std::memset(block, 0x11, bytes);
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "unit shadow fixture host import was refused");
         std::cout << "host import of the shadow test block refused: unit shadows not tested\n";
         return;
     }
     if (!Watched(address, bytes)) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "unit shadow fixture import is not watched");
         std::cout << "host imports are compared, not watched: unit shadows not tested\n";
         return;
     }
     Require(import->base == address && import->bytes == bytes, "the import does not cover the block");
+    std::cout << "unit shadow fixture import: " << (import->dmaBuf ? "dma-buf" : import->alias != nullptr ? "shared alias" : "host pointer") << ", shared chunk " << (import->chunk != nullptr ? "yes" : "no") << ", watched\n";
     CollectWritesUncached(address, bytes);
     const auto* words = static_cast<const std::uint8_t*>(block);
     const auto unit3 = address + 3 * unit;
@@ -2228,12 +2297,25 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     // A whole publish: the untouched half keeps the seed (the import's bytes), the other the
     // retile's; the copy stamps nothing, and a second publish copies nothing.
     const auto pre = CollectWritesUncached(address, bytes);
-    Require(PublishShadow(unit3, unit, PublishScope::Whole, PublishReason::Hook) == 1, "the whole publish did not copy the unit");
+    using Coverage = UploadShadowObservation::Coverage;
+    UploadShadowObservation observation;
+    static_cast<void>(ShadowReport());
+    const auto pins = firstSlab->pins.load();
+    Require(PublishShadow(unit3 + 100, unit - 200, PublishScope::Whole, PublishReason::Upload, &observation) == 1, "the whole publish did not copy the unit");
+    Require(observation.coverage == Coverage::SingleFreshSlab && observation.publishedBytes == unit, "the upload observation missed fresh coverage or the whole edge-unit publication");
+    Require(firstSlab->pins.load() == pins && firstSlab->lastUse == Recorder::Presents(), "the observed publish changed slab pinning or last use");
+    Require(ShadowReport().find("published 1/0.1 by reason { upload 1/0.1 }") != std::string::npos, "the observed publish changed publication counters");
     Require(recorder.PendingWriteOverlaps(unit3, unit), "the publish noted no pending write");
     recorder.Sync();
     Require(words[3 * unit] == 0x22 && words[3 * unit + unit / 2 - 1] == 0x22 && words[3 * unit + unit / 2] == 0x11 && words[4 * unit - 1] == 0x11 && words[3 * unit - 1] == 0x11 && words[4 * unit] == 0x11, "the published bytes are wrong");
     Require(!AnyShadowedOverlaps(unit3, unit), "a published unit still counts as shadowed");
-    Require(PublishShadow(unit3, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a second publish copied the unit again");
+    const auto owners = firstSlab.use_count();
+    const auto lastUse = firstSlab->lastUse;
+    const auto idleCounters = ShadowReport();
+    Require(PublishShadow(unit3, unit, PublishScope::Whole, PublishReason::Upload, &observation) == 0, "a second publish copied the unit again");
+    Require(observation.coverage == Coverage::Unobserved && observation.publishedBytes == 0, "an all-published range was certified without collection");
+    Require(recorder.Idle() && recorder.OpenKeptBytes() == 0 && !recorder.PendingWriteOverlaps(unit3, unit), "an all-published observation recorded work or retained bytes");
+    Require(firstSlab.use_count() == owners && firstSlab->pins.load() == pins && firstSlab->lastUse == lastUse && ShadowReport() == idleCounters, "an all-published observation changed ownership, last use or counters");
     Require(UnchangedSince(unit3, unit, pre), "the publish stamped the unit");
     {
         // The published unit still reads from the slab (both hold the bytes).
@@ -2247,7 +2329,8 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(four.has_value() && four->seedUnits.empty() && four->slab == half->slab, "unit 4's destination is not in the same slab");
     retile(*four, unit4, unit, 0x44, false);
     Require(AnyShadowedOverlaps(unit3, unit) && AnyShadowedOverlaps(unit4, unit), "re-marked units are not shadowed");
-    Require(PublishShadow(unit3 + 100, static_cast<std::size_t>(2 * unit - 100), PublishScope::PartialUnits, PublishReason::Fill) == 1, "the partial publish did not copy exactly the partly covered unit");
+    Require(PublishShadow(unit3 + 100, static_cast<std::size_t>(2 * unit - 100), PublishScope::PartialUnits, PublishReason::Fill, &observation) == 1, "the partial publish did not copy exactly the partly covered unit");
+    Require(observation.coverage == Coverage::Unobserved && observation.publishedBytes == unit, "a partial-scope observation certified uncollected coverage or miscounted the publication");
     Require(!AnyShadowedOverlaps(unit3, unit) && AnyShadowedOverlaps(unit4, unit), "the partial publish copied the wrong unit");
     recorder.Sync();
     Require(words[3 * unit] == 0x33 && words[4 * unit - 1] == 0x33 && words[4 * unit] == 0x11, "the partial publish's bytes are wrong");
@@ -2255,7 +2338,8 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     // walk saw the store before it), copies nothing and drops it.
     static_cast<void>(CollectWritesUncached(unit4, unit));
     *static_cast<volatile std::uint8_t*>(static_cast<void*>(static_cast<std::uint8_t*>(block) + 4 * unit + 4096)) = 0x55;
-    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Hook) == 0, "a stale unit was published");
+    Require(PublishShadow(unit4, unit, PublishScope::Whole, PublishReason::Upload, &observation) == 0, "a stale unit was published");
+    Require(observation.coverage == Coverage::Uncovered && observation.publishedBytes == 0, "a CPU-stale unit was certified as fresh upload coverage");
     Require(!AnyShadowedOverlaps(unit4, unit), "a stale unit still counts as shadowed after its publish");
     recorder.Sync();
     Require(words[4 * unit + 4096] == 0x55 && words[4 * unit] == 0x11, "a stale unit's publish overwrote the CPU's bytes");
@@ -2310,6 +2394,7 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(words[2 * unit] == 0x99 && words[3 * unit - 1] == 0x99, "the retire did not publish the unit still registered");
     Require(words[5 * unit] == 0x88 && words[5 * unit + unit - 1] == 0x88, "the retire did not publish a unit covered by the old registration");
     Require(words[127 * unit] == 0x66 && words[128 * unit] == 0x77, "the retire did not publish the second slab's units covered by the old registration");
+    std::cout << "Unit shadow upload observation tests passed: fresh single slab, whole edge bytes, all-published, partial scope, CPU-stale\n";
 }
 
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
@@ -5411,6 +5496,13 @@ void pipelineLibraryTests(const Device& device) {
     state.samples = 1;
     state.colors.front().samples = 1;
     Require(lookup() != multisampled && counters().built == std::array<std::uint64_t, 4>{2, 2, 4, 4}, "the 1x pipeline after a 4x one built its libraries again");
+    state.depth = DepthTarget{0, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    state.depthTest = true;
+    state.depthCompare = VK_COMPARE_OP_LESS;
+    static_cast<void>(lookup());
+    Require(counters().built == std::array<std::uint64_t, 4>{2, 3, 5, 5}, "a depth target shared the shader libraries built with no depth format");
+    state.depth.reset();
+    state.depthTest = false;
     if ((context.sampleLocationSampleCounts & VK_SAMPLE_COUNT_4_BIT) != 0) {
         state.samples = 4;
         state.colors.front().samples = 4;
@@ -5479,6 +5571,11 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--key-proof-only") {
+            keyProofTests(device, recorder);
+            std::cout << "DCC key proof tests passed\n";
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--storage-upload-lifetime-only" || std::string_view(argv[1]) == "--storage-upload-failure-only")) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
             return 0;
@@ -5547,6 +5644,21 @@ int main(int argc, char** argv) {
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-reuse-census-only") {
+            drawSnapshotCensusArithmeticTests();
+            const bool reused = drawSnapshotReuseTests(device, recorder);
+            recorder.Sync();
+            gpu.unlock();
+            const bool patched = drawSnapshotPatchTests(device, recorder);
+            gpu.lock();
+            recorder.Activate();
+            if (!reused || !patched) {
+                Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "required snapshot census transitions were skipped");
+                return 77;
+            }
+            std::cout << "Draw snapshot reuse census tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-cap-only") {
             drawSnapshotCapTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";
@@ -5613,7 +5725,7 @@ int main(int argc, char** argv) {
         sampleDumpTests(device, recorder);
         gpu.unlock();
         hostImportUnmapTests(device, recorder);
-        drawSnapshotPatchTests(device);
+        drawSnapshotPatchTests(device, recorder);
         gpu.lock();
         recorder.Activate();
         std::cout << "Recorder read tracking and label tests passed\n";

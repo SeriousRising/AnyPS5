@@ -23,6 +23,8 @@ enum class LoadStatus {
 
 struct Counters {
     std::uint64_t hits = 0;
+    std::uint64_t specializedHits = 0;
+    std::uint64_t specializedLookups = 0;
     std::uint64_t misses = 0;
     std::uint64_t writes = 0;
     std::uint64_t loadFailures = 0;
@@ -34,6 +36,7 @@ struct Counters {
 [[nodiscard]] std::uint64_t SourceVersion();
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
+void BuildSpecializedKey(std::span<const std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, std::vector<std::byte>& key);
 
 [[nodiscard]] std::string EntryName(std::span<const std::byte> key);
 
@@ -42,12 +45,16 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
 
 [[nodiscard]] std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const CompiledVariant& variant);
 [[nodiscard]] LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant);
+[[nodiscard]] std::vector<std::byte> EncodeSpecializedEntry(std::span<const std::byte> key, const SharedSpirv& spirv);
+[[nodiscard]] LoadStatus DecodeSpecializedEntry(std::span<const std::byte> file, std::span<const std::byte> key, SharedSpirv& spirv);
 
 [[nodiscard]] bool Enabled();
 [[nodiscard]] std::filesystem::path EntryDirectory();
 
 [[nodiscard]] bool Load(std::span<const std::byte> key, CompiledVariant& variant);
 void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant);
+[[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, const SpirvTarget& target, SharedSpirv& spirv);
+void StoreSpecialized(std::vector<std::byte> key, SharedSpirv spirv);
 void Flush();
 [[nodiscard]] Counters Totals();
 

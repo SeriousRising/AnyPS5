@@ -3,6 +3,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <array>
 #include <bit>
+#include <limits>
 
 namespace ShaderRecompiler {
 
@@ -210,6 +211,20 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     return returns(result);
 }
 
+}
+
+std::uint32_t EmitBdaDirectDwordPointer(SpirvEmitterState& state, std::uint32_t address) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto leaf = EmitBdaDirectWalk(state, address);
+    const auto physical = Binary(state, spv::OpIAdd, u64, address, leaf.delta);
+    const auto fits = Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u32, leaf.offset, ConstantU32(state, 4u)), leaf.bytes);
+    const auto extent = Binary(state, spv::OpULessThanEqual, boolean, address, BdaConstant(state, std::numeric_limits<std::uint64_t>::max() - 4u));
+    const auto mapped = Binary(state, spv::OpINotEqual, boolean, physical, BdaConstant(state, 0u));
+    const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u));
+    const auto usable = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpLogicalAnd, boolean, fits, extent), Binary(state, spv::OpLogicalAnd, boolean, mapped, aligned));
+    return Select(state, u64, usable, physical, BdaConstant(state, 0u));
 }
 
 static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {

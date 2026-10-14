@@ -525,15 +525,13 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
-std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
-    auto source = SpecializeVertexInputTypes(artifact, classes);
+std::vector<std::uint32_t> buildSpecializedSpirv(std::span<const std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
         if (!supplied.emplace(constant.id, constant.value).second) throw std::runtime_error("duplicate prepared specialization ID");
     }
     std::map<std::uint32_t, std::uint32_t> values;
     std::set<std::uint32_t> specializedIds;
-    const auto& words = source.Words();
     if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid prepared specialization module");
     for (std::size_t cursor = 5; cursor < words.size();) {
         const auto count = words[cursor] >> 16u;
@@ -595,6 +593,20 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
 #endif
+    return materialized;
+}
+
+std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, bool useCache) {
+    const auto source = SpecializeVertexInputTypes(artifact, classes);
+    const bool disk = useCache && !DebugProbeActive() && ShaderDiskCache::Enabled();
+    std::vector<std::byte> diskKey;
+    SharedSpirv specialized;
+    if (disk) ShaderDiskCache::BuildSpecializedKey(source.Words(), constants, target, diskKey);
+    if (!disk || !ShaderDiskCache::LoadSpecialized(diskKey, target, specialized)) {
+        specialized = buildSpecializedSpirv(source.Words(), constants, target);
+        if (disk) ShaderDiskCache::StoreSpecialized(std::move(diskKey), specialized);
+    }
+    const auto& materialized = specialized.Words();
     auto module = std::make_shared<SpecializedModule>();
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
     for (std::size_t cursor = 5; cursor < materialized.size();) {
@@ -607,7 +619,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    module->spirv = std::move(materialized);
+    module->spirv = std::move(specialized);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
     return module;
 }
@@ -715,7 +727,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, bool useCache) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
     key.clear();
@@ -735,7 +747,7 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     }
     std::call_once(entry->ready, [&] {
         try {
-            entry->module = buildSpecializedModule(artifact, classes, constants, target);
+            entry->module = buildSpecializedModule(artifact, classes, constants, target, useCache);
         } catch (...) {
             entry->failure = std::current_exception();
         }
@@ -836,7 +848,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target, request.useCache); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target, request.useCache);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);

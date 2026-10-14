@@ -117,6 +117,42 @@ std::uint32_t AddBdaSignedOffset(SpirvEmitterState& state, std::uint32_t address
     return result;
 }
 
+std::uint32_t DefineBdaDirectDwordReadFunction(SpirvEmitterState& state, bool coherent) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto pair = TypeU32Vector(state, 2);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, std::string("read_bda_direct_dword") + (state.bdaStopsInvocations ? "_stop" : "") + (coherent ? "_coherent" : ""));
+    state.module.AddFunction(spv::OpFunction, pair, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, pair, u64, u32, u32));
+    const auto address = state.module.AllocateId();
+    const auto offset = state.module.AllocateId();
+    const auto instruction = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, u64, address);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, offset);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, instruction);
+    EmitLabel(state, state.module.AllocateId());
+    const auto guest = AddBdaSignedOffset(state, address, offset, instruction);
+    const auto physical = EmitBdaDirectDwordPointer(state, guest);
+    const auto mapped = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
+    const auto result = EmitValueIfElse(state, mapped, pair, [&] {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, physical);
+        const auto value = state.module.AllocateId();
+        if (coherent) state.module.AddFunction(spv::OpAtomicLoad, u32, value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u));
+        else state.module.AddFunction(spv::OpLoad, u32, value, pointer, BdaAccessMask(coherent), 4u);
+        const auto read = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, pair, read, value, ConstantU32(state, 0u));
+        return read;
+    }, [&] {
+        const auto read = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, pair, read, state.bdaDwordReadFunctions[state.bdaStopsInvocations][coherent], guest, instruction);
+        return read;
+    });
+    state.module.AddFunction(spv::OpReturnValue, result);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
+
 std::uint32_t BdaSpanReadResultType(SpirvEmitterState& state) {
     const auto values = TypeU32Vector(state, 4);
     return state.bdaStopsInvocations ? state.module.Type(spv::OpTypeStruct, values, TypeU32(state)) : values;
@@ -264,6 +300,7 @@ void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
             state.module.AddFunction(spv::OpReturnValue, result);
             state.module.AddFunction(spv::OpFunctionEnd);
             state.bdaDwordReadFunctions[stop][coherent] = function;
+            if (state.bdaDirect && !BdaByteReadsForced()) state.bdaDirectDwordReadFunctions[stop][coherent] = DefineBdaDirectDwordReadFunction(state, coherent);
         }
     }
     state.bdaStopsInvocations = stops;
@@ -559,6 +596,20 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     if (dwords == 0u || dwords > 4u) ctx.Fail(inst, "unsupported BDA read width");
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
     const auto instruction = BdaInstructionPc(state, inst);
+    if (state.bdaDirect && dwords == 1u && !BdaByteReadsForced()) {
+        const auto function = state.bdaDirectDwordReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)];
+        if (function == 0) ctx.Fail(inst, "BDA direct dword read function is missing");
+        const auto read = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, TypeU32Vector(state, 2), read, function, address, ConstantU32(state, offset), instruction);
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, read, 0u);
+        if (state.bdaStopsInvocations) {
+            const auto stopped = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stopped, read, 1u);
+            StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, TypeBool(state), stopped, ConstantU32(state, 0u)));
+        }
+        return {value, 0u, 0u, 0u};
+    }
     const auto used = everyDword ? (1u << dwords) - 1u : UsedBdaDwords(inst, dwords);
     const auto isUsed = [&](std::uint32_t dword) { return (used & (1u << dword)) != 0u; };
     std::array<std::uint32_t, 4> values{};

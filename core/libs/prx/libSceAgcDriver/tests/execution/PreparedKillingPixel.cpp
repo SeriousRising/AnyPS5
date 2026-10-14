@@ -29,7 +29,7 @@ void SetEnvironment(const char* name, const std::string& value) {
 
 std::uint64_t Compiles() {
     const auto totals = ShaderRecompiler::ShaderDiskCache::Totals();
-    return totals.hits + totals.misses + totals.loadFailures;
+    return totals.hits + totals.misses + totals.loadFailures - totals.specializedLookups;
 }
 
 void DrawsReuseBothEarlyTestVariants() {

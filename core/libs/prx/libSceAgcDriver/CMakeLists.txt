@@ -821,6 +821,30 @@ target_link_libraries(agc_driver_cmask_fast_clear_tests PRIVATE
 set_target_properties(agc_driver_cmask_fast_clear_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_cmask_fast_clear_tests)
 
+add_test_executable(agc_driver_recorded_clear_attachment_tests EXCLUDE_FROM_ALL
+        tests/RecordedClearAttachment.cpp
+        ${agcCoverShaderHeaders}
+)
+target_include_directories(agc_driver_recorded_clear_attachment_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${agcTestShaderGeneratedRoot}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+)
+target_link_libraries(agc_driver_recorded_clear_attachment_tests PRIVATE libSceAgcDriver SDL2-static libc)
+set_target_properties(agc_driver_recorded_clear_attachment_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_recorded_clear_attachment_tests)
+
+
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_recorded_clear_attachment_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_recorded_clear_attachment COMMAND agc_driver_recorded_clear_attachment_tests)
+    set_tests_properties(agc_driver_recorded_clear_attachment PROPERTIES SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorded_clear_attachment PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/ResidentPresent.cpp
@@ -1556,8 +1580,14 @@ if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS)
             -DOUTPUT_ROOT=${CMAKE_CURRENT_BINARY_DIR}/capture-tests
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ComputePipelineCaptureRun.cmake)
     set_tests_properties(agc_compute_pipeline_capture_run PROPERTIES TIMEOUT 30 SKIP_REGULAR_EXPRESSION "compute pipeline capture run: skipped, no usable Vulkan device")
+    add_test(NAME agc_compute_pipeline_replay_stats COMMAND ${CMAKE_COMMAND}
+            -DREPLAY_STATS_ONLY=ON
+            -DREPLAY=$<TARGET_FILE:agc_compute_pipeline_replay>
+            -DOUTPUT_ROOT=${CMAKE_CURRENT_BINARY_DIR}/capture-tests
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ComputePipelineCaptureRun.cmake)
+    set_tests_properties(agc_compute_pipeline_replay_stats PROPERTIES TIMEOUT 30 SKIP_REGULAR_EXPRESSION "compute pipeline replay statistics: skipped,")
     if(WIN32)
-        set_tests_properties(agc_compute_pipeline_replay agc_compute_pipeline_capture_run PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_compute_pipeline_replay agc_compute_pipeline_capture_run agc_compute_pipeline_replay_stats PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
 

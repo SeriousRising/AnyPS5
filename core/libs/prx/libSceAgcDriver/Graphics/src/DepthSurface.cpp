@@ -456,7 +456,7 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
-VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, VkImage* image) {
     takeBack(context, target.address);
     std::lock_guard lock(surfacesMutex());
     const bool cleared = target.htileAddress != 0 && clearedHtiles().erase(target.htileAddress) != 0;
@@ -467,9 +467,11 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surface->clearStencil = target.clearStencil;
         if (cleared) surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
         surface->ApplyFastClear();
+        if (image != nullptr) *image = surface->image;
         return surface->view;
     }
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
+    if (image != nullptr) *image = surfaces().back()->image;
     return surfaces().back()->view;
 }
 
