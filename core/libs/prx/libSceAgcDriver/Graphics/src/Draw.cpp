@@ -1628,6 +1628,9 @@ struct IndirectRecord {
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset) {
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
+    // Diagnostic only (wrong picture): APS5_X_SKIP_DRAWS=all records no draw, =depth none without color targets.
+    static const int skipDraws = [] { const char* v = std::getenv("APS5_X_SKIP_DRAWS"); return v == nullptr ? 0 : std::strcmp(v, "all") == 0 ? 2 : std::strcmp(v, "depth") == 0 ? 1 : 0; }();
+    if (skipDraws == 2 || (skipDraws == 1 && state.colors.empty())) return;
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
         context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));

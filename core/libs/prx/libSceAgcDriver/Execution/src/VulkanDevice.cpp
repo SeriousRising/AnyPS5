@@ -3995,8 +3995,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (!Graphics::Recorder::HasComputeShape(timingKey)) Graphics::Recorder::NoteComputeShape(timingKey, Graphics::ProgramComputeShape(record.shader->program->spirv.Words()));
         Graphics::Recorder::NoteDispatch(timingKey, argumentImport != nullptr, record.x, record.y, record.z);
     }
+    // Diagnostic only (wrong results): APS5_X_SKIP_DISPATCH=<program address> records no dispatch of that program.
+    static const std::uint64_t skipProgram = [] { const char* v = std::getenv("APS5_X_SKIP_DISPATCH"); return v == nullptr ? 0ull : std::strcmp(v, "all") == 0 ? ~0ull : std::strtoull(v, nullptr, 0); }();
+    const bool skipped = skipProgram == ~0ull || (skipProgram != 0 && record.programAddress == skipProgram);
     const auto gpuTiming = recorder.BeginGpuTiming(timingKey);
-    if (argumentImport != nullptr) {
+    if (skipped) {
+    } else if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     } else {
         const auto* limit = state->properties.limits.maxComputeWorkGroupCount;

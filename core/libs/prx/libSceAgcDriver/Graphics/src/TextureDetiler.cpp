@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
@@ -104,6 +105,12 @@ TextureDetiler::TextureDetiler(const Context& context) : context(context) {
 
 TextureDetiler::~TextureDetiler() {
     release();
+}
+
+// Diagnostic only (wrong picture): APS5_X_SKIP_DETILE records no detile or retile dispatch.
+static bool SkipDetileDiagnostic() {
+    static const bool skip = std::getenv("APS5_X_SKIP_DETILE") != nullptr;
+    return skip;
 }
 
 void TextureDetiler::release() noexcept {
@@ -255,7 +262,7 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
     context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &push);
     const auto groupsX = (columnEnd - window.columnBegin + 7u) / 8u;
     const auto groupsY = (rowEnd - window.rowBegin + 7u) / 8u;
-    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, groupsX, groupsY, 1);
+    if (!SkipDetileDiagnostic()) context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, groupsX, groupsY, 1);
 }
 
 std::uint32_t TextureDetiler::CmaskErrors() {
@@ -419,7 +426,7 @@ void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode til
     context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, imagePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &push);
     const auto groupsX = (columnEnd - window.columnBegin + 7u) / 8u;
     const auto groupsY = (rowEnd - window.rowBegin + 7u) / 8u;
-    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, groupsX, groupsY, 1);
+    if (!SkipDetileDiagnostic()) context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, groupsX, groupsY, 1);
 }
 
 }

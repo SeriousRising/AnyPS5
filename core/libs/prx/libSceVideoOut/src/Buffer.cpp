@@ -102,6 +102,7 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     cfg->groups[setIndex] = group;
     cfg->width = attribute->width;
     cfg->height = attribute->height;
+    std::fprintf(stderr, "[videoout] registered %d buffers in set %d: %ux%u pixel format 0x%llx tiling %u\n", bufferNum, setIndex, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format), attribute->tiling_mode);
     for (int i = 0; i < bufferNum; i++) {
         cfg->buffers[bufferIndexStart + i] = registered[i];
     }
@@ -138,6 +139,7 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
         AgcDriverCheckGuestMemory_nid_postfix(reinterpret_cast<const void*>(display.address), AgcDriverDisplayBufferSize_nid_postfix(display), 65536);
     }
     cfg->groups[setIndex] = group;
+    std::fprintf(stderr, "[videoout] set %d attribute changed: %ux%u\n", setIndex, attribute->width, attribute->height);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
