@@ -1992,7 +1992,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     const auto passImages = resources.StorageImages();
-    const bool writesDepth = state.depthWrite || state.stencilTest;
+    // A stencil test that keeps every value (or writes through mask 0) stores nothing: no feedback.
+    const bool writesDepth = !WritesNoDepthOrStencil(state);
     const bool depthFeedback = record.depthImage != VK_NULL_HANDLE && std::any_of(passImages.begin(), passImages.end(), [&](const auto& image) { return image.first == record.depthImage && (writesDepth || image.second); });
     std::vector<std::pair<VkImage, bool>> passAttachments;
     passAttachments.reserve(record.targets.size() + (record.depthImage != VK_NULL_HANDLE ? 1u : 0u));
