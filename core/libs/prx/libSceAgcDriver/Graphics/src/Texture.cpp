@@ -99,6 +99,8 @@ std::atomic<std::uint64_t> snapshotBytes{0}, snapshotBytesTotal{0};
 constexpr std::array<const char*, 12> HandOverRefusalNames{"base", "size", "units", "extent", "layers", "mips", "tile mode", "dimension", "element size", "not cached", "holder keys", "none"};
 std::array<std::atomic<std::uint64_t>, HandOverRefusalNames.size()> handOverRefusals{};
 std::atomic<std::uint64_t> takeoverDiscards{0}, takeoverDiscardBytes{0}, layerAliasCopies{0};
+// Why APS5_DISCARD_TAKEOVER stored a holder instead: same layout, DCC-compressed, no unit inside.
+std::array<std::atomic<std::uint64_t>, 3> discardRefusals{};
 // The shapes of those pairs, as {refusal, holder base - refreshed base, then for the refreshed
 // image and the holder: width, height, depth or last array, mips, element bytes, tile mode};
 // under their own mutex, a leaf.
@@ -175,7 +177,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         std::snprintf(shape, sizeof(shape), " [%llu: %s %+lld, %lldx%lldx%lld %lld/%lld/%lld, %lldx%lldx%lld %lld/%lld/%lld]", static_cast<unsigned long long>(shapes[i].first), HandOverRefusalNames[static_cast<std::size_t>(v[0])], static_cast<long long>(v[1]), static_cast<long long>(v[2]), static_cast<long long>(v[3]), static_cast<long long>(v[4]), static_cast<long long>(v[5]), static_cast<long long>(v[6]), static_cast<long long>(v[7]), static_cast<long long>(v[8]), static_cast<long long>(v[9]), static_cast<long long>(v[10]), static_cast<long long>(v[11]), static_cast<long long>(v[12]), static_cast<long long>(v[13]));
         refusals += shape;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshots read %.1f MiB; snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s; takeover units discarded %llu/%.1f MiB; same-layout layers taken on the device %llu\n", take(snapshotBytes) / 1048576.0, take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str(), take(takeoverDiscards), take(takeoverDiscardBytes) / 1048576.0, take(layerAliasCopies));
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshots read %.1f MiB; snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s; takeover units discarded %llu/%.1f MiB; same-layout layers taken on the device %llu; discard refused: same layout %llu, DCC-compressed holder %llu, no unit inside %llu\n", take(snapshotBytes) / 1048576.0, take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str(), take(takeoverDiscards), take(takeoverDiscardBytes) / 1048576.0, take(layerAliasCopies), take(discardRefusals[0]), take(discardRefusals[1]), take(discardRefusals[2]));
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -2946,8 +2948,8 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
 }
 
 // APS5_LAYER_ALIAS_COPY (opt-in while measured): another image of this memory with the same layout
-// (linear or otherwise per-layer tracked, one mip, same extent and texel size, its layers a prefix
-// of this image's) holds pending results: they move here by a device copy, and so does the duty to
+// (linear or otherwise per-layer tracked, one mip, same extent and texel size, layers counted from
+// the same base) holds pending results in layers both view: they move here by a device copy, and so does the duty to
 // store them, instead of a store into guest memory and an upload back. A layer pending in both
 // images keeps the old order (FlushPending below).
 void StorageTexture::takeSameLayoutLayers() {
@@ -2961,7 +2963,7 @@ void StorageTexture::takeSameLayoutLayers() {
         for (auto* texture : pending.textures) {
             const auto& theirs = texture->descriptor;
             if (texture == this || theirs.baseAddress != descriptor.baseAddress || texture->blockUnits || theirs.mipCount != 1 || theirs.dccAddress != 0) continue;
-            if (texture->trackedLayers > trackedLayers || texture->trackedLayers != texture->geometry.imageLayers || texture->geometry.imageDepth != 1 || texture->trackedLayerBytes != trackedLayerBytes) continue;
+            if (texture->trackedLayers != texture->geometry.imageLayers || texture->geometry.imageDepth != 1 || texture->trackedLayerBytes != trackedLayerBytes) continue;
             if (theirs.width != descriptor.width || theirs.height != descriptor.height || theirs.tileMode != descriptor.tileMode || BytesPerElement(theirs.format) != BytesPerElement(descriptor.format) || !texture->Cached()) continue;
             if (auto alive = texture->weak_from_this().lock()) holders.push_back(std::move(alive));
         }
@@ -2971,7 +2973,8 @@ void StorageTexture::takeSameLayoutLayers() {
     for (const auto& holder : holders) {
         std::vector<VkImageCopy> regions;
         bool both = false;
-        for (std::uint32_t unit = 0; unit < holder->trackedLayers; ++unit) {
+        // The layers both images view (a holder with more layers keeps the rest pending).
+        for (std::uint32_t unit = 0; unit < std::min(holder->trackedLayers, trackedLayers); ++unit) {
             if (!holder->layerPending[unit]) continue;
             if (layerPending[unit]) both = true;
             regions.push_back({{VK_IMAGE_ASPECT_COLOR_BIT, 0, unit, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, unit, 1}, {0, 0, 0}, {descriptor.width, descriptor.height, 1}});
@@ -3058,11 +3061,18 @@ bool StorageTexture::discardIncompatibleTakeover(const StorageTexture& refreshed
     const auto& h = holder.descriptor;
     const auto rowBytes = [](const auto& d) { return static_cast<std::uint64_t>(d.width) * BytesPerElement(d.format); };
     const bool sameElement = BytesPerElement(r.format) == BytesPerElement(h.format);
-    if ((sameElement && r.width == h.width) || (r.tileMode == TextureTileMode::kLinear && h.tileMode == TextureTileMode::kLinear && rowBytes(r) == rowBytes(h))) return false;
-    if (h.dccAddress != 0 && holder.uploadedKeys != DccKeys::Uncompressed) return false;
+    if ((sameElement && r.width == h.width) || (r.tileMode == TextureTileMode::kLinear && h.tileMode == TextureTileMode::kLinear && rowBytes(r) == rowBytes(h))) {
+        discardRefusals[0].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (h.dccAddress != 0 && holder.uploadedKeys != DccKeys::Uncompressed) {
+        discardRefusals[1].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     for (std::uint32_t unit = 0; unit < holder.trackedLayers; ++unit) {
         if (holder.layerPending[unit] && holder.layerBegin(unit) >= address && holder.layerBegin(unit) + holder.layerBytes(unit) <= address + bytes) return true;
     }
+    discardRefusals[2].fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
