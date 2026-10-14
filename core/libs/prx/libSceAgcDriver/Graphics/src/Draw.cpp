@@ -2003,6 +2003,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, resources.StoresByAddress() || resources.HasCopiedWrites()};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    if (capture) Recorder::NotePassForced("capture");
+    if (readsTarget) Recorder::NotePassForced("reads its target");
+    if (depthFeedback) Recorder::NotePassForced(writesDepth ? "depth feedback (writes depth)" : "depth feedback (depth image stored to)");
+    if (gpuIndirect) Recorder::NotePassForced("GPU indirect");
+    if (meshIndirect) Recorder::NotePassForced("mesh indirect");
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || depthFeedback || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;

@@ -14,6 +14,8 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <cxxabi.h>
+#include <dlfcn.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1401,12 +1403,63 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
+namespace {
+// APS5_PROFILE_DRAW: why a draw began a render pass instead of continuing the open one, and which
+// caller of Recorder::Commands (or label run) closed the pass the draw found closed.
+std::atomic<const void*> passCloser{nullptr};
+std::mutex passBreakMutex;
+std::map<std::string, std::uint64_t> passBreaks;
+
+std::string closerName(const void* address) {
+    static std::map<const void*, std::string> names;
+    if (address == nullptr) return "nothing open (batch start)";
+    if (auto found = names.find(address); found != names.end()) return found->second;
+    // Exported names are NIDs: report the offset in the library, resolved offline (addr2line).
+    std::string name = "?";
+    Dl_info info{};
+    if (dladdr(address, &info) != 0 && info.dli_fbase != nullptr) {
+        char text[128];
+        const char* file = info.dli_fname != nullptr ? std::strrchr(info.dli_fname, '/') : nullptr;
+        std::snprintf(text, sizeof(text), "%s+0x%llx", file != nullptr ? file + 1 : "?", static_cast<unsigned long long>(static_cast<const char*>(address) - static_cast<const char*>(info.dli_fbase)));
+        name = text;
+    }
+    return names.emplace(address, name).first->second;
+}
+
+void notePassBreak(const std::string& reason) {
+    std::lock_guard lock(passBreakMutex);
+    ++passBreaks[reason];
+}
+
+const char labelRunCloser = 0;
+}
+
+void Recorder::NotePassForced(const char* reason) {
+    if (DrawProfiled()) notePassBreak(std::string("forced: ") + reason);
+}
+
+std::string Recorder::PassBreakReport() {
+    std::vector<std::pair<std::uint64_t, std::string>> rows;
+    {
+        std::lock_guard lock(passBreakMutex);
+        for (const auto& [reason, count] : passBreaks) rows.emplace_back(count, reason);
+        passBreaks.clear();
+    }
+    std::sort(rows.rbegin(), rows.rend());
+    std::string line;
+    for (std::size_t i = 0; i < rows.size() && i < 12; ++i) line += " [" + std::to_string(rows[i].first) + " " + rows[i].second + "]";
+    return line;
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
-    if (open->renderPass.open) endOpenRenderPass();
+    if (open->renderPass.open) {
+        if (DrawProfiled()) passCloser.store(__builtin_return_address(0));
+        endOpenRenderPass();
+    }
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
@@ -1420,6 +1473,12 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
+    if (DrawProfiled()) {
+        if (!pass.open) { const void* closer = passCloser.load(); notePassBreak("closed by " + (closer == &labelRunCloser ? std::string("label run") : closerName(closer))); }
+        else if (forced) notePassBreak("forced");
+        else if (pass.key != key) notePassBreak("other pass key");
+        passCloser.store(nullptr);
+    }
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
         open->passHazards.Clear();
@@ -1600,7 +1659,10 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     // A label says the work before it is done: the queued key stores (results of that work) land
     // ahead of every store of the run.
     if (!open->keyStores.empty()) recordKeyStores(true);
-    if (open->renderPass.open) endOpenRenderPass();
+    if (open->renderPass.open) {
+        passCloser.store(&labelRunCloser);
+        endOpenRenderPass();
+    }
     open->coveredAccess = 0;
     // Two transfers to the same bytes have no order of their own within the run.
     const auto overlapsRecorded = [&] { return std::any_of(run.recorded.begin(), run.recorded.end(), [&](const auto& store) { return std::get<0>(store) == buffer && offset < std::get<2>(store) && std::get<1>(store) < end; }); };
@@ -1672,7 +1734,10 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
-        if (open->renderPass.open) endOpenRenderPass();
+        if (open->renderPass.open) {
+            passCloser.store(&labelRunCloser);
+            endOpenRenderPass();
+        }
         const auto commands = open->commands;
         run.timing = beginTiming(ClassKey(CommandClass::LabelRun));
         if (BarrierValidate()) {
@@ -1834,7 +1899,7 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", CommandClassNames[i], static_cast<unsigned long long>(mergedCount));
         mergedLine += text;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s; draw pass breaks:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str(), Recorder::PassBreakReport().c_str());
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -3563,7 +3628,11 @@ void Recorder::Submit() {
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
-    if (open->renderPass.open) endOpenRenderPass();
+    if (open->renderPass.open) {
+        static const char submitCloser = 0;
+        if (DrawProfiled()) passCloser.store(&submitCloser);
+        endOpenRenderPass();
+    }
     const bool segments = segmentMode();
     if (!segments) {
         endSamples(*open);
