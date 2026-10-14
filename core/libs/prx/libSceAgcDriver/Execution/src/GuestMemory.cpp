@@ -1965,7 +1965,15 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     });
 }
 
+std::atomic<void (*)()> storeHook{nullptr};
+
+void SetStoreHook(void (*hook)()) {
+    storeHook.store(hook, std::memory_order_release);
+}
+
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
+    // A snapshot a helper thread still copies must not see this later store.
+    if (auto hook = storeHook.load(std::memory_order_acquire)) hook();
     if (source.empty()) return;
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);

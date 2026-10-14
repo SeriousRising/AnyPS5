@@ -2711,6 +2711,7 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes, DrawSnapshotReuse* reuse) {
     const auto held = entry.buffer->Bytes();
     if (held.size() != bytes || bytes == 0) return false;
+    WaitCopies();
     constexpr std::uint64_t block = 65536;
     const auto aligned = address / block * block;
     const auto end = address + bytes;
@@ -3584,6 +3585,8 @@ void Recorder::Submit() {
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& read : open->reads) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(read.begin, read.end - read.begin));
     }
+    // Snapshot bytes copied by helper threads (DeferCopy) are in place before the GPU reads them.
+    WaitCopies();
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     // The timeline reaches this batch's serial when it completes (see WaitSerial).

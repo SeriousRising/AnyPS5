@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "ThreadOwned.hpp"
@@ -3585,7 +3586,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, extents != nullptr && bytes % 4 == 0 ? &reuse : nullptr);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+            // A large snapshot is copied by a helper thread; Recorder::Submit waits for every such
+            // copy before the batch reaches the GPU (APS5_NO_ASYNC_SNAPSHOT copies here).
+            static const bool deferred = std::getenv("APS5_NO_ASYNC_SNAPSHOT") == nullptr;
+            if (deferred && bytes >= 16384) DeferCopy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes, buffer);
+            else std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
         selected.push_back(index);

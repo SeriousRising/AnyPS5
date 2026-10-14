@@ -1,8 +1,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -76,6 +78,67 @@ private:
     std::atomic<std::size_t> done{0};
 };
 
+class CopyPool {
+public:
+    explicit CopyPool(unsigned count) {
+        for (unsigned i = 0; i < count; ++i) std::thread([this] { work(); }).detach();
+    }
+
+    void Add(void* destination, const void* source, std::size_t bytes, std::shared_ptr<const void> keep) {
+        {
+            std::lock_guard lock(mutex);
+            jobs.push_back({destination, source, bytes, std::move(keep)});
+            pending.fetch_add(1, std::memory_order_acq_rel);
+        }
+        wake.notify_one();
+    }
+
+    void Wait() {
+        if (pending.load(std::memory_order_acquire) == 0) return;
+        std::unique_lock lock(mutex);
+        finished.wait(lock, [&] { return pending.load(std::memory_order_acquire) == 0; });
+    }
+
+    bool Pending() const { return pending.load(std::memory_order_acquire) != 0; }
+
+private:
+    struct Job {
+        void* destination;
+        const void* source;
+        std::size_t bytes;
+        std::shared_ptr<const void> keep;
+    };
+
+    void work() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [&] { return !jobs.empty(); });
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            lock.unlock();
+            std::memcpy(job.destination, job.source, job.bytes);
+            job.keep.reset();
+            lock.lock();
+            if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) finished.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable finished;
+    std::deque<Job> jobs;
+    std::atomic<std::size_t> pending{0};
+};
+
+CopyPool* sharedCopyPool() {
+    static CopyPool* const pool = [] {
+        auto* created = new CopyPool(std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u));
+        GuestMemory::SetStoreHook(&WaitCopies);
+        return created;
+    }();
+    return pool;
+}
+
 ComparePool* sharedPool() {
     static ComparePool* const pool = new ComparePool(CompareHelpers());
     return pool;
@@ -99,6 +162,18 @@ void CompareSpansFrom(std::span<const CompareSpan> spans, std::span<std::uint8_t
 
 void CompareSpans(std::span<const CompareSpan> spans, std::span<std::uint8_t> equal) {
     CompareSpansFrom(spans, equal, std::size_t{1} << 20u);
+}
+
+void DeferCopy(void* destination, const void* source, std::size_t bytes, std::shared_ptr<const void> keep) {
+    sharedCopyPool()->Add(destination, source, bytes, std::move(keep));
+}
+
+void WaitCopies() {
+    sharedCopyPool()->Wait();
+}
+
+bool CopiesPending() {
+    return sharedCopyPool()->Pending();
 }
 
 }
