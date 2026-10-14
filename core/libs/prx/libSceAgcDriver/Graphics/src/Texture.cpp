@@ -2947,13 +2947,13 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     BumpPendingSerial();
 }
 
-// APS5_LAYER_ALIAS_COPY (opt-in while measured): another image of this memory with the same layout
+// Default (APS5_NO_LAYER_ALIAS_COPY turns it off): another image of this memory with the same layout
 // (linear or otherwise per-layer tracked, one mip, same extent and texel size, layers counted from
 // the same base) holds pending results in layers both view: they move here by a device copy, and so does the duty to
 // store them, instead of a store into guest memory and an upload back. A layer pending in both
 // images keeps the old order (FlushPending below).
 void StorageTexture::takeSameLayoutLayers() {
-    static const bool enabled = std::getenv("APS5_LAYER_ALIAS_COPY") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_LAYER_ALIAS_COPY") == nullptr;
     auto* recorder = Recorder::Active();
     if (!enabled || recorder == nullptr || blockUnits || descriptor.mipCount != 1 || trackedLayers != geometry.imageLayers || geometry.imageDepth != 1 || descriptor.dccAddress != 0) return;
     std::vector<std::shared_ptr<StorageTexture>> holders;
@@ -2991,7 +2991,7 @@ void StorageTexture::takeSameLayoutLayers() {
         holder->reconcilePending();
         for (const auto& region : regions) markLayersPending(region.dstSubresource.baseArrayLayer, 1);
         static std::atomic<bool> reported{false};
-        if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] storage image 0x%llx: same-layout layers taken over on the device (APS5_LAYER_ALIAS_COPY)\n", static_cast<unsigned long long>(descriptor.baseAddress));
+        if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] storage image 0x%llx: same-layout layers taken over on the device\n", static_cast<unsigned long long>(descriptor.baseAddress));
         layerAliasCopies.fetch_add(regions.size(), std::memory_order_relaxed);
     }
 }

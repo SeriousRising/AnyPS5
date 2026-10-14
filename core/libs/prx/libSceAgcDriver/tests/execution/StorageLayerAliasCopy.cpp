@@ -202,11 +202,6 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
 }
 
 int main() {
-#ifdef _WIN32
-    _putenv_s("APS5_LAYER_ALIAS_COPY", "1");
-#else
-    setenv("APS5_LAYER_ALIAS_COPY", "1", 1);
-#endif
     try {
         const bool watched = AgcDriver::GuestMemory::WriteWatched();
         GuestBlock block(watched);
