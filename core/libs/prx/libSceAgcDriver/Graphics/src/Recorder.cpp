@@ -665,7 +665,7 @@ bool QueuedLabelOverlaps(std::uint64_t address, std::size_t bytes) {
 std::atomic<std::uint64_t> hookCalls{0}, hookLocks{0}, targetedSyncs{0}, batchesLeftInFlight{0};
 // Snapshot maintenance (under the GpuMutex): notes whose range the snapshot already covered (no
 // rebuild), rebuilds, and the time the rebuilds took (APS5_PROFILE_DRAW), so their cost is visible.
-std::uint64_t snapshotCovered = 0, snapshotRebuilds = 0;
+std::uint64_t snapshotCovered = 0, snapshotRebuilds = 0, snapshotInserts = 0;
 double snapshotRebuildMs = 0;
 
 using WriteRanges = Recorder::WriteRanges;
@@ -2916,7 +2916,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     if (bytes == 0) return;
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
-        publishPendingWrites();
+        publishPendingWrite(address, address + bytes);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
@@ -2941,7 +2941,7 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
     if (!noteWrite(address, bytes)) return;
-    publishPendingWrites();
+    publishPendingWrite(address, address + bytes);
     // The note precedes this thread's vkQueueSubmit and the label another queue polls for; the
     // fence makes that order hold without relying on x86 store ordering.
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2949,7 +2949,7 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
     if (!noteWrite(address, bytes, false, value)) return;
-    publishPendingWrites();
+    publishPendingWrite(address, address + bytes);
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2961,6 +2961,38 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
     if (!publish) return;
     publishPendingWrites();
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+// One range noted in the open batch: the published union is already merged and sorted, so the
+// range joins a copy of it in one pass instead of a rebuild and sort of every batch's raw ranges
+// (each label store to a new address rebuilt it). Another publish since the load falls back to the
+// rebuild, so the union never misses a range.
+void Recorder::publishPendingWrite(std::uint64_t address, std::uint64_t end) const {
+    if (activeRecorder != this) return;
+    auto current = pendingWrites.load(std::memory_order_acquire);
+    if (current == nullptr) {
+        publishPendingWrites();
+        return;
+    }
+    auto merged = std::make_shared<WriteRanges>();
+    merged->reserve(current->size() + 1);
+    const auto at = std::upper_bound(current->begin(), current->end(), std::pair<std::uint64_t, std::uint64_t>{address, end});
+    merged->insert(merged->end(), current->begin(), at);
+    merged->emplace_back(address, end);
+    merged->insert(merged->end(), at, current->end());
+    std::size_t out = 0;
+    for (const auto& [begin, finish] : *merged) {
+        if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, finish);
+        else (*merged)[out++] = {begin, finish};
+    }
+    merged->resize(out);
+    std::shared_ptr<const WriteRanges> next = std::move(merged);
+    if (!pendingWrites.compare_exchange_strong(current, std::move(next), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        publishPendingWrites();
+        return;
+    }
+    publishGeneration.fetch_add(1, std::memory_order_release);
+    ++snapshotInserts;
 }
 
 void Recorder::publishPendingWrites() const {
