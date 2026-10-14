@@ -248,7 +248,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     }
 
     constexpr DenormalFlushEliminator denormalFlushEliminator;
-    if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
+    if ((request.target.fastFloat32 ? denormalFlushEliminator.EliminateAll(program) : denormalFlushEliminator.Eliminate(program)).removedFlushes != 0u) {
         deadCodeEliminator.Eliminate(program);
     }
 
@@ -440,6 +440,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
+    targetOptions.fastFloat32 = request.target.fastFloat32;
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
 

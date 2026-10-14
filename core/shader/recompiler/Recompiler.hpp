@@ -230,6 +230,8 @@ struct SpirvTarget {
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
+    // APS5_FAST_F32 (accuracy trade): no explicit f32 flushes or guest NaN choice; DenormFlushToZero 32.
+    bool fastFloat32 = false;
     bool registrationModules = false;
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;

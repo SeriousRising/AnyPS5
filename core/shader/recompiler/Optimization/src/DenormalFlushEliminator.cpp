@@ -27,6 +27,16 @@ IrValue* flushedSource(const IrValue& value) {
     return maskedOperand(value.Argument(1)->Resolve(), IrOpcode::BitwiseAnd32, 0x80000000u) == source ? source : nullptr;
 }
 
+// A select guarded by an f32 NaN test (|bits| > infinity): the operand used when not NaN.
+IrValue* nanGuardedOperand(const IrValue& value) {
+    if ((value.Opcode() != IrOpcode::SelectU32 && value.Opcode() != IrOpcode::SelectF32) || value.ArgumentCount() != 3u) return nullptr;
+    const IrValue* condition = value.Argument(0)->Resolve();
+    if (condition->Opcode() != IrOpcode::UGreaterThan32 || condition->ArgumentCount() != 2u) return nullptr;
+    if (!isImmediate(condition->Argument(1)->Resolve(), 0x7f800000u)) return nullptr;
+    if (maskedOperand(condition->Argument(0)->Resolve(), IrOpcode::BitwiseAnd32, 0x7fffffffu) == nullptr) return nullptr;
+    return value.Argument(2)->Resolve();
+}
+
 class DenormalFreeValues {
 public:
     bool Contains(const IrValue* value) {
@@ -90,6 +100,21 @@ DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& prog
             if (!inst->HasUses()) continue;
             IrValue* source = flushedSource(*inst);
             if (source == nullptr || !denormalFree.Contains(source)) continue;
+            inst->ReplaceAllUsesWith(source);
+            ++stats.removedFlushes;
+        }
+    }
+    return stats;
+}
+
+DenormalFlushEliminationStats DenormalFlushEliminator::EliminateAll(IrProgram& program) const {
+    DenormalFlushEliminationStats stats;
+    for (auto* block : program.BlockOrder()) {
+        for (auto* inst : block->Instructions()) {
+            if (!inst->HasUses()) continue;
+            IrValue* source = flushedSource(*inst);
+            if (source == nullptr) source = nanGuardedOperand(*inst);
+            if (source == nullptr) continue;
             inst->ReplaceAllUsesWith(source);
             ++stats.removedFlushes;
         }
