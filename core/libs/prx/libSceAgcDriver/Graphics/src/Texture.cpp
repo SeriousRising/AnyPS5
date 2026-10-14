@@ -99,7 +99,7 @@ std::atomic<std::uint64_t> snapshotBytes{0}, snapshotBytesTotal{0};
 constexpr std::array<const char*, 12> HandOverRefusalNames{"base", "size", "units", "extent", "layers", "mips", "tile mode", "dimension", "element size", "not cached", "holder keys", "none"};
 std::array<std::atomic<std::uint64_t>, HandOverRefusalNames.size()> handOverRefusals{};
 std::atomic<std::uint64_t> takeoverDiscards{0}, takeoverDiscardBytes{0}, layerAliasCopies{0};
-// Why APS5_DISCARD_TAKEOVER stored a holder instead: same layout, DCC-compressed, no unit inside.
+// Why the takeover discard stored a holder instead: same layout, DCC-compressed, no unit inside.
 std::array<std::atomic<std::uint64_t>, 3> discardRefusals{};
 // The shapes of those pairs, as {refusal, holder base - refreshed base, then for the refreshed
 // image and the holder: width, height, depth or last array, mips, element bytes, tile mode};
@@ -3047,7 +3047,7 @@ bool StorageTexture::overlapsUnit(std::uint32_t unit, std::uint64_t address, std
     return address < begin + layerBytes(unit) && begin < address + bytes;
 }
 
-// APS5_DISCARD_TAKEOVER (opt-in, trades accuracy for speed): a storage image refreshed over pending
+// Default (APS5_NO_DISCARD_TAKEOVER turns it off; trades accuracy for speed): a storage image refreshed over pending
 // results of an image whose memory layout it cannot read meaningfully (another row width or texel
 // size; the engine reusing transient memory) drops those results instead of storing them and
 // uploading them again. Only the holder's pending units that lie inside the
@@ -3055,7 +3055,7 @@ bool StorageTexture::overlapsUnit(std::uint32_t unit, std::uint64_t address, std
 // DCC-compressed (its write-back stores it whole); guest memory keeps its older bytes there. Views of one layout (layers, height, tile mode) keep the
 // exact path.
 bool StorageTexture::discardIncompatibleTakeover(const StorageTexture& refreshed, const StorageTexture& holder, std::uint64_t address, std::size_t bytes) {
-    static const bool enabled = std::getenv("APS5_DISCARD_TAKEOVER") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_DISCARD_TAKEOVER") == nullptr;
     if (!enabled) return false;
     const auto& r = refreshed.descriptor;
     const auto& h = holder.descriptor;
@@ -3151,7 +3151,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     for (const auto& texture : flush) {
         try {
             // An incompatible holder's units inside the refreshed range are dropped, not stored
-            // (APS5_DISCARD_TAKEOVER); its edge units the range only cuts are stored below.
+            // (unless APS5_NO_DISCARD_TAKEOVER); its edge units the range only cuts are stored below.
             if (std::find(discard.begin(), discard.end(), texture.get()) != discard.end()) {
                 for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
                     if (!texture->layerPending[unit] || texture->layerBegin(unit) < address || texture->layerBegin(unit) + texture->layerBytes(unit) > address + bytes) continue;

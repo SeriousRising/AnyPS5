@@ -191,11 +191,6 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
 }
 
 int main() {
-#ifdef _WIN32
-    _putenv_s("APS5_DISCARD_TAKEOVER", "1");
-#else
-    setenv("APS5_DISCARD_TAKEOVER", "1", 1);
-#endif
     try {
         const bool watched = AgcDriver::GuestMemory::WriteWatched();
         GuestBlock block(watched);
