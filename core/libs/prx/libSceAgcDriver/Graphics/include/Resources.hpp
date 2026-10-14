@@ -15,7 +15,9 @@ void NoteBufferUnmapped(VkDeviceSize bytes) noexcept;
 
 class Buffer {
 public:
-    Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // `exactHandle` false: a pooled VkBuffer larger than `size` is kept instead of rebound at the exact
+    // size; only for users that bind Bytes().size() as an explicit range (descriptors, copies).
+    Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bool exactHandle = true);
     ~Buffer();
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
@@ -37,6 +39,8 @@ private:
     void* mapping = nullptr;
     std::size_t size;
     std::size_t capacity;
+    // Bytes of the VkBuffer itself (more than `size` when a pooled handle was kept).
+    std::size_t handleBytes = 0;
     // Fully made (or taken from the pool), so release returns it to the pool instead of destroying
     // the handles a failed construction left.
     bool ready = false;

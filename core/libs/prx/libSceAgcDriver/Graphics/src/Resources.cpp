@@ -50,7 +50,7 @@ void NoteBufferUnmapped(VkDeviceSize bytes) noexcept {
     mappedBytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool exactHandle) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), handleBytes(size) {
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
@@ -64,7 +64,8 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         capacity = allocation->bytes;
         offset = allocation->offset;
         slab = allocation->slab;
-        if (allocation->bufferBytes != size) {
+        if (allocation->bufferBytes > size && !exactHandle) handleBytes = allocation->bufferBytes;
+        else if (allocation->bufferBytes != size) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
             deviceAddress = 0;
@@ -137,7 +138,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, handleBytes});
         return;
     }
     if (slab) {

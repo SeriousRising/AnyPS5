@@ -3585,7 +3585,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         DrawSnapshotReuse reuse;
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, extents != nullptr && bytes % 4 == 0 ? &reuse : nullptr);
         if (buffer == nullptr) {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            // Bound below with an explicit range: a larger pooled handle serves as is.
+            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false);
             // A large snapshot is copied by a helper thread; Recorder::Submit waits for every such
             // copy before the batch reaches the GPU (APS5_NO_ASYNC_SNAPSHOT copies here).
             static const bool deferred = std::getenv("APS5_NO_ASYNC_SNAPSHOT") == nullptr;
