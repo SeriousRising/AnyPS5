@@ -192,5 +192,20 @@ int main() {
         return loop(true) && !loop(false);
     });
 
+    passed &= run("fast float mode drops every flush and NaN-guarded select, keeping other selects", [] {
+        Builder b;
+        auto& value = b.unknown();
+        auto& flushed = b.flush(value);
+        auto& magnitude = b.emit(IrOpcode::BitwiseAnd32, IrType::U32, {&value, &b.constant(0x7fffffffu)});
+        auto& isNan = b.emit(IrOpcode::UGreaterThan32, IrType::Bool, {&magnitude, &b.constant(0x7f800000u)});
+        auto& canonical = b.emit(IrOpcode::SelectU32, IrType::U32, {&isNan, &b.constant(0xffc00000u), &value});
+        auto& other = b.emit(IrOpcode::SelectU32, IrType::U32, {&b.emit(IrOpcode::ULessThan32, IrType::Bool, {&value, &b.constant(16u)}), &b.constant(1u), &value});
+        b.keep(flushed);
+        b.keep(canonical);
+        b.keep(other);
+        const auto removed = DenormalFlushEliminator{}.EliminateAll(b.program).removedFlushes;
+        return removed == 2u && !flushed.HasUses() && !canonical.HasUses() && other.HasUses();
+    });
+
     return passed ? 0 : 1;
 }
