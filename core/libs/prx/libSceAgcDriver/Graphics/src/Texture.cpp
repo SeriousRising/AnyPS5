@@ -98,6 +98,7 @@ std::atomic<std::uint64_t> snapshotBytes{0}, snapshotBytesTotal{0};
 // on the device, by the first difference (StorageTexture::handOverRefusal).
 constexpr std::array<const char*, 12> HandOverRefusalNames{"base", "size", "units", "extent", "layers", "mips", "tile mode", "dimension", "element size", "not cached", "holder keys", "none"};
 std::array<std::atomic<std::uint64_t>, HandOverRefusalNames.size()> handOverRefusals{};
+std::atomic<std::uint64_t> takeoverDiscards{0}, takeoverDiscardBytes{0};
 // The shapes of those pairs, as {refusal, holder base - refreshed base, then for the refreshed
 // image and the holder: width, height, depth or last array, mips, element bytes, tile mode};
 // under their own mutex, a leaf.
@@ -174,7 +175,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         std::snprintf(shape, sizeof(shape), " [%llu: %s %+lld, %lldx%lldx%lld %lld/%lld/%lld, %lldx%lldx%lld %lld/%lld/%lld]", static_cast<unsigned long long>(shapes[i].first), HandOverRefusalNames[static_cast<std::size_t>(v[0])], static_cast<long long>(v[1]), static_cast<long long>(v[2]), static_cast<long long>(v[3]), static_cast<long long>(v[4]), static_cast<long long>(v[5]), static_cast<long long>(v[6]), static_cast<long long>(v[7]), static_cast<long long>(v[8]), static_cast<long long>(v[9]), static_cast<long long>(v[10]), static_cast<long long>(v[11]), static_cast<long long>(v[12]), static_cast<long long>(v[13]));
         refusals += shape;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshots read %.1f MiB; snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s\n", take(snapshotBytes) / 1048576.0, take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshots read %.1f MiB; snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s; takeover units discarded %llu/%.1f MiB\n", take(snapshotBytes) / 1048576.0, take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str(), take(takeoverDiscards), take(takeoverDiscardBytes) / 1048576.0);
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -2989,11 +2990,39 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
+bool StorageTexture::overlapsUnit(std::uint32_t unit, std::uint64_t address, std::size_t bytes) const {
+    const auto begin = layerBegin(unit);
+    return address < begin + layerBytes(unit) && begin < address + bytes;
+}
+
+// APS5_DISCARD_TAKEOVER (opt-in, trades accuracy for speed): a storage image refreshed over pending
+// results of an image whose memory layout it cannot read meaningfully (another row width or texel
+// size; the engine reusing transient memory) drops those results instead of storing them and
+// uploading them again. Only the holder's pending units that lie inside the
+// refreshed range (edge units it only cuts are stored as before), and the holder is not
+// DCC-compressed (its write-back stores it whole); guest memory keeps its older bytes there. Views of one layout (layers, height, tile mode) keep the
+// exact path.
+bool StorageTexture::discardIncompatibleTakeover(const StorageTexture& refreshed, const StorageTexture& holder, std::uint64_t address, std::size_t bytes) {
+    static const bool enabled = std::getenv("APS5_DISCARD_TAKEOVER") != nullptr;
+    if (!enabled) return false;
+    const auto& r = refreshed.descriptor;
+    const auto& h = holder.descriptor;
+    const auto rowBytes = [](const auto& d) { return static_cast<std::uint64_t>(d.width) * BytesPerElement(d.format); };
+    const bool sameElement = BytesPerElement(r.format) == BytesPerElement(h.format);
+    if ((sameElement && r.width == h.width) || (r.tileMode == TextureTileMode::kLinear && h.tileMode == TextureTileMode::kLinear && rowBytes(r) == rowBytes(h))) return false;
+    if (h.dccAddress != 0 && holder.uploadedKeys != DccKeys::Uncompressed) return false;
+    for (std::uint32_t unit = 0; unit < holder.trackedLayers; ++unit) {
+        if (holder.layerPending[unit] && holder.layerBegin(unit) >= address && holder.layerBegin(unit) + holder.layerBytes(unit) <= address + bytes) return true;
+    }
+    return false;
+}
+
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
+    std::vector<const StorageTexture*> discard;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -3025,6 +3054,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     std::lock_guard shapesLock(handOverShapesMutex);
                     ++handOverShapes[key];
                 }
+                if (exempt != nullptr && discardIncompatibleTakeover(*exempt, *texture, address, bytes)) discard.push_back(texture);
                 if (auto alive = texture->weak_from_this().lock()) flush.push_back(std::move(alive));
                 it = pending.textures.erase(it);
             } else {
@@ -3061,6 +3091,16 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     const auto previousReason = std::exchange(flushReason, reason);
     for (const auto& texture : flush) {
         try {
+            // An incompatible holder's units inside the refreshed range are dropped, not stored
+            // (APS5_DISCARD_TAKEOVER); its edge units the range only cuts are stored below.
+            if (std::find(discard.begin(), discard.end(), texture.get()) != discard.end()) {
+                for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
+                    if (!texture->layerPending[unit] || texture->layerBegin(unit) < address || texture->layerBegin(unit) + texture->layerBytes(unit) > address + bytes) continue;
+                    texture->layerPending[unit] = false;
+                    takeoverDiscards.fetch_add(1, std::memory_order_relaxed);
+                    takeoverDiscardBytes.fetch_add(texture->layerBytes(unit), std::memory_order_relaxed);
+                }
+            }
             // Only the pending layers the access overlaps are stored; the others stay pending (the
             // store re-registers the image for them).
             texture->writeBack(address, bytes);

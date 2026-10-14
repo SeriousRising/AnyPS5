@@ -407,6 +407,8 @@ private:
     // layer generation (the whole-surface fast check), `dirty` whether any layer is pending.
     std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
+    bool overlapsUnit(std::uint32_t unit, std::uint64_t address, std::size_t bytes) const;
+    static bool discardIncompatibleTakeover(const StorageTexture& refreshed, const StorageTexture& holder, std::uint64_t address, std::size_t bytes);
     void refreshGeneration();
     bool refreshProved();
     void takeRefreshProof(bool aliased);
