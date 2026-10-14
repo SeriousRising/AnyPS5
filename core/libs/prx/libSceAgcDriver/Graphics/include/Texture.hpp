@@ -418,6 +418,7 @@ private:
     void markLayersPending(std::uint32_t first, std::uint32_t count);
     // Registers or unregisters the image as its pending layers say (after a write-back).
     void reconcilePending();
+    void takeSameLayoutLayers();
     // Pending images whose surface shares one of the 64 KiB write-stamp blocks firstBlock..lastBlock
     // (the span a write-back stamps) without overlapping this one: the tracked layer of theirs
     // holding the shared block, when its memory is unchanged since its generation (see writeBack),

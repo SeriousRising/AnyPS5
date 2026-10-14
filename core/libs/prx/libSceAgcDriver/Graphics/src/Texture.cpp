@@ -98,7 +98,7 @@ std::atomic<std::uint64_t> snapshotBytes{0}, snapshotBytesTotal{0};
 // on the device, by the first difference (StorageTexture::handOverRefusal).
 constexpr std::array<const char*, 12> HandOverRefusalNames{"base", "size", "units", "extent", "layers", "mips", "tile mode", "dimension", "element size", "not cached", "holder keys", "none"};
 std::array<std::atomic<std::uint64_t>, HandOverRefusalNames.size()> handOverRefusals{};
-std::atomic<std::uint64_t> takeoverDiscards{0}, takeoverDiscardBytes{0};
+std::atomic<std::uint64_t> takeoverDiscards{0}, takeoverDiscardBytes{0}, layerAliasCopies{0};
 // The shapes of those pairs, as {refusal, holder base - refreshed base, then for the refreshed
 // image and the holder: width, height, depth or last array, mips, element bytes, tile mode};
 // under their own mutex, a leaf.
@@ -175,7 +175,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         std::snprintf(shape, sizeof(shape), " [%llu: %s %+lld, %lldx%lldx%lld %lld/%lld/%lld, %lldx%lldx%lld %lld/%lld/%lld]", static_cast<unsigned long long>(shapes[i].first), HandOverRefusalNames[static_cast<std::size_t>(v[0])], static_cast<long long>(v[1]), static_cast<long long>(v[2]), static_cast<long long>(v[3]), static_cast<long long>(v[4]), static_cast<long long>(v[5]), static_cast<long long>(v[6]), static_cast<long long>(v[7]), static_cast<long long>(v[8]), static_cast<long long>(v[9]), static_cast<long long>(v[10]), static_cast<long long>(v[11]), static_cast<long long>(v[12]), static_cast<long long>(v[13]));
         refusals += shape;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshots read %.1f MiB; snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s; takeover units discarded %llu/%.1f MiB\n", take(snapshotBytes) / 1048576.0, take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str(), take(takeoverDiscards), take(takeoverDiscardBytes) / 1048576.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] snapshots read %.1f MiB; snapshot compares %llu, rescued %llu (%llu read by an upload under clear keys); images a refresh stored instead of handing over, by first difference:%s; takeover units discarded %llu/%.1f MiB; same-layout layers taken on the device %llu\n", take(snapshotBytes) / 1048576.0, take(snapshotCompares), take(snapshotRescues), take(clearSnapshotRescues), refusals.c_str(), take(takeoverDiscards), take(takeoverDiscardBytes) / 1048576.0, take(layerAliasCopies));
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -1632,6 +1632,7 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    takeSameLayoutLayers();
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
@@ -2942,6 +2943,54 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
+}
+
+// APS5_LAYER_ALIAS_COPY (opt-in while measured): another image of this memory with the same layout
+// (linear or otherwise per-layer tracked, one mip, same extent and texel size, its layers a prefix
+// of this image's) holds pending results: they move here by a device copy, and so does the duty to
+// store them, instead of a store into guest memory and an upload back. A layer pending in both
+// images keeps the old order (FlushPending below).
+void StorageTexture::takeSameLayoutLayers() {
+    static const bool enabled = std::getenv("APS5_LAYER_ALIAS_COPY") != nullptr;
+    auto* recorder = Recorder::Active();
+    if (!enabled || recorder == nullptr || blockUnits || descriptor.mipCount != 1 || trackedLayers != geometry.imageLayers || geometry.imageDepth != 1 || descriptor.dccAddress != 0) return;
+    std::vector<std::shared_ptr<StorageTexture>> holders;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (auto* texture : pending.textures) {
+            const auto& theirs = texture->descriptor;
+            if (texture == this || theirs.baseAddress != descriptor.baseAddress || texture->blockUnits || theirs.mipCount != 1 || theirs.dccAddress != 0) continue;
+            if (texture->trackedLayers > trackedLayers || texture->trackedLayers != texture->geometry.imageLayers || texture->geometry.imageDepth != 1 || texture->trackedLayerBytes != trackedLayerBytes) continue;
+            if (theirs.width != descriptor.width || theirs.height != descriptor.height || theirs.tileMode != descriptor.tileMode || BytesPerElement(theirs.format) != BytesPerElement(descriptor.format) || !texture->Cached()) continue;
+            if (auto alive = texture->weak_from_this().lock()) holders.push_back(std::move(alive));
+        }
+    }
+    if (holders.empty()) return;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    for (const auto& holder : holders) {
+        std::vector<VkImageCopy> regions;
+        bool both = false;
+        for (std::uint32_t unit = 0; unit < holder->trackedLayers; ++unit) {
+            if (!holder->layerPending[unit]) continue;
+            if (layerPending[unit]) both = true;
+            regions.push_back({{VK_IMAGE_ASPECT_COLOR_BIT, 0, unit, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, unit, 1}, {0, 0, 0}, {descriptor.width, descriptor.height, 1}});
+        }
+        if (both || regions.empty()) continue;
+        recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        auto commands = recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, holder->image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder->Keep(holder);
+        if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
+        for (const auto& region : regions) holder->layerPending[region.srcSubresource.baseArrayLayer] = false;
+        holder->reconcilePending();
+        for (const auto& region : regions) markLayersPending(region.dstSubresource.baseArrayLayer, 1);
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] storage image 0x%llx: same-layout layers taken over on the device (APS5_LAYER_ALIAS_COPY)\n", static_cast<unsigned long long>(descriptor.baseAddress));
+        layerAliasCopies.fetch_add(regions.size(), std::memory_order_relaxed);
+    }
 }
 
 void StorageTexture::reconcilePending() {
