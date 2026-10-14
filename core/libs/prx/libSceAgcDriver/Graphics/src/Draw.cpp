@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -1913,6 +1914,8 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
         samples.push_back(std::move(sample));
     };
     if (bindings != nullptr) {
+        // A large snapshot may still be copied by a helper thread (DeferCopy).
+        WaitCopies();
         for (const auto& snapshot : bindings->snapshots) {
             const auto bytes = snapshot.buffer->Bytes();
             addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), 0, bytes.data());

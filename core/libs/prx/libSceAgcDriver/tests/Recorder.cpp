@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -1385,6 +1386,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
         const auto check = [&] {
             const auto bindings = resources.PrepareDrawBindings(regionRecorder);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "the read-only misaligned draw input was not snapshotted");
+            AgcDriver::Graphics::WaitCopies();
             const auto contents = bindings->snapshots.front().buffer->Bytes();
             Require(bindings->snapshots.front().address == view - adjustment && contents.size() == adjustment + elementBytes, "the draw snapshot does not start at the aligned offset below the view");
             Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's patched offset into the draw snapshot misses the view's bytes");
@@ -1471,6 +1473,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
         const auto outerContents = bindings->snapshots[0].buffer->Bytes();
         Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
+        AgcDriver::Graphics::WaitCopies();
         const auto contents = bindings->snapshots[1].buffer->Bytes();
         Require(contents.size() >= adjustment + elementBytes, "a draw snapshot ends before the bytes the shader reads");
         Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's offset into a draw snapshot misses the view's bytes");
@@ -1679,6 +1682,8 @@ bool drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
             total.Add(extents.reuse);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             const auto buffer = bindings->snapshots[0].buffer;
+            // Snapshot bytes are in place by Submit; a large one is copied by a helper thread.
+            AgcDriver::Graphics::WaitCopies();
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
@@ -1778,6 +1783,8 @@ bool drawSnapshotPatchTests(const Device& device, Recorder& recorder) {
             total.Add(extents.reuse);
             Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
             auto buffer = bindings->snapshots[0].buffer;
+            // Snapshot bytes are in place by Submit; a large one is copied by a helper thread.
+            AgcDriver::Graphics::WaitCopies();
             const auto contents = buffer->Bytes();
             Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
             return buffer;
@@ -1920,6 +1927,8 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         if (Watched(address, bytes)) {
             Require(snapshotRecorder.ReusableDrawSnapshot(smallAddress, smallBytes) != nullptr, "an input below the draw snapshot cap was not kept in the snapshot cache");
         }
+        // Snapshot bytes are in place by Submit; a large one is copied by a helper thread.
+        AgcDriver::Graphics::WaitCopies();
         const auto contents = bindings->snapshots[0].buffer->Bytes();
         Require(contents.size() == smallBytes && std::all_of(contents.begin(), contents.end(), [](std::byte value) { return value == std::byte{0x11}; }), "a draw snapshot does not hold the guest bytes of its draw");
         std::memset(reinterpret_cast<void*>(smallAddress), 0x22, smallBytes);
