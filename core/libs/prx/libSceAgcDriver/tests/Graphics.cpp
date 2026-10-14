@@ -5059,6 +5059,44 @@ void parallelCompareTests() {
     CompareSpansFrom({}, none, 0);
 }
 
+void deferredCopyTests() {
+    using AgcDriver::Graphics::CopiesPending;
+    using AgcDriver::Graphics::DeferCopy;
+    using AgcDriver::Graphics::WaitCopies;
+    constexpr std::size_t bytes = 256 * 1024;
+    constexpr std::size_t count = 64;
+    std::vector<std::vector<std::byte>> sources(count);
+    std::vector<std::shared_ptr<std::vector<std::byte>>> destinations(count);
+    for (std::size_t k = 0; k < count; ++k) {
+        sources[k].assign(bytes, std::byte{0});
+        for (std::size_t i = 0; i < bytes; ++i) sources[k][i] = static_cast<std::byte>((i * 31 + k) & 0xff);
+        destinations[k] = std::make_shared<std::vector<std::byte>>(bytes, std::byte{0xee});
+    }
+    for (int round = 0; round < 3; ++round) {
+        for (std::size_t k = 0; k < count; ++k) {
+            auto& destination = *destinations[k];
+            std::fill(destination.begin(), destination.end(), std::byte{0xee});
+            DeferCopy(destination.data(), sources[k].data(), bytes, destinations[k]);
+        }
+        // A waiter on another thread returns too, and only after every copy landed.
+        std::thread other([] { WaitCopies(); });
+        WaitCopies();
+        other.join();
+        Require(!CopiesPending(), "deferred copies still pending after WaitCopies");
+        for (std::size_t k = 0; k < count; ++k) Require(*destinations[k] == sources[k], "a deferred copy did not land before WaitCopies returned");
+    }
+    // The pool holds a destination alive until its copy ran.
+    {
+        auto kept = std::make_shared<std::vector<std::byte>>(bytes);
+        std::weak_ptr<std::vector<std::byte>> watch = kept;
+        DeferCopy(kept->data(), sources[0].data(), bytes, kept);
+        kept.reset();
+        WaitCopies();
+        Require(watch.expired(), "the pool kept a destination after its copy ran");
+    }
+    WaitCopies();
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -5176,6 +5214,7 @@ int main(int argc, char** argv) {
         vertexZeroFillTests();
         vertexZeroFillMergeTests();
         parallelCompareTests();
+        deferredCopyTests();
         pixelParameterSlotTests();
         rectListTests();
         floatControlsModeTests();
