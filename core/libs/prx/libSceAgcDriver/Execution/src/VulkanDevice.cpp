@@ -869,7 +869,7 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout replay");
     result.layoutMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
-    const auto pipelineFlags = capture.flags | (state->pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0u);
+    const auto pipelineFlags = capture.flags | Graphics::PipelineCaptureFlags(graphicsContext());
     CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, pipelineFlags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline);
     result.pipelineMilliseconds = elapsed(phase);
     if (state->pipelineExecutableInfo) Graphics::LogPipelineStatistics_nid_no_patch(graphicsContext(), objects.pipeline);
@@ -4251,7 +4251,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
         check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
-        const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
+        const VkPipelineCreateFlags pipelineFlags = Graphics::PipelineCaptureFlags(context) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
         const Graphics::PipelineSpecialization specialization(shader);
         const auto subgroupSize = state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
         if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && CaptureComputePipeline(shader.spirv.size())) {

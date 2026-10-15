@@ -10,6 +10,8 @@ namespace AgcDriver::Graphics {
 struct VertexInputLayout;
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline);
+// The statistics flags pipelines take under APS5_PIPELINE_STATS (with internal representations under APS5_PIPELINE_ISA_DIR).
+VkPipelineCreateFlags PipelineCaptureFlags(const Context& context);
 
 // The attachments of one render pass instance. Work recorded with it references the handle until
 // the batch completes, so a recorded draw keeps the object (Recorder::Keep) like its pipeline.

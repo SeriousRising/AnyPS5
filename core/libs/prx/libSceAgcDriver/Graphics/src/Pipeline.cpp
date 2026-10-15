@@ -13,14 +13,52 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
+// Diagnostic: with APS5_PIPELINE_STATS=1, APS5_PIPELINE_ISA_DIR=<dir> saves the driver's internal
+// representations (RADV: NIR, ACO IR, assembly) of executables of at least APS5_PIPELINE_ISA_MIN
+// instructions (default 15000) as <dir>/<pipeline>-<executable>-<name>.txt.
+static const char* pipelineIsaDirectory() {
+    static const char* directory = std::getenv("APS5_PIPELINE_ISA_DIR");
+    return directory;
+}
+
+static void savePipelineRepresentations(const Context& context, const VkPipelineExecutableInfoKHR& executable, const char* stage) {
+    const auto getRepresentations = context.Function<PFN_vkGetPipelineExecutableInternalRepresentationsKHR>("vkGetPipelineExecutableInternalRepresentationsKHR");
+    std::uint32_t count = 0;
+    Check(getRepresentations(context.device, &executable, &count, nullptr), "vkGetPipelineExecutableInternalRepresentationsKHR count");
+    std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+    Check(getRepresentations(context.device, &executable, &count, representations.data()), "vkGetPipelineExecutableInternalRepresentationsKHR sizes");
+    std::vector<std::vector<char>> texts(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        texts[index].resize(representations[index].dataSize);
+        representations[index].pData = texts[index].data();
+    }
+    Check(getRepresentations(context.device, &executable, &count, representations.data()), "vkGetPipelineExecutableInternalRepresentationsKHR");
+    const auto path = std::string(pipelineIsaDirectory()) + "/" + std::to_string(std::bit_cast<std::uint64_t>(executable.pipeline)) + "-" + std::to_string(executable.executableIndex) + "-" + stage + ".txt";
+    std::FILE* file = std::fopen(path.c_str(), "w");
+    if (file == nullptr) return;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        std::fprintf(file, "==== %s: %s\n", representations[index].name, representations[index].description);
+        if (representations[index].isText && !texts[index].empty()) std::fwrite(texts[index].data(), 1, std::strlen(texts[index].data()), file);
+        std::fputc('\n', file);
+    }
+    std::fclose(file);
+}
+
+VkPipelineCreateFlags PipelineCaptureFlags(const Context& context) {
+    if (!context.pipelineExecutableInfo) return 0;
+    return VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (pipelineIsaDirectory() != nullptr ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
+}
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline) {
     if (!context.pipelineExecutableInfo) return;
@@ -63,6 +101,12 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
                 throw std::runtime_error("unsupported pipeline statistic format");
             }
             std::fprintf(stderr, "[pipeline-stats] pipeline=0x%llx executable=%u %s=%s (%s)\n", static_cast<unsigned long long>(std::bit_cast<std::uint64_t>(pipeline)), index, statistic.name, value, statistic.description);
+        }
+        if (pipelineIsaDirectory() != nullptr) {
+            static const std::uint64_t minimum = [] { const char* text = std::getenv("APS5_PIPELINE_ISA_MIN"); return text ? std::strtoull(text, nullptr, 10) : 15000ull; }();
+            for (const auto& statistic : statistics) {
+                if (std::string_view(statistic.name) == "Instructions" && statistic.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR && statistic.value.u64 >= minimum) savePipelineRepresentations(context, executable, property.name);
+            }
         }
     }
 }
@@ -460,7 +504,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         blend.pAttachments = firstChannels.empty() ? nullptr : firstChannels.data();
         std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
         VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
+        pipelineInfo.flags = PipelineCaptureFlags(context);
         pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
         pipelineInfo.pStages = stages.data();
         VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
