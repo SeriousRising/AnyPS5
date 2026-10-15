@@ -21,6 +21,7 @@ struct Decoration {
     std::optional<std::uint32_t> stride;
     std::optional<std::uint32_t> index;
     bool block = false;
+    bool aliased = false;
     bool patch = false;
     bool perPrimitive = false;
     bool perVertex = false;
@@ -364,6 +365,10 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     decoration.perVertex = true;
                 }
                 if (kind == spv::DecorationBlock) decoration.block = true;
+                if (kind == spv::DecorationAliased) {
+                    Require(count == 3 && !decoration.aliased, "duplicate or malformed SPIR-V Aliased decoration");
+                    decoration.aliased = true;
+                }
                 break;
             }
             case spv::OpMemberDecorate:
@@ -433,6 +438,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         for (const auto& [name, operands] : module.modes) Require(operands.empty() && (name == spv::ExecutionModeOriginUpperLeft || name == spv::ExecutionModeEarlyFragmentTests || name == spv::ExecutionModeDepthReplacing || name == spv::ExecutionModeDepthLess || name == spv::ExecutionModeDepthGreater || name == spv::ExecutionModePixelInterlockOrderedEXT || name == spv::ExecutionModeStencilRefReplacingEXT), "unsupported fragment execution mode");
     } else Require(module.modes.empty(), "unsupported vertex execution mode");
     std::set<std::pair<std::uint32_t, std::uint32_t>> descriptors;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> bufferVariables;
     bool push = false;
     for (const auto& [id, variable] : module.variables) {
         if (variable.storage == spv::StorageClassFunction || variable.storage == spv::StorageClassPrivate) continue;
@@ -519,12 +525,14 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         } else {
             Require(variable.storage == spv::StorageClassStorageBuffer && decoration.set && decoration.binding, "unsupported or unbound shader resource");
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
-            Require(descriptors.insert(key).second, "duplicate SPIR-V resource binding");
+            const bool first = descriptors.insert(key).second;
             const auto binding = std::find_if(shader.bindings.begin(), shader.bindings.end(), [&](const auto& item) { return item.descriptorSet == key.first && item.binding == key.second; });
             Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata");
             Require(binding->kind == ShaderRecompiler::DescriptorKind::StorageBuffer, "SPIR-V descriptor type disagrees with recompiler binding metadata");
             Require(!binding->readOnly, "read-only descriptor metadata is unsupported because the recompiler emits no NonWritable decoration");
             const bool array = binding->role == ShaderRecompiler::DescriptorRole::GuestBuffers;
+            const auto previous = bufferVariables.find(key);
+            Require(first || (array && previous != bufferVariables.end() && decoration.aliased && module.decorations[previous->second].aliased), "duplicate SPIR-V resource binding without guest buffer aliases");
             Require(array || (ShaderRecompiler::BdaAbi::TableVersion(shader.bdaAbiVersion) && (binding->role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding->role == ShaderRecompiler::DescriptorRole::FaultBuffer)) || binding->role == ShaderRecompiler::DescriptorRole::ShaderData || binding->role == ShaderRecompiler::DescriptorRole::FlattenedSrt || binding->role == ShaderRecompiler::DescriptorRole::Gds, "SPIR-V descriptor role is unsupported");
             auto blockId = typeId;
             if (array) {
@@ -538,9 +546,18 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             const auto& block = module.Type(blockId);
             Require(block.size() == 3 && (block[0] & 0xffffu) == spv::OpTypeStruct && module.decorations[blockId].block, "descriptor must be a Block struct with exactly one member");
             const auto& words = module.Type(block[2]);
-            Require(words.size() == 3 && (words[0] & 0xffffu) == spv::OpTypeRuntimeArray && module.Signature(words[2]) == "u32", "descriptor block member must be a runtime array of u32");
+            Require(words.size() == 3 && (words[0] & 0xffffu) == spv::OpTypeRuntimeArray, "descriptor block member must be a runtime array");
+            const auto& element = module.Type(words[2]);
+            const bool integer = element.size() == 4 && (element[0] & 0xffffu) == spv::OpTypeInt && element[3] == 0u;
+            const bool u32 = integer && element[2] == 32u;
+            const bool u64 = integer && element[2] == 64u;
+            const bool u32x4 = element.size() == 4 && (element[0] & 0xffffu) == spv::OpTypeVector && element[3] == 4u && module.Signature(element[2]) == "u32";
+            Require(u32 || (array && decoration.aliased && (u64 || u32x4)), "descriptor block member must contain u32 or an aliased guest buffer view");
+            const auto stride = u64 ? 8u : u32x4 ? 16u : 4u;
+            Require(module.decorations[block[2]].stride == stride, "descriptor runtime array stride disagrees with its element type");
             const auto member = module.offsets.find({blockId, 0});
             Require(member != module.offsets.end() && member->second == 0, "descriptor block member must have offset zero");
+            bufferVariables.emplace(key, id);
         }
     }
     if (vertex) {
