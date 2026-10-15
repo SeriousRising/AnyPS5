@@ -65,6 +65,14 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 
 namespace {
 
+// Why a draw gets no recipe, by first refusal (APS5_PROFILE_DRAW), for the [draws] line.
+std::array<std::atomic<std::uint64_t>, 8> recipeBuildOutcomes{};
+
+bool recipeBuildProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
 std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
     if (const auto guest = FindGuestColorTargetFormat(format, elementBytes)) return *guest;
     throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
@@ -653,6 +661,11 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; recipe hits %llu, misses by reason:", static_cast<unsigned long long>(profile.recipeHits));
     for (std::size_t i = 1; i < profile.recipeMisses.size() && room(); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
+    }
+    if (room()) {
+        static constexpr const char* names[8] = {"uncacheable", "waited", "indirect", "template not reusable", "depth target", "moved buffers", "multisampled", "built"};
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; recipe builds by first refusal:");
+        for (std::size_t i = 0; i < 8 && room(); ++i) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", names[i], static_cast<unsigned long long>(recipeBuildOutcomes[i].exchange(0, std::memory_order_relaxed)));
     }
     std::fprintf(stderr, "%s\n", line);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
@@ -2473,6 +2486,11 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
+        if (recipeOut != nullptr && DrawRecipes() && recipeBuildProfiled()) {
+            // The first condition that keeps this draw from a recipe (APS5_PROFILE_DRAW).
+            const std::size_t why = !cacheable ? 0 : outcome.waited ? 1 : args != nullptr ? 2 : !resources->Reusable() ? 3 : state.depth ? 4 : !resolved.moved.empty() ? 5 : multisampled ? 6 : 7;
+            recipeBuildOutcomes[why].fetch_add(1, std::memory_order_relaxed);
+        }
         if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
