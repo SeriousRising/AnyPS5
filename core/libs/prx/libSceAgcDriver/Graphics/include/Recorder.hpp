@@ -78,6 +78,9 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     static void NotePassForced(const char* reason);
+    // Nonzero while a draw's render pass stays open: the same value for every draw that continues it,
+    // a new one after anything is recorded outside it (each pass end advances it).
+    std::uint64_t OpenPassSerial() const { return open != nullptr && open->renderPass.open ? passSerial : 0; }
     static std::string PassBreakReport();
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -877,6 +880,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     std::uint64_t submissions = 0;
+    std::uint64_t passSerial = 1;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per

@@ -68,6 +68,31 @@ namespace {
 // Why a draw gets no recipe, by first refusal (APS5_PROFILE_DRAW), for the [draws] line.
 std::array<std::atomic<std::uint64_t>, 8> recipeBuildOutcomes{};
 
+// Resident color targets per attachment index as the last draw left them: a draw that finds the same
+// render pass still open (nothing recorded outside it since), the same collect epoch (no ordering
+// point a CPU store could pass) and the same target description takes the image without refreshing
+// it again (APS5_NO_TARGET_REUSE refreshes every draw). Only that pass's own draws wrote it since.
+struct TargetReuse {
+    const Recorder* recorder = nullptr;
+    std::uint64_t pass = 0;
+    std::uint64_t epoch = 0;
+    ColorTarget color{};
+    std::weak_ptr<StorageTexture> resident;
+};
+thread_local std::array<TargetReuse, 8> targetReuse;
+std::atomic<std::uint64_t> targetReuseHits{0}, targetReuseMisses{0};
+
+bool targetReuseEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_TARGET_REUSE") == nullptr;
+    return enabled;
+}
+
+bool sameTarget(const ColorTarget& a, const ColorTarget& b) {
+    return a.address == b.address && a.surfaceAddress == b.surfaceAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes &&
+           a.dccAddress == b.dccAddress && a.cmaskAddress == b.cmaskAddress && a.cmaskBytes == b.cmaskBytes && a.cmaskFastClear == b.cmaskFastClear && a.clearWords == b.clearWords && a.mipCount == b.mipCount && a.mip == b.mip && a.depth == b.depth &&
+           a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples;
+}
+
 bool recipeBuildProfiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profile;
@@ -2254,7 +2279,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            auto* reuseRecorder = Recorder::Active();
+            if (targetReuseEnabled() && index < targetReuse.size() && reuseRecorder != nullptr) {
+                const auto& reuse = targetReuse[index];
+                const auto pass = reuseRecorder->OpenPassSerial();
+                if (pass != 0 && reuse.recorder == reuseRecorder && reuse.pass == pass && reuse.epoch == GuestMemory::CollectEpoch() && sameTarget(reuse.color, color)) binding.resident = reuse.resident.lock();
+                (binding.resident != nullptr ? targetReuseHits : targetReuseMisses).fetch_add(1, std::memory_order_relaxed);
+            }
+            if (binding.resident == nullptr) binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -2482,6 +2514,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.completion = completion;
         record.waited = outcome.waited;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
+        if (targetReuseEnabled()) {
+            const auto pass = recorder != nullptr ? recorder->OpenPassSerial() : 0;
+            for (std::size_t index = 0; index < targetReuse.size(); ++index) {
+                auto& reuse = targetReuse[index];
+                if (index < targets.size() && pass != 0 && targets[index].resident != nullptr && !targets[index].multisampled) reuse = {recorder, pass, GuestMemory::CollectEpoch(), targets[index].color, targets[index].resident};
+                else reuse = {};
+            }
+        }
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a

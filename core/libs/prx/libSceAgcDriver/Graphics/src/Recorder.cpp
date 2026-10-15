@@ -1510,6 +1510,7 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
 }
 
 void Recorder::endOpenRenderPass(bool barrier) {
+    ++passSerial;
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
