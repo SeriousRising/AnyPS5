@@ -1359,9 +1359,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->float64DenormPreserve = enabled.shaderFloat64 && floatControls.shaderDenormPreserveFloat64 == VK_TRUE &&
         floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
     if (state->float64DenormPreserve && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
-    // APS5_FAST_F32 (accuracy trade): the recompiler drops explicit f32 flushes and the guest NaN choice,
-    // and modules flush f32 denormals in hardware.
-    state->fastFloat32 = std::getenv("APS5_FAST_F32") != nullptr && floatControls.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+    // Fast f32 (default; APS5_NO_FAST_F32 turns it off; an accuracy trade): the recompiler drops explicit
+    // f32 flushes and the guest NaN choice, and modules flush f32 denormals in hardware.
+    state->fastFloat32 = std::getenv("APS5_NO_FAST_F32") == nullptr && floatControls.shaderDenormFlushToZeroFloat32 == VK_TRUE;
     if (state->fastFloat32 && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormFlushToZero);
     enabled.vertexPipelineStoresAndAtomics = VK_TRUE;
     enabled.fragmentStoresAndAtomics = VK_TRUE;
