@@ -32,7 +32,17 @@ public:
 private:
     void initializeAddress(VkBufferUsageFlags usage);
     void release() noexcept;
-    Context context;
+    template<typename TFunction>
+    TFunction function(const char* name) const {
+        Require(deviceProc != nullptr, "missing Vulkan device function resolver");
+        const auto resolved = reinterpret_cast<TFunction>(deviceProc(device, name));
+        Require(resolved != nullptr, std::string("missing Vulkan function: ") + name);
+        return resolved;
+    }
+    // What the handles' release needs of the creating Context (a whole copy per buffer cost ~2 KiB
+    // and a shared_ptr count on every snapshot).
+    VkDevice device;
+    PFN_vkGetDeviceProcAddr deviceProc;
     VkDeviceAddress deviceAddress = 0;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;

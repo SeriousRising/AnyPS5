@@ -50,7 +50,7 @@ void NoteBufferUnmapped(VkDeviceSize bytes) noexcept {
     mappedBytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool exactHandle) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), handleBytes(size) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool exactHandle) : device(context.device), deviceProc(context.deviceProc), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties), handleBytes(size) {
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
@@ -142,16 +142,16 @@ void Buffer::release() noexcept {
         return;
     }
     if (slab) {
-        if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+        if (buffer) function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device, buffer, nullptr);
         cache->PutSlot(memory, offset);
         return;
     }
     if (mapping) {
-        context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
+        function<PFN_vkUnmapMemory>("vkUnmapMemory")(device, memory);
         NoteBufferUnmapped(allocationBytes);
     }
-    if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (buffer) function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device, buffer, nullptr);
+    if (memory) function<PFN_vkFreeMemory>("vkFreeMemory")(device, memory, nullptr);
 }
 
 VkBuffer Buffer::Handle() const {
@@ -169,7 +169,7 @@ void Buffer::Invalidate() {
     range.memory = memory;
     range.offset = offset;
     range.size = slab ? static_cast<VkDeviceSize>(capacity) : VK_WHOLE_SIZE;
-    Check(context.Function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(context.device, 1, &range), "vkInvalidateMappedMemoryRanges");
+    Check(function<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges")(device, 1, &range), "vkInvalidateMappedMemoryRanges");
 }
 
 DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
