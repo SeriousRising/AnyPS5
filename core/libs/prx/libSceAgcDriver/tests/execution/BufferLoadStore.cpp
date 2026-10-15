@@ -291,9 +291,9 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, s
 void CheckDwordx4Stores(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     constexpr std::array<std::uint32_t, 4> values{0x12345678u, 0x89abcdefu, 0x76543210u, 0xfedcba98u};
     alignas(256) std::array<std::uint32_t, 12> code{
-        0x34020084u, // v_lshlrev_b32 v1, 4, v0
+        0x34020084u,
         0x7e0802ffu, values[0], 0x7e0a02ffu, values[1], 0x7e0c02ffu, values[2], 0x7e0e02ffu, values[3],
-        0xe0781000u, 0x80000401u, 0xbf810000u, // buffer_store_dwordx4 v[4:7], v1, s[0:3], 0 offen
+        0xe0781000u, 0x80000401u, 0xbf810000u,
     };
     struct Case {
         std::uint32_t offset;
@@ -313,7 +313,7 @@ void CheckDwordx4Stores(AgcDriver::VulkanDevice& device, std::uint32_t waveSize)
         expected.fill(0xa5u);
         code[9] = 0xe0781000u | value.offset | (value.coherent ? 0x4000u : 0u);
         auto userData = BufferDescriptor(output + value.baseOffset, value.bytes);
-        if (value.swizzle) userData[1] |= 0x80100000u; // stride 16, swizzle enabled
+        if (value.swizzle) userData[1] |= 0x80100000u;
         const std::span<const std::uint32_t> words(code);
         const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(words)}}};
         const ShaderRecompiler::ShaderComputeStageInfo compute{{waveSize, 1u, 1u}, 0u, {false, false, false}, false, 1u};
