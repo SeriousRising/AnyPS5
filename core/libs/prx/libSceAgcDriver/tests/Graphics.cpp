@@ -3162,6 +3162,7 @@ struct ModuleShape {
     std::uint32_t pushLength = 32;
     std::uint32_t pushStride = 4;
     std::uint32_t bufferArray = 0;
+    std::uint32_t bufferAlias = 0;
     bool plainBuffer = false;
     bool shaderData = false;
     bool vertexInput = false;
@@ -3328,13 +3329,37 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
             emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassStorageBuffer});
             emit(annotations, spv::OpDecorate, {variable, spv::DecorationDescriptorSet, 0});
             emit(annotations, spv::OpDecorate, {variable, spv::DecorationBinding, binding});
+            return variable;
         };
         if (shape.bufferArray != 0) {
             const auto length = id();
             const auto array = id();
             emit(declarations, spv::OpConstant, {uintType, length, shape.bufferArray});
             emit(declarations, spv::OpTypeArray, {array, block, length});
-            declare(array, 0);
+            const auto variable = declare(array, 0);
+            if (shape.bufferAlias != 0u) {
+                auto element = uintType;
+                if (shape.bufferAlias != 32u) {
+                    element = id();
+                    if (shape.bufferAlias == 64u) emit(declarations, spv::OpTypeInt, {element, 64u, 0u});
+                    else emit(declarations, spv::OpTypeVector, {element, uintType, 4u});
+                }
+                const auto aliasRuntime = id();
+                const auto aliasBlock = id();
+                const auto aliasLength = id();
+                const auto aliasArray = id();
+                emit(declarations, spv::OpTypeRuntimeArray, {aliasRuntime, element});
+                emit(declarations, spv::OpTypeStruct, {aliasBlock, aliasRuntime});
+                emit(declarations, spv::OpConstant, {uintType, aliasLength, shape.bufferArray});
+                emit(declarations, spv::OpTypeArray, {aliasArray, aliasBlock, aliasLength});
+                emit(annotations, spv::OpDecorate, {aliasRuntime, spv::DecorationArrayStride, shape.bufferAlias / 8u});
+                emit(annotations, spv::OpDecorate, {aliasBlock, spv::DecorationBlock});
+                emit(annotations, spv::OpMemberDecorate, {aliasBlock, 0u, spv::DecorationOffset, 0u});
+                const auto alias = declare(aliasArray, 0);
+                emit(annotations, spv::OpDecorate, {variable, spv::DecorationAliased});
+                emit(annotations, spv::OpDecorate, {alias, spv::DecorationAliased});
+                emit(annotations, spv::OpDecorate, {alias, spv::DecorationCoherent});
+            }
         }
         if (shape.plainBuffer) declare(block, 0);
         if (shape.shaderData) declare(block, 5);
@@ -3345,6 +3370,7 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     emit(function, spv::OpFunctionEnd, {});
     std::vector<std::uint32_t> words{spv::MagicNumber, 0x10300, 0, next, 0};
     emit(words, spv::OpCapability, {spv::CapabilityShader});
+    if (shape.bufferAlias == 64u) emit(words, spv::OpCapability, {spv::CapabilityInt64});
     if (shape.sampleId) emit(words, spv::OpCapability, {spv::CapabilitySampleRateShading});
     if (shape.layer) emit(words, spv::OpCapability, {spv::CapabilityGeometry});
     if (shape.barycentric) {
@@ -4769,6 +4795,87 @@ void validationTests() {
         return vertex;
     };
     validate(pushed({.push = true, .bufferArray = 2}), 8);
+    for (const auto width : {32u, 64u, 128u}) {
+        auto vertex = pushed({.push = true, .bufferArray = 2, .bufferAlias = width});
+        vertex.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+        validate(vertex, 8);
+    }
+    for (std::uint32_t failure = 0; failure < 9u; ++failure) {
+        auto vertex = pushed({.push = true, .bufferArray = 2, .bufferAlias = failure == 7u ? 32u : failure == 6u ? 64u : 128u});
+        auto code = vertex.spirv.Words();
+        const auto last = [&](spv::Op opcode, std::uint32_t decoration = 0xffffffffu) {
+            std::size_t found = 0;
+            for (std::size_t at = 5; at < code.size(); at += code[at] >> 16u) {
+                if ((code[at] & 0xffffu) == opcode && (decoration == 0xffffffffu || code[at + 2] == decoration)) found = at;
+            }
+            Require(found != 0, "buffer alias validation fixture is missing an instruction");
+            return found;
+        };
+        const char* error = nullptr;
+        switch (failure) {
+        case 0:
+        case 1: {
+            const auto at = last(spv::OpDecorate, spv::DecorationAliased) - (failure == 0 ? 3u : 0u);
+            code[at + 2] = spv::DecorationRelaxedPrecision;
+            error = "without guest buffer aliases";
+            break;
+        }
+        case 2: {
+            const auto at = last(spv::OpDecorate, spv::DecorationAliased);
+            code[at] += 1u << 16u;
+            code.insert(code.begin() + at + 3u, 0u);
+            error = "malformed SPIR-V Aliased decoration";
+            break;
+        }
+        case 3:
+            code[last(spv::OpConstant) + 3u] = 1u;
+            error = "descriptor array length disagrees";
+            break;
+        case 4:
+            code[last(spv::OpDecorate, spv::DecorationArrayStride) + 3u] = 8u;
+            error = "runtime array stride disagrees";
+            break;
+        case 5:
+            code[last(spv::OpTypeVector) + 3u] = 3u;
+            error = "aliased guest buffer view";
+            break;
+        case 6:
+            code[last(spv::OpTypeInt) + 3u] = 1u;
+            error = "aliased guest buffer view";
+            break;
+        case 7:
+            code[last(spv::OpDecorate, spv::DecorationCoherent) + 2u] = spv::DecorationRelaxedPrecision;
+            break;
+        case 8:
+            code[last(spv::OpMemberDecorate) + 4u] = 4u;
+            error = "member must have offset zero";
+            break;
+        }
+        vertex.spirv = std::move(code);
+        if (error != nullptr) expectFailure([&] { validate(vertex, 8); }, error);
+        else validate(vertex, 8);
+    }
+    {
+        auto vertex = pushed({.push = true, .bufferArray = 2, .bufferAlias = 128u});
+        vertex.bindings.front().kind = Kind::UniformBuffer;
+        expectFailure([&] { validate(vertex, 8); }, "disagrees with recompiler binding metadata");
+    }
+    {
+        ShaderRecompiler::RecompileResult vertex;
+        auto code = makeModule({.plainBuffer = true, .shaderData = true});
+        std::vector<std::uint32_t> aliases;
+        std::size_t declarations = 0;
+        for (std::size_t at = 5; at < code.size(); at += code[at] >> 16u) {
+            if ((code[at] & 0xffffu) == spv::OpTypeVoid) declarations = at;
+            if ((code[at] & 0xffffu) != spv::OpDecorate || code[at + 2] != spv::DecorationBinding) continue;
+            code[at + 3] = 0u;
+            emit(aliases, spv::OpDecorate, {code[at + 1], spv::DecorationAliased});
+        }
+        code.insert(code.begin() + declarations, aliases.begin(), aliases.end());
+        vertex.spirv = std::move(code);
+        vertex.bindings.push_back(makeBinding(Role::ShaderData, 0, 1, {1, 2}));
+        expectFailure([&] { validate(vertex, 0); }, "duplicate SPIR-V resource binding");
+    }
     {
         ShaderRecompiler::RecompileResult vertex;
         vertex.spirv = makeModule({.shaderData = true});

@@ -288,6 +288,60 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, s
     device.WaitIdle();
 }
 
+void CheckDwordx4Stores(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+    constexpr std::array<std::uint32_t, 4> values{0x12345678u, 0x89abcdefu, 0x76543210u, 0xfedcba98u};
+    alignas(256) std::array<std::uint32_t, 12> code{
+        0x34020084u,
+        0x7e0802ffu, values[0], 0x7e0a02ffu, values[1], 0x7e0c02ffu, values[2], 0x7e0e02ffu, values[3],
+        0xe0781000u, 0x80000401u, 0xbf810000u,
+    };
+    struct Case {
+        std::uint32_t offset;
+        std::uint32_t bytes;
+        std::uint32_t baseOffset;
+        bool swizzle;
+        bool coherent;
+    };
+    const auto full = waveSize * 16u;
+    const std::array<Case, 8> cases{{{0u, full, 0u, false, false}, {0u, full, 0u, false, true}, {0u, full, 16u, false, false},
+        {4u, full + 4u, 0u, false, false}, {0u, 8u, 0u, false, false}, {0u, 12u, 0u, false, false},
+        {0u, full, 1u, false, false}, {0u, full, 0u, true, false}}};
+    auto* output = reinterpret_cast<std::uint8_t*>(Output.data());
+    std::array<std::uint8_t, sizeof(Output)> expected{};
+    for (const auto& value : cases) {
+        Output.fill(0xa5a5a5a5u);
+        expected.fill(0xa5u);
+        code[9] = 0xe0781000u | value.offset | (value.coherent ? 0x4000u : 0u);
+        auto userData = BufferDescriptor(output + value.baseOffset, value.bytes);
+        if (value.swizzle) userData[1] |= 0x80100000u;
+        const std::span<const std::uint32_t> words(code);
+        const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(words)}}};
+        const ShaderRecompiler::ShaderComputeStageInfo compute{{waveSize, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        ShaderRecompiler::RecompileRequest request{
+            {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), words, 0, {}},
+            {waveSize, 0u, userData, compute, std::nullopt, std::nullopt, memory}, device.Target(), {0u, 0u, 0u, 128u}};
+        request.useCache = false;
+        const auto result = ShaderRecompiler::Recompile(request);
+        device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+        device.WaitIdle();
+        for (std::uint32_t lane = 0; lane < waveSize; ++lane) {
+            for (std::uint32_t component = 0; component < values.size(); ++component) {
+                const auto offset = lane * 16u + value.offset + component * 4u;
+                if (offset + 4u > (value.swizzle ? 16u : value.bytes)) continue;
+                const auto address = value.baseOffset + (value.swizzle ? offset * 8u : offset);
+                for (std::uint32_t byte = 0; byte < 4u; ++byte) expected[address + byte] = static_cast<std::uint8_t>(values[component] >> (byte * 8u));
+            }
+        }
+        for (std::size_t byte = 0; byte < expected.size(); ++byte) {
+            if (output[byte] == expected[byte]) continue;
+            Require(false, "dwordx4 store wave" + std::to_string(waveSize) + " offset " + std::to_string(value.offset) +
+                " size " + std::to_string(value.bytes) + " base +" + std::to_string(value.baseOffset) +
+                " swizzle " + std::to_string(value.swizzle) + " coherent " + std::to_string(value.coherent) +
+                ": byte " + std::to_string(byte) + " is " + Hex(output[byte]) + ", expected " + Hex(expected[byte]));
+        }
+    }
+}
+
 void CheckRuntimeDescriptors(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     constexpr std::array<std::uint32_t, 6> code{0x34040082u, 0xe0000000u, 0x80000100u, 0xe0701000u, 0x80010102u, 0xbf810000u};
     struct Case {
@@ -353,6 +407,8 @@ int main() {
         Check(Expected64, Names, "wave64 split");
         CheckRuntimeDescriptors(*device, 32u);
         CheckRuntimeDescriptors(*device, 64u);
+        CheckDwordx4Stores(*device, 32u);
+        CheckDwordx4Stores(*device, 64u);
         std::puts("buffer load store tests passed");
         return 0;
     } catch (const std::exception& error) {

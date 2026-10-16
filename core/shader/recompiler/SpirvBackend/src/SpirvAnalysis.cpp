@@ -341,6 +341,7 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 }
                 const auto& memory = program.Resources().memoryInfo.at(memoryIndex);
                 requirements.coherentBuffers = requirements.coherentBuffers || (memory.coherent && !memory.gpuDescriptor);
+                requirements.bufferVectorStores = requirements.bufferVectorStores || (inst->Opcode() == IrOpcode::StoreBufferU32x4 && memory.dataBits == 32u && !memory.formatted && !memory.gpuDescriptor);
                 if (!memory.planningOnly) {
                     requirements.subgroupLocalInvocationId = requirements.subgroupLocalInvocationId || program.Resources().stage == IrShaderStage::Compute;
                 }

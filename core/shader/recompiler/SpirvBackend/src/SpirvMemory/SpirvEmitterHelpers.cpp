@@ -111,6 +111,13 @@ std::uint32_t StorageBufferU64BlockType(SpirvEmitterState& state) {
         array);
 }
 
+std::uint32_t StorageBufferU32x4BlockType(SpirvEmitterState& state) {
+    const auto array = state.module.DecoratedType(spv::OpTypeRuntimeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 16u}}}, TypeU32Vector(state, 4u));
+    return state.module.DecoratedType(spv::OpTypeStruct,
+        {{spv::OpDecorate, {spv::DecorationBlock}},
+         {spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}}}, array);
+}
+
 std::uint32_t PushConstantArrayType(SpirvEmitterState& state) {
     const auto count = ConstantU32(state, PushData::DwordCount);
     return state.module.DecoratedType(spv::OpTypeArray,
@@ -409,14 +416,16 @@ void DefineDescriptors(SpirvEmitterState& state) {
             state.storageBufferVariable = Define(ArrayType(StorageBufferBlockType(state)), "buffers");
             if (state.requirements.coherentBufferAlias) state.storageBufferCoherentVariable = Define(ArrayType(StorageBufferBlockType(state)), "buffers_coherent");
             if (state.requirements.bufferInt64Atomics) state.storageBufferU64Variable = Define(ArrayType(StorageBufferU64BlockType(state)), "buffers_u64");
-            if (state.storageBufferU64Variable != 0u || state.storageBufferCoherentVariable != 0u) {
-                for (const auto variable : {state.storageBufferVariable, state.storageBufferCoherentVariable, state.storageBufferU64Variable}) {
+            if (state.requirements.bufferVectorStores) state.storageBufferU32x4Variable = Define(ArrayType(StorageBufferU32x4BlockType(state)), "buffers_u32x4");
+            if (state.storageBufferU64Variable != 0u || state.storageBufferCoherentVariable != 0u || state.storageBufferU32x4Variable != 0u) {
+                for (const auto variable : {state.storageBufferVariable, state.storageBufferCoherentVariable, state.storageBufferU64Variable, state.storageBufferU32x4Variable}) {
                     if (variable != 0u) state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
                 }
             }
             if (state.requirements.coherentBuffers) {
                 state.module.AddAnnotation(spv::OpDecorate, state.storageBufferCoherentVariable != 0u ? state.storageBufferCoherentVariable : state.storageBufferVariable, spv::DecorationCoherent);
                 if (state.storageBufferU64Variable != 0u) state.module.AddAnnotation(spv::OpDecorate, state.storageBufferU64Variable, spv::DecorationCoherent);
+                if (state.storageBufferU32x4Variable != 0u) state.module.AddAnnotation(spv::OpDecorate, state.storageBufferU32x4Variable, spv::DecorationCoherent);
             }
             break;
         case DescriptorBindingKind::BdaPagetable:
