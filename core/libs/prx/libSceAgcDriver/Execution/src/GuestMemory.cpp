@@ -1190,6 +1190,10 @@ void BumpCollectEpoch() {
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
+void FollowCollectEpoch() {
+    threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }

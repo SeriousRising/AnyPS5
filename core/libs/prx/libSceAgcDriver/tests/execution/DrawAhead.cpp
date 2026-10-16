@@ -657,7 +657,7 @@ int main(int argc, char** argv) {
                 const bool off = std::getenv("APS5_NO_DRAW_AHEAD") != nullptr;
                 std::printf("draw ahead: %llu draws prepared ahead, %llu hit\n", static_cast<unsigned long long>(counts.prepared), static_cast<unsigned long long>(counts.hits));
                 Require(off ? counts.prepared == 0 && counts.hits == 0 : counts.prepared != 0 && counts.hits != 0, off ? "draw ahead: draws were prepared ahead with the look-ahead switched off" : "draw ahead: no draw was prepared ahead and then hit");
-                if (std::getenv("APS5_SPLIT_DRAWS") != nullptr) {
+                if (std::getenv("APS5_SPLIT_VERIFY") != nullptr) {
                     std::printf("draw ahead: %llu draws recorded by the split recorder\n", static_cast<unsigned long long>(AgcDriver::SplitDrawsHanded()));
                     Require(AgcDriver::SplitDrawsHanded() != 0, "draw ahead: no draw went to the split recorder");
                 }

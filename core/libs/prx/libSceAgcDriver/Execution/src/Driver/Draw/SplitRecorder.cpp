@@ -13,7 +13,7 @@
 #include <cstdlib>
 #include <immintrin.h>
 
-// Split recording (APS5_SPLIT_DRAWS=1; design in NEXT.md "Two-stage worker design"): the queue-0
+// Split recording (default; APS5_NO_SPLIT_DRAWS=1 turns it off; design in the project's NEXT.md): the queue-0
 // worker keeps packet decode, register state and every draw's front half, and hands each cache-hit
 // draw to a recorder thread that records it in packet order with the labels queued before it.
 // While draws are in flight the worker records nothing: a gate on its GPU-mutex acquisitions waits
@@ -34,7 +34,7 @@ constexpr std::size_t SplitWindow = 64;
 }
 
 bool Driver::splitDraws() {
-    static const bool enabled = std::getenv("APS5_SPLIT_DRAWS") != nullptr && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr && drawEntries() && registerKeyEnabled();
+    static const bool enabled = std::getenv("APS5_NO_SPLIT_DRAWS") == nullptr && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr && drawEntries() && registerKeyEnabled();
     return enabled;
 }
 
@@ -309,7 +309,7 @@ void Driver::runSplitRecorder() noexcept {
             }
             if (draw->collectEpoch != collectEpoch) {
                 collectEpoch = draw->collectEpoch;
-                GuestMemory::BumpCollectEpoch();
+                GuestMemory::FollowCollectEpoch();
             }
             recordSplitDraw(*draw);
             splitRecorded.store(draw->sequence, std::memory_order_release);

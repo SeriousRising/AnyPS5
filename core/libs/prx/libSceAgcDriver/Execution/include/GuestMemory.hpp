@@ -97,6 +97,9 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+// A fresh epoch for a thread that continues another worker's packet order (the split recorder) at
+// an ordering point that worker already passed and counted: not counted again.
+void FollowCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
@@ -169,7 +172,7 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
-// Split recording (APS5_SPLIT_DRAWS): a worker whose recording another thread continues in packet
+// Split recording (default, APS5_NO_SPLIT_DRAWS=1 off): a worker whose recording another thread continues in packet
 // order installs a gate on itself, run before each of its outermost acquisitions: lock() waits in
 // it until that thread has recorded everything handed over, try_lock() fails while it has not.
 void SetGpuLockGate(bool (*gate)(bool wait));
