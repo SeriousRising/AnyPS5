@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/SplitRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -36,6 +37,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -66,6 +68,7 @@ public:
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     DrawEntryCounters DrawCacheCounters();
     DrawAheadTotals DrawAheadCounts();
+    std::uint64_t SplitDrawsHanded();
 
 private:
     friend class SampledReadScope;
@@ -145,6 +148,22 @@ private:
     bool awaitDrawAhead();
     void prepareDrawAhead(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
+    static bool splitDraws();
+    static bool splitVerify();
+    static bool& splitLeader();
+    static std::deque<SplitTransitLabel>& splitTransitLabels();
+    static bool& splitWaitInOrder();
+    bool splitBusy();
+    // site: the packet opcode that drains, or one of the SplitSite values (SplitRecorder.cpp).
+    void splitDrain(std::uint32_t site);
+    std::optional<std::uint32_t> splitDrainSite(std::uint32_t header, std::span<const std::uint32_t> packet, const QueueState& queue);
+    static bool splitGate(bool wait);
+    void splitHandOver(std::unique_ptr<SplitDraw> draw);
+    bool splitLabelsOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
+    void runSplitRecorder() noexcept;
+    void recordSplitDraw(SplitDraw& draw);
+    void stopSplitRecorder();
+    void reportSplit();
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
@@ -332,6 +351,26 @@ private:
     std::uint64_t validatedThroughHookReported = 0;
     std::array<std::atomic<std::uint64_t>, DrawLockRunCountKinds> drawLockRunCounts{};
     std::array<std::uint64_t, DrawLockRunCountKinds> drawLockRunReported{};
+
+    // Split recording (Draw/SplitRecorder.cpp): the worker hands draws over under splitMutex; the
+    // recorder is idle when it has recorded every one and given the GPU mutex up.
+    std::mutex splitMutex;
+    std::condition_variable splitWake;
+    std::condition_variable splitIdled;
+    std::deque<std::unique_ptr<SplitDraw>> splitOps;
+    std::thread splitThread;
+    std::exception_ptr splitError;
+    std::atomic<bool> splitIdle{true};
+    std::atomic<bool> splitFailed{false};
+    bool splitSleeping = false;
+    bool splitLeaderWaiting = false;
+    bool splitStop = false;
+    std::uint64_t splitHanded = 0;
+    std::atomic<std::uint64_t> splitRecorded{0};
+    std::array<std::atomic<std::uint64_t>, 7> splitCounts{};
+    std::array<std::uint64_t, 7> splitReported{};
+    std::array<std::atomic<std::uint64_t>, 0x109> splitDrainSites{};
+    std::array<std::uint64_t, 0x109> splitDrainSitesReported{};
 
     std::mutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};

@@ -29,6 +29,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return DrawVerdict::Drawn;
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
+    if (submission.queue == 0) reportSplit();
+    // Split recording: an indirect draw reads its records only after the recorder has recorded
+    // every draw before it.
+    if (drawParameters.indirect) splitDrain(0x102);
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
     phaseTiming.Phase(DrawRowPrecheck);
@@ -187,7 +191,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool verifyHit = false;
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
 
-    if (!drawHit) endDrawLockRun(RunEndedByMiss);
+    if (!drawHit) {
+        endDrawLockRun(RunEndedByMiss);
+    }
     if ((drawHit || verifyHit) && submission.queue == 0 && std::all_of(matched.begin(), matched.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr || variant->ahead.load(std::memory_order_relaxed) != 0; })) {
         for (const auto& variant : matched) {
             if (variant != nullptr) variant->ahead.fetch_sub(1, std::memory_order_relaxed);
@@ -403,6 +409,27 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
+    }
+    // Never while this thread holds the GPU mutex: its nested acquisitions pass no gate.
+    if (splitLeader() && drawHit && !GuestMemory::GpuMutex().HeldByThisThread()) {
+        auto split = std::make_unique<SplitDraw>();
+        split->device = std::move(localDevice);
+        split->decode = decode;
+        split->programs = std::move(programsCopy);
+        split->parameters = drawParameters;
+        split->results = std::move(results);
+        split->stages = std::move(stages);
+        split->snapshots = std::move(snapshots);
+        split->decodeReads = std::move(decodeReads);
+        split->matched = std::move(matched);
+        split->matchedRegions = std::move(matchedRegions);
+        split->recipeStages = std::move(recipeStages);
+        split->recipe = std::move(recipe);
+        split->drawKey = drawKey;
+        split->header = packet[0];
+        split->collectEpoch = GuestMemory::CollectEpoch();
+        splitHandOver(std::move(split));
+        return DrawVerdict::Drawn;
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);

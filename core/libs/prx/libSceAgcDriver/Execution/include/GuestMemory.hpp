@@ -169,6 +169,10 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// Split recording (APS5_SPLIT_DRAWS): a worker whose recording another thread continues in packet
+// order installs a gate on itself, run before each of its outermost acquisitions: lock() waits in
+// it until that thread has recorded everything handed over, try_lock() fails while it has not.
+void SetGpuLockGate(bool (*gate)(bool wait));
 std::uint64_t GpuHoldSerial();
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must

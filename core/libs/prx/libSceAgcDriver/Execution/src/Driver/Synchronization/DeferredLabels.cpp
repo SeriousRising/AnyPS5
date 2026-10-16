@@ -160,6 +160,18 @@ void Driver::recordQueuedLabelsBeforeRead(std::uint32_t queue) {
 }
 
 bool Driver::recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    // Split recording: a capture over a label this worker holds or handed over is redone once the
+    // label is recorded, as for a held label without the split.
+    if (splitLeader() && (!splitTransitLabels().empty() || !deferredLabels().labels.empty())) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+        for (const auto& region : regions) runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+        if (splitLabelsOver(runs)) {
+            recordQueuedLabelsBeforeRead(queue);
+            splitDrain(0x108);
+            ++captureRetries;
+            return true;
+        }
+    }
     const auto& labels = deferredLabels().labels;
     if (labels.empty()) return false;
     for (const auto& label : labels) {

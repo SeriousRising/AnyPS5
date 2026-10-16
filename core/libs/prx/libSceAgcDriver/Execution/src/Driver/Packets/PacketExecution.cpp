@@ -117,7 +117,7 @@ void Driver::execute(const Submission& submission) {
             run.enabled = false;
         }
     } lockRunScope{*this, drawLockRun()};
-    lockRunScope.run.enabled = submission.queue == 0 && drawLockRunEnabled();
+    lockRunScope.run.enabled = submission.queue == 0 && drawLockRunEnabled() && !splitLeader();
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
@@ -140,6 +140,13 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        // Split recording: only register writes, draws, labels and the packets that read no
+        // recorded state run while the recorder still holds draws; the rest wait until it is idle
+        // (packets that take the GPU mutex wait in its gate anyway).
+        if (splitLeader()) {
+            splitWaitInOrder() = false;
+            if (const auto site = splitDrainSite(header, packet, queue)) splitDrain(*site);
+        }
         if (lockRunScope.run.lock.owns_lock()) {
             const bool follows = !Pm4::Predicated(header) && (Pm4::DrawOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x7a || opcode == 0x26 || opcode == 0x2a || opcode == 0x2f || opcode == 0x13);
             if (!follows) endDrawLockRun(RunEndedByPacket);
@@ -271,7 +278,7 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x3c || opcode == 0x93) {
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
             const auto waitStart = std::chrono::steady_clock::now();
-            timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
+            if (!std::exchange(splitWaitInOrder(), false)) timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
             gateOpened() = true;
             if (traceGpu && std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(200)) {
 
@@ -343,6 +350,8 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
+    // A submission completes only once its draws are recorded (completion orders other queues).
+    splitDrain(0x100);
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

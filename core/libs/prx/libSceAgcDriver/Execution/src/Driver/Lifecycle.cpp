@@ -44,6 +44,7 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    stopSplitRecorder();
     stopDrawAhead();
     StopWorkerSampler();
     CloseRegistrationPreparation();

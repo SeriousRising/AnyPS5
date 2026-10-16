@@ -78,6 +78,7 @@ void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_
 void Driver::landPendingWaits(std::uint32_t queue) {
     auto& waits = pendingWaits();
     if (waits.empty()) return;
+    splitDrain(0x103);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct LandStats {
         std::uint64_t lands = 0, waited = 0;

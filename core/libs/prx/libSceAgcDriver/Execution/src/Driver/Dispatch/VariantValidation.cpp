@@ -72,6 +72,13 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     if (live != nullptr) live->clear();
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
+    // Split recording: labels this worker still holds or handed over stay queued much longer than
+    // without the split (until the next draw's record), so over the entry's memory they are recorded
+    // now and the checks below see them as pending writes, instead of refusing the entry.
+    if (splitLeader() && splitLabelsOver(variant.runs)) {
+        recordQueuedLabelsBeforeRead(queue);
+        splitDrain(0x108);
+    }
     PendingView pending;
     pending.Load();
     if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling)) return EntryOutcome::Differing;

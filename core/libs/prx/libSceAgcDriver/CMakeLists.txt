@@ -136,6 +136,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/SplitRecorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
@@ -399,6 +400,23 @@ if(BUILD_TESTING)
     set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_gpu_lock_gate_tests EXCLUDE_FROM_ALL
+        tests/GpuLockGate.cpp
+        Execution/src/GuestMemory.cpp
+)
+target_include_directories(agc_gpu_lock_gate_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_gpu_lock_gate_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_gpu_lock_gate_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_gpu_lock_gate_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_gpu_lock_gate_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_gpu_lock_gate COMMAND agc_gpu_lock_gate_tests)
+    if(WIN32)
+        set_tests_properties(agc_gpu_lock_gate PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1288,11 +1306,11 @@ if(BUILD_TESTING)
             set_tests_properties(${agcWaitTest}_${agcWaitName} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    foreach(agcAheadMode IN ITEMS "off|APS5_NO_DRAW_AHEAD=1" "without_pending|APS5_NO_DRAW_AHEAD_PENDING=1" "without_lock_run|APS5_NO_DRAW_LOCK_RUN=1" "without_image_hook|APS5_NO_VALIDATE_IMAGE_HOOK=1" "without_mesh_ahead|APS5_NO_DRAW_AHEAD_MESH=1" "verified|APS5_VERIFY_DRAW_ENTRIES=1|APS5_VERIFY_DRAW_RECIPE=1")
+    foreach(agcAheadMode IN ITEMS "off|APS5_NO_DRAW_AHEAD=1" "without_pending|APS5_NO_DRAW_AHEAD_PENDING=1" "without_lock_run|APS5_NO_DRAW_LOCK_RUN=1" "without_image_hook|APS5_NO_VALIDATE_IMAGE_HOOK=1" "without_mesh_ahead|APS5_NO_DRAW_AHEAD_MESH=1" "verified|APS5_VERIFY_DRAW_ENTRIES=1|APS5_VERIFY_DRAW_RECIPE=1" "split|APS5_SPLIT_DRAWS=1|APS5_SPLIT_VERIFY=1")
         string(REPLACE "|" ";" agcAheadMode "${agcAheadMode}")
         list(POP_FRONT agcAheadMode agcAheadName)
         add_test(NAME agc_driver_draw_ahead_${agcAheadName} COMMAND agc_driver_draw_ahead_tests)
-        set_tests_properties(agc_driver_draw_ahead_${agcAheadName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcAheadMode}" FAIL_REGULAR_EXPRESSION "draw-cache. verify:" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(agc_driver_draw_ahead_${agcAheadName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${agcAheadMode}" FAIL_REGULAR_EXPRESSION "draw-cache. verify:|split. verify: draw" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         if(WIN32)
             set_tests_properties(agc_driver_draw_ahead_${agcAheadName} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()

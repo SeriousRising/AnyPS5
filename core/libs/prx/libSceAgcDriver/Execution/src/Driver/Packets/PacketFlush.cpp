@@ -12,10 +12,13 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0};
     static const bool profileSteps = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // Split recording: the recorder does these duties per draw while it holds draws. The worker
+    // never notes queued labels (its labels move into hand-overs, where nobody would forget them).
+    if (splitLeader() && splitBusy()) return;
     LabelStepTimer steps(profileSteps);
     auto& deferred = deferredLabels();
     const bool queued = !deferred.labels.empty();
-    const bool queuedTable = queued && QueuedLabelTable();
+    const bool queuedTable = queued && QueuedLabelTable() && !splitLeader();
     if (queuedTable) noteQueuedLabels(queue);
     const bool selfLocking = !ownLock && PacketLocksItself(header);
     bool submit = false, record = false, needsRecord = false, deferredDue = false, pendingDue = false;

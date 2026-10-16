@@ -1613,12 +1613,24 @@ const void* ThreadToken() {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+namespace {
+thread_local bool (*lockGate)(bool wait) = nullptr;
+}
+
+void SetGpuLockGate(bool (*gate)(bool wait)) {
+    lockGate = gate;
+}
+
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool GpuMutexType::try_lock() {
+    if (lockGate != nullptr && !HeldByThisThread() && !lockGate(false)) {
+        if (GpuLockProfiled()) LockStats().nextSite = GpuLockSite::Other;
+        return false;
+    }
     if (!GpuLockProfiled()) {
         if (!mutex.try_lock()) return false;
         acquired();
@@ -1682,6 +1694,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (lockGate != nullptr && !HeldByThisThread()) lockGate(true);
     if (!GpuLockProfiled()) {
         if (!mutex.try_lock()) {
             waiting.fetch_add(1, std::memory_order_acq_rel);
