@@ -533,6 +533,8 @@ public:
     };
     // The rows gathered since the last [gputime] report.
     static std::vector<DrawTimingRow> DrawGpuTimes();
+    // Disjoint queue durations since the last [gputime] report (nested ranges count once).
+    static std::map<std::uint32_t, double> QueueGpuTimes();
     // The address-based sites of the program timed under `key`, for the [gputime-address] line;
     // false when the key has none recorded yet.
     static bool HasAddressSites(std::uint64_t key);
@@ -631,6 +633,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::uint32_t> timedQueues;
         struct TimedDraw {
             std::uint32_t index;
             DrawTimingDetail detail;

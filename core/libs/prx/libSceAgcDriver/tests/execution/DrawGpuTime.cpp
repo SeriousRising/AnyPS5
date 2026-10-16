@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuQueueTiming.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -39,6 +40,25 @@ namespace {
 
 using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
+
+void QueueTimingTests() {
+    using AgcDriver::Graphics::GpuQueueInterval;
+    using AgcDriver::Graphics::PartitionGpuQueueTimes;
+    const auto nested = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{10, 30, 0}, GpuQueueInterval{12, 20, 0}, GpuQueueInterval{18, 25, 0}});
+    Require(nested.ticks == std::map<std::uint32_t, std::uint64_t>{{0, 20}} && nested.mixedTicks == 0, "nested ranges on one queue were counted more than once");
+    const auto overlap = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{10, 30, 0}, GpuQueueInterval{15, 25, 0x40}, GpuQueueInterval{20, 35, 0x46}});
+    Require(overlap.ticks == std::map<std::uint32_t, std::uint64_t>{{0, 5}, {0x46, 5}} && overlap.mixedTicks == 15, "overlapping queues were not partitioned into exclusive and mixed time");
+    const auto adjacent = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{30, 40, 0xffffffffu}, GpuQueueInterval{10, 20, 0}, GpuQueueInterval{20, 30, 0x48}});
+    Require(adjacent.ticks == std::map<std::uint32_t, std::uint64_t>{{0, 10}, {0x48, 10}, {0xffffffffu, 10}} && adjacent.mixedTicks == 0, "adjacent or untagged ranges were assigned to the wrong queue");
+    const auto empty = PartitionGpuQueueTimes({});
+    Require(empty.ticks.empty() && empty.mixedTicks == 0, "empty queue timings have coverage");
+    const auto invalid = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{20, 20, 0}, GpuQueueInterval{30, 10, 0x40}, GpuQueueInterval{40, 45, 0x48}});
+    Require(invalid.ticks == std::map<std::uint32_t, std::uint64_t>{{0x48, 5}} && invalid.mixedTicks == 0, "invalid queue timing intervals were counted");
+}
 
 constexpr std::uint32_t Width = 512;
 constexpr std::uint32_t Height = 256;
@@ -244,9 +264,15 @@ void TimedDrawTests(AgcDriver::VulkanDevice& device, const Block& first, const B
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     const auto plain = StateFor(DecodeTarget(0, first, Rgba8Info, TiledAttrib3), std::nullopt);
     const auto deep = StateFor(DecodeTarget(0, second, Rgba8Info, TiledAttrib3), AgcDriver::Graphics::DepthTarget{depthBlock.Address(), 0, {Width, Height}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    const auto previousTag = AgcDriver::GuestMemory::GpuLockThreadTag();
+    AgcDriver::GuestMemory::TagGpuLockThread(0);
     device.Draw(plain, draw, shaders);
+    AgcDriver::GuestMemory::TagGpuLockThread(0x40);
     device.Draw(deep, draw, shaders);
     device.WaitIdle();
+    AgcDriver::GuestMemory::TagGpuLockThread(previousTag);
+    const auto queues = AgcDriver::Graphics::Recorder::QueueGpuTimes();
+    Require(queues.contains(0) && queues.at(0) > 0 && queues.contains(0x40) && queues.at(0x40) > 0, "mixed-batch ranges lost their recording queue tags");
     const auto plainBefore = Find(VK_FORMAT_UNDEFINED);
     const auto deepBefore = Find(VK_FORMAT_D32_SFLOAT);
     Require(plainBefore.passes != 0 && deepBefore.passes != 0, "the draws of a profiled run left no draw timing rows");
@@ -377,6 +403,7 @@ int main() {
 #endif
         TraitTests();
         AddressSiteTests();
+        QueueTimingTests();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Block first(8 * BlockBytes);
