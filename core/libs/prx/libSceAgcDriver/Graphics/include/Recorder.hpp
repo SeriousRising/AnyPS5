@@ -463,6 +463,7 @@ public:
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
+    static constexpr std::uint64_t QueueTimingKey = 0x4;
     // The driver's own command classes: their [gputime] ranges take the reserved keys 0x10 + class
     // (printed by name, with counts and bytes, per 10 s and per present) and their barriers are
     // counted on the [barriers] line (CountBarriers, printed every 10 s under APS5_PROFILE_DRAW
@@ -533,6 +534,7 @@ public:
     };
     // The rows gathered since the last [gputime] report.
     static std::vector<DrawTimingRow> DrawGpuTimes();
+    static std::map<std::uint32_t, double> QueueGpuTimes();
     // The address-based sites of the program timed under `key`, for the [gputime-address] line;
     // false when the key has none recorded yet.
     static bool HasAddressSites(std::uint64_t key);
@@ -631,6 +633,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::uint32_t> timedQueues;
         struct TimedDraw {
             std::uint32_t index;
             DrawTimingDetail detail;
@@ -639,6 +642,8 @@ private:
         std::vector<TimedDraw> timedDraws;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
+        std::uint32_t queueTiming = NoTiming;
+        std::optional<std::uint32_t> queueTimingTag;
         double gpuStartNs = 0;
         double gpuEndNs = 0;
         std::uint64_t readGeneration = 0;

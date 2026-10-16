@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuQueueTiming.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -43,6 +44,18 @@ Recorder* activeRecorder = nullptr;
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return profiled;
+}
+
+bool QueueTimingOnly() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_PROFILE_GPU");
+        return value != nullptr && std::strcmp(value, "queues") == 0;
+    }();
+    return enabled;
+}
+
+bool QueueTimingRange(std::uint64_t key) {
+    return key == Recorder::BatchTimingKey || key == Recorder::QueueTimingKey || key == Recorder::ClassKey(Recorder::CommandClass::LabelRun) || key == Recorder::ClassKey(Recorder::CommandClass::DccKeyStore);
 }
 
 std::uint64_t syncCounts[5] = {};
@@ -1628,6 +1641,14 @@ void Recorder::ensureOpen() {
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
     }
+    if (QueueTimingOnly()) {
+        const auto tag = GuestMemory::GpuLockThreadTag();
+        if (open->queueTimingTag != tag) {
+            EndGpuTiming(std::exchange(open->queueTiming, NoTiming));
+            open->queueTiming = beginTiming(QueueTimingKey);
+            open->queueTimingTag = tag;
+        }
+    }
 }
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
@@ -1831,6 +1852,7 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
 
 void Recorder::FlushStores() {
     if (open == nullptr || open->run.queued.empty()) return;
+    if (QueueTimingOnly()) ensureOpen();
     closeStoreRun(false);
 }
 
@@ -1860,6 +1882,8 @@ std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
+std::map<std::uint32_t, double> timingQueues;
+double timingMixedMs = 0, timingQueueSpanMs = 0, timingQueueUntimedMs = 0, timingPresentMs = 0;
 std::map<Recorder::DrawTimingDetail, Recorder::DrawTimingRow> timingDraws;
 std::map<std::uint64_t, Recorder::AddressSites> timingSites;
 std::map<std::uint64_t, Recorder::ComputeShape> timingShapes;
@@ -2015,16 +2039,18 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
     totals.ms += nanoseconds / 1e6;
     totals.bytes += bytes;
     timingClassMs += nanoseconds / 1e6;
+    if (which == CommandClass::PresentBlit) timingPresentMs += nanoseconds / 1e6;
 }
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
-    if (!GpuTimingEnabled()) return NoTiming;
+    if (!GpuTimingEnabled() || (QueueTimingOnly() && !QueueTimingRange(key))) return NoTiming;
     Commands();
     return beginTiming(key);
 }
 
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
+    if (QueueTimingOnly() && !QueueTimingRange(key)) return NoTiming;
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;
     const auto commands = open->commands;
     const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
@@ -2045,11 +2071,17 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     }
     if (open->timedKeys.size() >= queryCount / 2) {
         timingDropped.fetch_add(1, std::memory_order_relaxed);
+        if (QueueTimingOnly()) {
+            EndGpuTiming(open->queueTiming);
+            open->queueTiming = NoTiming;
+        }
         return NoTiming;
     }
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    const bool deferred = key == ClassKey(CommandClass::LabelRun) || key == ClassKey(CommandClass::DccKeyStore) || key == ClassKey(CommandClass::StorageWriteBack) || key == ClassKey(CommandClass::ShadowPublish);
+    open->timedQueues.push_back(deferred ? 0xffffffffu : GuestMemory::GpuLockThreadTag());
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2069,6 +2101,11 @@ void Recorder::NoteTimedDraw(std::uint32_t timing, const DrawTimingDetail& detai
     auto& draws = open->timedDraws;
     if (!draws.empty() && draws.back().index == index) ++draws.back().draws;
     else draws.push_back({index, detail, 1});
+}
+
+std::map<std::uint32_t, double> Recorder::QueueGpuTimes() {
+    std::lock_guard lock(timingMutex);
+    return timingQueues;
 }
 
 bool Recorder::HasAddressSites(std::uint64_t key) {
@@ -2600,12 +2637,35 @@ void Recorder::readGpuTiming(Batch& batch) {
             continue;
         }
         const auto key = batch.timedKeys[i];
+        if (key == QueueTimingKey) {
+            intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+            continue;
+        }
         auto& totals = timingByKey[key];
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+    }
+    if (batch.batchTiming != NoTiming) {
+        const auto begin = stamps[batch.batchTiming * 2];
+        const auto end = stamps[batch.batchTiming * 2 + 1];
+        if (end >= begin) {
+            std::vector<GpuQueueInterval> queued;
+            for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+                if (i != batch.batchTiming) queued.push_back({std::max(begin, stamps[i * 2]), std::min(end, stamps[i * 2 + 1]), batch.timedQueues[i]});
+            }
+            const auto coverage = PartitionGpuQueueTimes(queued);
+            auto covered = coverage.mixedTicks;
+            for (const auto& [queue, ticks] : coverage.ticks) {
+                timingQueues[queue] += static_cast<double>(ticks) * period / 1e6;
+                covered += ticks;
+            }
+            timingMixedMs += static_cast<double>(coverage.mixedTicks) * period / 1e6;
+            timingQueueSpanMs += static_cast<double>(end - begin) * period / 1e6;
+            timingQueueUntimedMs += static_cast<double>(end - begin - covered) * period / 1e6;
+        }
     }
     for (const auto& draw : batch.timedDraws) {
         auto& row = timingDraws[draw.detail];
@@ -2644,6 +2704,20 @@ void Recorder::readGpuTiming(Batch& batch) {
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    const double queueTotal = timingQueueSpanMs + timingPresentMs;
+    double computeMs = 0, otherMs = 0;
+    std::string queues;
+    for (const auto& [queue, ms] : timingQueues) {
+        char text[128];
+        std::snprintf(text, sizeof(text), " [0x%x %.3fms/frame %.2f%%]", queue, ms * perPresent, queueTotal > 0 ? 100 * ms / queueTotal : 0);
+        queues += text;
+        if (queue == 0x40 || queue == 0x46 || queue == 0x48) computeMs += ms;
+        else if (queue != 0) otherMs += ms;
+    }
+    const auto upper = computeMs + otherMs + timingMixedMs + timingQueueUntimedMs;
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime-queues] %llu presents; total %.3fms/frame (batch span + present blit %.3fms/frame); exclusive:%s; mixed %.3fms/frame; untimed %.3fms/frame; compute %.3fms/frame %.2f%%; compute upper %.3fms/frame %.2f%% (includes mixed, untimed, other tags); timestamp ranges are diagnostic bounds; mode=%s\n", static_cast<unsigned long long>(presents), queueTotal * perPresent, timingPresentMs * perPresent, queues.c_str(), timingMixedMs * perPresent, timingQueueUntimedMs * perPresent, computeMs * perPresent, queueTotal > 0 ? 100 * computeMs / queueTotal : 0, upper * perPresent, queueTotal > 0 ? 100 * upper / queueTotal : 0, QueueTimingOnly() ? "boundaries" : "ranges");
+    timingQueues.clear();
+    timingMixedMs = timingQueueSpanMs = timingQueueUntimedMs = timingPresentMs = 0;
     std::string addressed;
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) {
         const auto found = timingSites.find(hot[i].first);
@@ -3660,6 +3734,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    if (QueueTimingOnly()) ensureOpen();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) {
         static const char submitCloser = 0;
@@ -3680,6 +3755,7 @@ void Recorder::Submit() {
         recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         CountBarriers(CommandClass::Draw);
     }
+    EndGpuTiming(open->queueTiming);
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
     if (FlipReadCheck()) {

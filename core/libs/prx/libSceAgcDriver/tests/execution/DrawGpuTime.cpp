@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuQueueTiming.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -35,10 +37,118 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
 namespace {
 
 using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
+
+void QueueTimingTests() {
+    using AgcDriver::Graphics::GpuQueueInterval;
+    using AgcDriver::Graphics::PartitionGpuQueueTimes;
+    const auto nested = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{10, 30, 0}, GpuQueueInterval{12, 20, 0}, GpuQueueInterval{18, 25, 0}});
+    Require(nested.ticks == std::map<std::uint32_t, std::uint64_t>{{0, 20}} && nested.mixedTicks == 0, "nested ranges on one queue were counted more than once");
+    const auto overlap = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{10, 30, 0}, GpuQueueInterval{15, 25, 0x40}, GpuQueueInterval{20, 35, 0x46}});
+    Require(overlap.ticks == std::map<std::uint32_t, std::uint64_t>{{0, 5}, {0x46, 5}} && overlap.mixedTicks == 15, "overlapping queues were not partitioned into exclusive and mixed time");
+    const auto adjacent = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{30, 40, 0xffffffffu}, GpuQueueInterval{10, 20, 0}, GpuQueueInterval{20, 30, 0x48}});
+    Require(adjacent.ticks == std::map<std::uint32_t, std::uint64_t>{{0, 10}, {0x48, 10}, {0xffffffffu, 10}} && adjacent.mixedTicks == 0, "adjacent or untagged ranges were assigned to the wrong queue");
+    const auto empty = PartitionGpuQueueTimes({});
+    Require(empty.ticks.empty() && empty.mixedTicks == 0, "empty queue timings have coverage");
+    const auto invalid = PartitionGpuQueueTimes(std::array{
+        GpuQueueInterval{20, 20, 0}, GpuQueueInterval{30, 10, 0x40}, GpuQueueInterval{40, 45, 0x48}});
+    Require(invalid.ticks == std::map<std::uint32_t, std::uint64_t>{{0x48, 5}} && invalid.mixedTicks == 0, "invalid queue timing intervals were counted");
+}
+
+struct QueueTimestampSpy {
+    PFN_vkGetDeviceProcAddr resolve = nullptr;
+    PFN_vkCmdWriteTimestamp writeTimestamp = nullptr;
+    std::uint32_t queryCount = 0;
+    std::vector<std::uint32_t> events;
+} queueTimestampSpy;
+
+VKAPI_ATTR VkResult VKAPI_CALL SpyCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo* info, const VkAllocationCallbacks* callbacks, VkQueryPool* pool) {
+    queueTimestampSpy.queryCount = info->queryCount;
+    return reinterpret_cast<PFN_vkCreateQueryPool>(queueTimestampSpy.resolve(device, "vkCreateQueryPool"))(device, info, callbacks, pool);
+}
+
+VKAPI_ATTR void VKAPI_CALL SpyWriteTimestamp(VkCommandBuffer commands, VkPipelineStageFlagBits stage, VkQueryPool pool, std::uint32_t query) {
+    queueTimestampSpy.events.push_back(query);
+    queueTimestampSpy.writeTimestamp(commands, stage, pool, query);
+}
+
+VKAPI_ATTR void VKAPI_CALL SpyEndRenderPass(VkCommandBuffer) {
+    queueTimestampSpy.events.push_back(AgcDriver::Graphics::Recorder::NoTiming);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL SpyDeviceProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkCreateQueryPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(SpyCreateQueryPool);
+    if (std::strcmp(name, "vkCmdWriteTimestamp") == 0) return reinterpret_cast<PFN_vkVoidFunction>(SpyWriteTimestamp);
+    if (std::strcmp(name, "vkCmdEndRenderPass") == 0 || std::strcmp(name, "vkCmdEndRenderingKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(SpyEndRenderPass);
+    return queueTimestampSpy.resolve(device, name);
+}
+
+void QueueRecorderTimingTests(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    queueTimestampSpy.resolve = context.deviceProc;
+    queueTimestampSpy.writeTimestamp = context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp");
+    context.deviceProc = SpyDeviceProc;
+    context.functions = nullptr;
+    const auto previousTag = AgcDriver::GuestMemory::GpuLockThreadTag();
+    Buffer buffer(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const std::uint32_t value = 7;
+    {
+        AgcDriver::GuestMemory::TagGpuLockThread(0);
+        Recorder recorder(context, false);
+        recorder.RecordStore(buffer.Handle(), 0, std::as_bytes(std::span(&value, 1)), 0);
+        Require(recorder.HasQueuedStores(), "queue timing flush test needs a deferred store");
+        const auto queueBegin = queueTimestampSpy.events.back();
+        recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, PassAccess{});
+        queueTimestampSpy.events.clear();
+        AgcDriver::GuestMemory::TagGpuLockThread(0x40);
+        recorder.FlushStores();
+        const auto& events = queueTimestampSpy.events;
+        Require(events.size() >= 3 && events[0] == queueBegin + 1 && events[1] % 2 == 0 && events[2] == Recorder::NoTiming, "cross-queue store flush closed the render pass before transitioning queue timing");
+        recorder.Sync();
+    }
+    for (const auto key : {Recorder::ClassKey(Recorder::CommandClass::LabelRun), Recorder::ClassKey(Recorder::CommandClass::DccKeyStore), Recorder::QueueTimingKey}) {
+        AgcDriver::GuestMemory::TagGpuLockThread(0);
+        Recorder recorder(context, false);
+        queueTimestampSpy.events.clear();
+        recorder.Commands();
+        const auto queueBegin = queueTimestampSpy.events.back();
+        Require(queueTimestampSpy.queryCount >= 4, "queue timing query pool has no ownership range");
+        for (std::uint32_t range = queueBegin / 2 + 1; range < queueTimestampSpy.queryCount / 2; ++range) {
+            const auto timing = recorder.BeginGpuTiming(Recorder::QueueTimingKey);
+            Require(timing != Recorder::NoTiming, "queue timing cap test exhausted queries early");
+            recorder.EndGpuTiming(timing);
+        }
+        queueTimestampSpy.events.clear();
+        if (key == Recorder::QueueTimingKey) {
+            AgcDriver::GuestMemory::TagGpuLockThread(0x40);
+            recorder.Commands();
+        } else {
+            Require(recorder.BeginGpuTiming(key) == Recorder::NoTiming, "queue timing cap test did not exhaust queries");
+        }
+        Require(queueTimestampSpy.events == std::vector<std::uint32_t>{queueBegin + 1}, key == Recorder::QueueTimingKey ? "a queue transition at the query cap ended the same timestamp twice" : "a dropped unknown range left the active queue span open");
+        recorder.RecordStore(buffer.Handle(), 0, std::as_bytes(std::span(&value, 1)), 0);
+        recorder.FlushStores();
+        recorder.Sync();
+        Require(std::count(queueTimestampSpy.events.begin(), queueTimestampSpy.events.end(), queueBegin + 1) == 1 && queueTimestampSpy.events.back() == 1, "work after the query cap extended the old queue span instead of remaining untimed");
+    }
+    AgcDriver::GuestMemory::TagGpuLockThread(previousTag);
+}
 
 constexpr std::uint32_t Width = 512;
 constexpr std::uint32_t Height = 256;
@@ -235,7 +345,7 @@ Row Find(VkFormat depth) {
     return {};
 }
 
-void TimedDrawTests(AgcDriver::VulkanDevice& device, const Block& first, const Block& second, const Block& depthBlock) {
+void TimedDrawTests(AgcDriver::VulkanDevice& device, const Block& first, const Block& second, const Block& depthBlock, bool queuesOnly) {
     const auto prepared = Prepare(device, Program({0.5f, 0.25f, 0.5f, 0.75f}, false));
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &prepared.vertex, 0},
@@ -244,9 +354,19 @@ void TimedDrawTests(AgcDriver::VulkanDevice& device, const Block& first, const B
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     const auto plain = StateFor(DecodeTarget(0, first, Rgba8Info, TiledAttrib3), std::nullopt);
     const auto deep = StateFor(DecodeTarget(0, second, Rgba8Info, TiledAttrib3), AgcDriver::Graphics::DepthTarget{depthBlock.Address(), 0, {Width, Height}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    const auto previousTag = AgcDriver::GuestMemory::GpuLockThreadTag();
+    AgcDriver::GuestMemory::TagGpuLockThread(0);
     device.Draw(plain, draw, shaders);
+    AgcDriver::GuestMemory::TagGpuLockThread(0x40);
     device.Draw(deep, draw, shaders);
     device.WaitIdle();
+    AgcDriver::GuestMemory::TagGpuLockThread(previousTag);
+    const auto queues = AgcDriver::Graphics::Recorder::QueueGpuTimes();
+    Require(queues.contains(0) && queues.at(0) > 0 && queues.contains(0x40) && queues.at(0x40) > 0, "mixed-batch ranges lost their recording queue tags");
+    if (queuesOnly) {
+        Require(AgcDriver::Graphics::Recorder::DrawGpuTimes().empty(), "queue-only profiling still emitted per-draw timestamp ranges");
+        return;
+    }
     const auto plainBefore = Find(VK_FORMAT_UNDEFINED);
     const auto deepBefore = Find(VK_FORMAT_D32_SFLOAT);
     Require(plainBefore.passes != 0 && deepBefore.passes != 0, "the draws of a profiled run left no draw timing rows");
@@ -370,19 +490,23 @@ void AddressSiteTests() {
 
 int main() {
     try {
+        const auto* mode = std::getenv("APS5_PROFILE_GPU");
+        const bool queuesOnly = mode != nullptr && std::string_view(mode) == "queues";
 #ifdef _WIN32
-        _putenv_s("APS5_PROFILE_GPU", "1");
+        _putenv_s("APS5_PROFILE_GPU", queuesOnly ? "queues" : "1");
 #else
-        setenv("APS5_PROFILE_GPU", "1", 1);
+        setenv("APS5_PROFILE_GPU", queuesOnly ? "queues" : "1", 1);
 #endif
         TraitTests();
         AddressSiteTests();
+        QueueTimingTests();
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Block first(8 * BlockBytes);
         Block second(8 * BlockBytes);
         Block depth(BlockBytes);
-        TimedDrawTests(*device, first, second, depth);
+        TimedDrawTests(*device, first, second, depth, queuesOnly);
+        if (queuesOnly) QueueRecorderTimingTests(*device);
         std::puts("draw GPU timing tests passed");
         return 0;
     } catch (const std::exception& error) {
