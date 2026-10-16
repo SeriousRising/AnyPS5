@@ -172,7 +172,7 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
-// Split recording (default, APS5_NO_SPLIT_DRAWS=1 off): a worker whose recording another thread continues in packet
+// Split recording (APS5_SPLIT_DRAWS): a worker whose recording another thread continues in packet
 // order installs a gate on itself, run before each of its outermost acquisitions: lock() waits in
 // it until that thread has recorded everything handed over, try_lock() fails while it has not.
 void SetGpuLockGate(bool (*gate)(bool wait));

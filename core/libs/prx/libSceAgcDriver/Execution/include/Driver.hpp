@@ -14,7 +14,7 @@ struct DrawAheadTotals {
     std::uint64_t hits;
 };
 DrawAheadTotals DrawAheadCounts();
-// Queue-0 draws handed to the split recorder so far (APS5_NO_SPLIT_DRAWS turns it off), for tests.
+// Queue-0 draws handed to the split recorder so far (APS5_SPLIT_DRAWS), for tests.
 std::uint64_t SplitDrawsHanded();
 
 }
