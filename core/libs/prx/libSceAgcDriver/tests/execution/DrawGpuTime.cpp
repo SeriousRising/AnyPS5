@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuQueueTiming.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -36,6 +37,14 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
 namespace {
 
 using AgcDriver::Graphics::Require;
@@ -58,6 +67,82 @@ void QueueTimingTests() {
     const auto invalid = PartitionGpuQueueTimes(std::array{
         GpuQueueInterval{20, 20, 0}, GpuQueueInterval{30, 10, 0x40}, GpuQueueInterval{40, 45, 0x48}});
     Require(invalid.ticks == std::map<std::uint32_t, std::uint64_t>{{0x48, 5}} && invalid.mixedTicks == 0, "invalid queue timing intervals were counted");
+}
+
+struct QueueTimestampSpy {
+    PFN_vkGetDeviceProcAddr resolve = nullptr;
+    PFN_vkCmdWriteTimestamp writeTimestamp = nullptr;
+    std::uint32_t queryCount = 0;
+    std::vector<std::uint32_t> events;
+} queueTimestampSpy;
+
+VKAPI_ATTR VkResult VKAPI_CALL SpyCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo* info, const VkAllocationCallbacks* callbacks, VkQueryPool* pool) {
+    queueTimestampSpy.queryCount = info->queryCount;
+    return reinterpret_cast<PFN_vkCreateQueryPool>(queueTimestampSpy.resolve(device, "vkCreateQueryPool"))(device, info, callbacks, pool);
+}
+
+VKAPI_ATTR void VKAPI_CALL SpyWriteTimestamp(VkCommandBuffer commands, VkPipelineStageFlagBits stage, VkQueryPool pool, std::uint32_t query) {
+    queueTimestampSpy.events.push_back(query);
+    queueTimestampSpy.writeTimestamp(commands, stage, pool, query);
+}
+
+VKAPI_ATTR void VKAPI_CALL SpyEndRenderPass(VkCommandBuffer) {
+    queueTimestampSpy.events.push_back(AgcDriver::Graphics::Recorder::NoTiming);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL SpyDeviceProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkCreateQueryPool") == 0) return reinterpret_cast<PFN_vkVoidFunction>(SpyCreateQueryPool);
+    if (std::strcmp(name, "vkCmdWriteTimestamp") == 0) return reinterpret_cast<PFN_vkVoidFunction>(SpyWriteTimestamp);
+    if (std::strcmp(name, "vkCmdEndRenderPass") == 0 || std::strcmp(name, "vkCmdEndRenderingKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(SpyEndRenderPass);
+    return queueTimestampSpy.resolve(device, name);
+}
+
+void QueueRecorderTimingTests(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    queueTimestampSpy.resolve = context.deviceProc;
+    queueTimestampSpy.writeTimestamp = context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp");
+    context.deviceProc = SpyDeviceProc;
+    context.functions = nullptr;
+    const auto previousTag = AgcDriver::GuestMemory::GpuLockThreadTag();
+    Buffer buffer(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const std::uint32_t value = 7;
+    {
+        AgcDriver::GuestMemory::TagGpuLockThread(0);
+        Recorder recorder(context, false);
+        recorder.RecordStore(buffer.Handle(), 0, std::as_bytes(std::span(&value, 1)), 0);
+        Require(recorder.HasQueuedStores(), "queue timing flush test needs a deferred store");
+        const auto queueBegin = queueTimestampSpy.events.back();
+        recorder.LeaveRenderPassOpen(1, Recorder::NoTiming, false, PassAccess{});
+        queueTimestampSpy.events.clear();
+        AgcDriver::GuestMemory::TagGpuLockThread(0x40);
+        recorder.FlushStores();
+        const auto& events = queueTimestampSpy.events;
+        Require(events.size() >= 3 && events[0] == queueBegin + 1 && events[1] % 2 == 0 && events[2] == Recorder::NoTiming, "cross-queue store flush closed the render pass before transitioning queue timing");
+        recorder.Sync();
+    }
+    for (const auto which : {Recorder::CommandClass::LabelRun, Recorder::CommandClass::DccKeyStore}) {
+        AgcDriver::GuestMemory::TagGpuLockThread(0);
+        Recorder recorder(context, false);
+        queueTimestampSpy.events.clear();
+        recorder.Commands();
+        const auto queueBegin = queueTimestampSpy.events.back();
+        Require(queueTimestampSpy.queryCount >= 4, "queue timing query pool has no ownership range");
+        for (std::uint32_t range = queueBegin / 2 + 1; range < queueTimestampSpy.queryCount / 2; ++range) {
+            const auto timing = recorder.BeginGpuTiming(Recorder::QueueTimingKey);
+            Require(timing != Recorder::NoTiming, "queue timing cap test exhausted queries early");
+            recorder.EndGpuTiming(timing);
+        }
+        queueTimestampSpy.events.clear();
+        Require(recorder.BeginGpuTiming(which) == Recorder::NoTiming, "queue timing cap test did not exhaust queries");
+        Require(queueTimestampSpy.events == std::vector<std::uint32_t>{queueBegin + 1}, "a dropped unknown range left the active queue span open");
+        recorder.RecordStore(buffer.Handle(), 0, std::as_bytes(std::span(&value, 1)), 0);
+        recorder.FlushStores();
+        recorder.Sync();
+        Require(std::count(queueTimestampSpy.events.begin(), queueTimestampSpy.events.end(), queueBegin + 1) == 1 && queueTimestampSpy.events.back() == 1, "work after the query cap extended the old queue span instead of remaining untimed");
+    }
+    AgcDriver::GuestMemory::TagGpuLockThread(previousTag);
 }
 
 constexpr std::uint32_t Width = 512;
@@ -416,6 +501,7 @@ int main() {
         Block second(8 * BlockBytes);
         Block depth(BlockBytes);
         TimedDrawTests(*device, first, second, depth, queuesOnly);
+        if (queuesOnly) QueueRecorderTimingTests(*device);
         std::puts("draw GPU timing tests passed");
         return 0;
     } catch (const std::exception& error) {
