@@ -163,6 +163,8 @@ private:
     bool splitLabelsOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
     void runSplitRecorder() noexcept;
     void recordSplitDraw(SplitDraw& draw);
+    void recordSplitPacket(SplitDraw& op);
+    bool splitHandsOverPacket(std::uint32_t header, std::span<const std::uint32_t> packet, const QueueState& queue);
     void stopSplitRecorder();
     void reportSplit();
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -132,6 +133,17 @@ std::optional<std::uint32_t> Driver::splitDrainSite(std::uint32_t header, std::s
     return opcode;
 }
 
+// An end-of-pipe RELEASE_MEM with an interrupt and a label (or no store): the recorder executes it
+// in order instead of the worker draining for it.
+bool Driver::splitHandsOverPacket(std::uint32_t header, std::span<const std::uint32_t> packet, const QueueState& queue) {
+    static const bool packets = std::getenv("APS5_SPLIT_NO_PACKETS") == nullptr;
+    if (!packets || ((header >> 8u) & 0xffu) != 0x49 || packet.size() < 8 || (Pm4::Predicated(header) && queue.predication.operation != 0)) return false;
+    const auto interrupt = (packet[2] >> 24u) & 7u;
+    if (interrupt == 0 || interrupt == 3) return false;
+    const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
+    return storesNothing || Pm4::DecodeLabelWrite(packet).has_value();
+}
+
 bool Driver::splitGate(bool wait) {
     auto& driver = Get();
     if (driver.splitIdle.load(std::memory_order_acquire) && !driver.splitFailed.load(std::memory_order_acquire)) return true;
@@ -189,7 +201,34 @@ void Driver::splitHandOver(std::unique_ptr<SplitDraw> draw) {
     splitCounts[SplitHanded].fetch_add(1, std::memory_order_relaxed);
 }
 
+void Driver::recordSplitPacket(SplitDraw& op) {
+    const auto header = op.packet.front();
+    const auto opcode = (header >> 8u) & 0xffu;
+    GuestMemory::SetCurrentPacket(opcode, 0);
+    if (!op.labels.empty()) {
+        auto& deferred = deferredLabels();
+        if (deferred.labels.empty()) deferred.since = std::chrono::steady_clock::now();
+        deferred.labels.insert(deferred.labels.end(), op.labels.begin(), op.labels.end());
+    }
+    // The worker's packet loop for this packet: its flush duties, then preparePacketMemory (which
+    // records the queued labels and this one, and attaches the interrupt to the recorded work),
+    // then the execute step, which needs no register state for RELEASE_MEM.
+    static thread_local Submission submission;
+    static thread_local QueueState none;
+    flushBetweenPackets(0, header, true);
+    bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
+    const std::span<const std::uint32_t> packet(op.packet);
+    preparePacketMemory(submission, none, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
+    traceLabel(packet, 0);
+    if (!wroteOnGpu) {
+        Pm4::Execute(packet, none);
+        if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, 0);
+    }
+    if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(0);
+}
+
 void Driver::recordSplitDraw(SplitDraw& draw) {
+    if (!draw.packet.empty()) return recordSplitPacket(draw);
     GuestMemory::SetCurrentPacket((draw.header >> 8u) & 0xffu, 0);
     if (auto current = device.Load(); current != nullptr && current != draw.device) draw.device = std::move(current);
     if (!draw.labels.empty()) {

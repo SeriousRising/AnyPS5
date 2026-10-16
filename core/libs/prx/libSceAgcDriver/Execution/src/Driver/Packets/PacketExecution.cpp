@@ -145,6 +145,15 @@ void Driver::execute(const Submission& submission) {
         // (packets that take the GPU mutex wait in its gate anyway).
         if (splitLeader()) {
             splitWaitInOrder() = false;
+            if (splitHandsOverPacket(header, packet, queue)) {
+                auto op = std::make_unique<SplitDraw>();
+                op->packet.assign(packet.begin(), packet.end());
+                op->collectEpoch = GuestMemory::CollectEpoch();
+                splitHandOver(std::move(op));
+                recent.Record(cursor);
+                cursor = nextCursor;
+                continue;
+            }
             if (const auto site = splitDrainSite(header, packet, queue)) splitDrain(*site);
         }
         if (lockRunScope.run.lock.owns_lock()) {

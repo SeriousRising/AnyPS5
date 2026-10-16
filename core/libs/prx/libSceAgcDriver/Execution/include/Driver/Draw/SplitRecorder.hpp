@@ -37,6 +37,9 @@ struct SplitDraw {
     // The worker's collect epoch at the hand-over: the recorder starts an epoch of its own wherever
     // the worker passed an ordering point between two draws (GuestMemory::BumpCollectEpoch).
     std::uint64_t collectEpoch = 0;
+    // Instead of a draw: an end-of-pipe RELEASE_MEM the recorder executes as the worker would
+    // (its label recorded in order, the interrupt delivered after the work before it).
+    std::vector<std::uint32_t> packet;
 };
 
 // A label handed over inside a split draw and not recorded yet (sequence: that draw's).
