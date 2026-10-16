@@ -151,7 +151,9 @@ bool Driver::splitGate(bool wait) {
         driver.splitCounts[SplitTriesRefused].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    driver.splitDrain(SiteGate);
+    // Under APS5_PROFILE_DRAW the gate's drains are split by the lock site the caller tagged.
+    const auto site = GuestMemory::NextGpuLockSite();
+    driver.splitDrain(site == GuestMemory::GpuLockSite::Other ? SiteGate : 0x110u + static_cast<std::uint32_t>(site));
     return true;
 }
 
@@ -362,7 +364,9 @@ void Driver::reportSplit() {
     for (std::size_t i = 0; i < sites.size() && i < 8; ++i) {
         static constexpr std::array<const char*, 9> names{"end", "miss", "indirect", "waits", "gate", "flip", "rendering wait", "predicated", "label"};
         char item[48];
-        if (sites[i].second >= SiteEnd) std::snprintf(item, sizeof item, " %s %llu", names[sites[i].second - SiteEnd], static_cast<unsigned long long>(sites[i].first));
+        static constexpr std::array<const char*, 13> lockSites{"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
+        if (sites[i].second >= 0x110) std::snprintf(item, sizeof item, " gate:%s %llu", lockSites[std::min<std::size_t>(sites[i].second - 0x110, 12)], static_cast<unsigned long long>(sites[i].first));
+        else if (sites[i].second >= SiteEnd) std::snprintf(item, sizeof item, " %s %llu", names[sites[i].second - SiteEnd], static_cast<unsigned long long>(sites[i].first));
         else std::snprintf(item, sizeof item, " 0x%02zx %llu", sites[i].second, static_cast<unsigned long long>(sites[i].first));
         bySite += item;
     }

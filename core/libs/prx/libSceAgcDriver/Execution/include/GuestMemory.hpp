@@ -193,6 +193,8 @@ std::uint32_t GpuLockThreadTag();
 // the line shows who holds the mutex, not only who waits for it.
 enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
 void TagGpuLockSite(GpuLockSite site);
+// The site tagged for the calling thread's next acquisition (Other off the profiled path).
+GpuLockSite NextGpuLockSite();
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
 void NoteLockedGpuWait(double ms);

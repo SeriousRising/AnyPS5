@@ -1798,6 +1798,10 @@ void TagGpuLockSite(GpuLockSite site) {
     LockStats().nextSite = site;
 }
 
+GpuLockSite NextGpuLockSite() {
+    return GpuLockProfiled() ? LockStats().nextSite : GpuLockSite::Other;
+}
+
 void MarkPresenterThread() {
     LockStats().holderColumn = PresenterColumn;
 }

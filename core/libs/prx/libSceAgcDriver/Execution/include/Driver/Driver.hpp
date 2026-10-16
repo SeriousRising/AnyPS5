@@ -372,8 +372,8 @@ private:
     std::atomic<std::uint64_t> splitRecorded{0};
     std::array<std::atomic<std::uint64_t>, 7> splitCounts{};
     std::array<std::uint64_t, 7> splitReported{};
-    std::array<std::atomic<std::uint64_t>, 0x109> splitDrainSites{};
-    std::array<std::uint64_t, 0x109> splitDrainSitesReported{};
+    std::array<std::atomic<std::uint64_t>, 0x120> splitDrainSites{};
+    std::array<std::uint64_t, 0x120> splitDrainSitesReported{};
 
     std::mutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};
