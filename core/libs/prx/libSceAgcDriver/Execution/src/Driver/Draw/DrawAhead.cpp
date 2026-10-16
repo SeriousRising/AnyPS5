@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
+#include <immintrin.h>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
 
@@ -156,6 +158,11 @@ std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t sta
                 if (ahead.wake.wait_for(lock, std::chrono::microseconds(50), [&] { return ahead.cancel.load(std::memory_order_acquire); })) return cursor;
             }
             if (seen > ahead.draws.load(std::memory_order_relaxed)) {
+                ahead.preparing.store(seen, std::memory_order_release);
+                struct Prepared {
+                    std::atomic<std::uint64_t>& preparing;
+                    ~Prepared() { preparing.store(0, std::memory_order_release); }
+                } prepared{ahead.preparing};
                 try {
                     prepareDrawAhead(queue, packet, submission);
                 } catch (const std::exception&) {
@@ -192,6 +199,19 @@ std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t sta
         cursor += count;
     }
     return commands.size();
+}
+
+// Whether the draw-ahead thread was preparing the worker's current draw (its ordinal is `draws`,
+// counted by drawAheadAt): then this waits until it is done and returns true.
+bool Driver::awaitDrawAhead() {
+    auto& ahead = drawAhead;
+    const auto current = ahead.draws.load(std::memory_order_relaxed);
+    if (current == 0 || ahead.preparing.load(std::memory_order_acquire) != current) return false;
+    for (std::uint32_t spin = 0; ahead.preparing.load(std::memory_order_acquire) == current; ++spin) {
+        if (spin < 2000) _mm_pause();
+        else std::this_thread::yield();
+    }
+    return true;
 }
 
 void Driver::prepareDrawAhead(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission) {

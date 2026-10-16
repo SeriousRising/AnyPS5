@@ -82,6 +82,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             ++drawEntryCounters.absent;
         }
     }
+    // The draw-ahead thread may be preparing this very draw's entry right now: wait for it rather
+    // than capturing and compiling the same stages again here.
+    if (registerKey && entry == nullptr && submission.queue == 0 && awaitDrawAhead()) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (const auto found = drawCache.find(drawKey); found != drawCache.end()) {
+            entry = found->second;
+            decode = entry->decode;
+            --drawEntryCounters.absent;
+            drawAhead.Count(AheadAwaited);
+        }
+    }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         std::lock_guard cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);

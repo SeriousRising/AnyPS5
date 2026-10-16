@@ -16,7 +16,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-enum DrawAheadCount : std::size_t { AheadScans, AheadPrepared, AheadHits, AheadWarm, AheadPassed, AheadPending, AheadUnsupported, AheadErrors, AheadStops, AheadOverKnown, AheadOverRaw, AheadOverSync, AheadOverImage, AheadOverVertex, AheadIndirect, AheadEmpty, AheadMetadataPass, AheadNothing, AheadRejected, AheadMesh, AheadNoDevice, AheadStageRejected, DrawAheadCountKinds };
+enum DrawAheadCount : std::size_t { AheadScans, AheadPrepared, AheadHits, AheadWarm, AheadPassed, AheadPending, AheadUnsupported, AheadErrors, AheadStops, AheadOverKnown, AheadOverRaw, AheadOverSync, AheadOverImage, AheadOverVertex, AheadIndirect, AheadEmpty, AheadMetadataPass, AheadNothing, AheadRejected, AheadMesh, AheadNoDevice, AheadStageRejected, AheadAwaited, DrawAheadCountKinds };
 
 enum DrawLockRunCount : std::size_t { RunsStarted, RunDrawsHeld, RunEndedByMiss, RunEndedBySync, RunEndedByPacket, RunEndedByBound, DrawLockRunCountKinds };
 
@@ -46,6 +46,8 @@ struct DrawAhead {
     std::atomic<bool> cancel{false};
     std::atomic<std::size_t> stopped{Running};
     std::atomic<std::uint64_t> draws{0};
+    // The ordinal (in `draws`) of the draw prepareDrawAhead works on now, 0 between draws.
+    std::atomic<std::uint64_t> preparing{0};
     std::array<std::atomic<std::uint64_t>, DrawAheadCountKinds> counts{};
     std::array<std::uint64_t, DrawAheadCountKinds> reported{};
     std::array<std::atomic<std::uint64_t>, 9> refused{};

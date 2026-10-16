@@ -142,6 +142,7 @@ private:
     void drawAheadAt(const Submission& submission, const QueueState& queue, std::size_t cursor);
     void runDrawAhead() noexcept;
     std::size_t scanDrawsAhead(const Submission& submission, std::size_t start, std::uint64_t firstDraw);
+    bool awaitDrawAhead();
     void prepareDrawAhead(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
