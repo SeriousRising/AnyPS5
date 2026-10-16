@@ -29,7 +29,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return DrawVerdict::Drawn;
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
-    if (submission.queue == 0) reportSplit();
+    if (submission.queue == 0 && (splitLeader() || profile)) reportSplit();
     // Split recording: an indirect draw reads its records only after the recorder has recorded
     // every draw before it.
     if (drawParameters.indirect) splitDrain(0x102);

@@ -344,6 +344,22 @@ void Driver::reportSplit() {
         ahead[kind] = total - aheadBefore[kind];
         aheadBefore[kind] = total;
     }
+    std::string stops;
+    {
+        std::vector<std::pair<std::uint64_t, std::size_t>> at;
+        for (std::size_t op = 0; op < drawAhead.stoppedAt.size(); ++op) {
+            const auto total = drawAhead.stoppedAt[op].load(std::memory_order_relaxed);
+            if (total != drawAhead.stoppedAtReported[op]) at.emplace_back(total - drawAhead.stoppedAtReported[op], op);
+            drawAhead.stoppedAtReported[op] = total;
+        }
+        std::sort(at.rbegin(), at.rend());
+        for (std::size_t i = 0; i < at.size() && i < 6; ++i) {
+            char item[40];
+            std::snprintf(item, sizeof item, " 0x%zx %llu", at[i].second, static_cast<unsigned long long>(at[i].first));
+            stops += item;
+        }
+    }
+    std::fprintf(stderr, "[split] draw-ahead (10 s): %llu scans, stopped at:%s\n", ahead[AheadScans], stops.c_str());
     std::fprintf(stderr, "[split] draw-ahead (10 s): %llu prepared, %llu already warm, %llu passed by the worker first, %llu hits on prepared stages, %llu unsupported, %llu entries the worker waited for\n", ahead[AheadPrepared], ahead[AheadWarm], ahead[AheadPassed], ahead[AheadHits], ahead[AheadUnsupported], ahead[AheadAwaited]);
     std::fprintf(stderr, "[split] 10 s: %llu draws handed to the recorder, %llu drains waited %.1f ms in all (by site:%s), %llu waits held in queue order, %llu GPU-mutex tries refused while draws were in flight; verify: %llu stages, %llu mismatches\n", counts[SplitHanded], counts[SplitDrains], counts[SplitDrainUs] / 1000.0, bySite.c_str(), counts[SplitWaitsInOrder], counts[SplitTriesRefused], counts[SplitVerified], counts[SplitVerifyMismatches]);
 }

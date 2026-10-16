@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <immintrin.h>
 #include <thread>
@@ -49,19 +50,28 @@ DrawAheadTotals Driver::DrawAheadCounts() {
     return {drawAhead.counts[AheadPrepared].load(std::memory_order_relaxed), drawAhead.counts[AheadHits].load(std::memory_order_relaxed)};
 }
 
+std::size_t Driver::drawAheadLanes() {
+    static const std::size_t lanes = [] {
+        const char* text = std::getenv("APS5_DRAW_AHEAD_LANES");
+        return std::clamp<std::size_t>(text != nullptr ? std::strtoul(text, nullptr, 10) : 2, 1, DrawAhead::MaxLanes);
+    }();
+    return lanes;
+}
+
 void Driver::beginDrawAhead() {
     cancelDrawAhead();
-    drawAhead.stopped.store(0, std::memory_order_release);
+    for (std::size_t lane = 0; lane < drawAheadLanes(); ++lane) drawAhead.lanes[lane].stopped.store(0, std::memory_order_release);
 }
 
 void Driver::cancelDrawAhead() {
     auto& ahead = drawAhead;
+    const auto lanes = std::span(ahead.lanes).first(drawAheadLanes());
     std::unique_lock lock(ahead.mutex);
     ahead.cancel.store(true, std::memory_order_release);
     ahead.wake.notify_all();
-    ahead.idle.wait(lock, [&] { return !ahead.busy; });
+    ahead.idle.wait(lock, [&] { return std::none_of(lanes.begin(), lanes.end(), [](const DrawAheadLane& lane) { return lane.busy; }); });
     ahead.cancel.store(false, std::memory_order_release);
-    ahead.stopped.store(DrawAhead::Running, std::memory_order_release);
+    for (auto& lane : lanes) lane.stopped.store(DrawAhead::Running, std::memory_order_release);
 }
 
 void Driver::stopDrawAhead() {
@@ -72,46 +82,54 @@ void Driver::stopDrawAhead() {
         ahead.cancel.store(true, std::memory_order_release);
     }
     ahead.wake.notify_all();
-    if (ahead.thread.joinable()) ahead.thread.join();
+    for (auto& lane : ahead.lanes) {
+        if (lane.thread.joinable()) lane.thread.join();
+    }
 }
 
 void Driver::drawAheadAt(const Submission& submission, const QueueState& queue, std::size_t cursor) {
     auto& ahead = drawAhead;
     const auto draws = ahead.draws.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (ahead.stopped.load(std::memory_order_acquire) > cursor) return;
+    const auto lanes = std::span(ahead.lanes).first(drawAheadLanes());
+    // Every lane stops at the same packet, so one still running means the scan is not over.
+    if (std::any_of(lanes.begin(), lanes.end(), [&](const DrawAheadLane& lane) { return lane.stopped.load(std::memory_order_acquire) > cursor; })) return;
     std::unique_lock lock(ahead.mutex);
-    ahead.idle.wait(lock, [&] { return !ahead.busy; });
+    ahead.idle.wait(lock, [&] { return std::none_of(lanes.begin(), lanes.end(), [](const DrawAheadLane& lane) { return lane.busy; }); });
     if (ahead.stop) return;
-    if (!ahead.thread.joinable()) ahead.thread = std::thread([this] { runDrawAhead(); });
-    ahead.state.shader = queue.shader;
-    ahead.state.context = queue.context;
-    ahead.state.userConfig = queue.userConfig;
-    ahead.state.savedContext = queue.savedContext;
-    ahead.state.indexBase = queue.indexBase;
-    ahead.state.drawIndirectBase = queue.drawIndirectBase;
-    ahead.state.indexBufferSize = queue.indexBufferSize;
-    ahead.state.indexType = queue.indexType;
-    ahead.state.instanceCount = queue.instanceCount;
-    ahead.state.predication = queue.predication;
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        auto& lane = lanes[index];
+        if (!lane.thread.joinable()) lane.thread = std::thread([this, index] { runDrawAhead(index); });
+        lane.state.shader = queue.shader;
+        lane.state.context = queue.context;
+        lane.state.userConfig = queue.userConfig;
+        lane.state.savedContext = queue.savedContext;
+        lane.state.indexBase = queue.indexBase;
+        lane.state.drawIndirectBase = queue.drawIndirectBase;
+        lane.state.indexBufferSize = queue.indexBufferSize;
+        lane.state.indexType = queue.indexType;
+        lane.state.instanceCount = queue.instanceCount;
+        lane.state.predication = queue.predication;
+        lane.stopped.store(DrawAhead::Running, std::memory_order_release);
+        lane.busy = true;
+    }
     ahead.submission = &submission;
     ahead.start = cursor;
     ahead.firstDraw = draws;
-    ahead.stopped.store(DrawAhead::Running, std::memory_order_release);
-    ahead.busy = true;
     ahead.Count(AheadScans);
     lock.unlock();
-    ahead.wake.notify_one();
+    ahead.wake.notify_all();
 }
 
-void Driver::runDrawAhead() noexcept {
+void Driver::runDrawAhead(std::size_t index) noexcept {
     PinWorkerThread("draw look-ahead");
     GuestMemory::LeaveGpuWritesPending();
     auto& ahead = drawAhead;
+    auto& lane = ahead.lanes[index];
     std::unique_lock lock(ahead.mutex);
     for (;;) {
-        ahead.wake.wait(lock, [&] { return ahead.stop || ahead.busy; });
+        ahead.wake.wait(lock, [&] { return ahead.stop || lane.busy; });
         if (ahead.stop) {
-            ahead.busy = false;
+            lane.busy = false;
             ahead.idle.notify_all();
             return;
         }
@@ -121,20 +139,22 @@ void Driver::runDrawAhead() noexcept {
         lock.unlock();
         auto stopped = submission.commands.size();
         try {
-            stopped = scanDrawsAhead(submission, start, firstDraw);
+            stopped = scanDrawsAhead(submission, start, firstDraw, index);
         } catch (...) {
             ahead.Count(AheadErrors);
         }
         lock.lock();
-        ahead.stopped.store(stopped, std::memory_order_release);
-        ahead.busy = false;
+        lane.stopped.store(stopped, std::memory_order_release);
+        lane.busy = false;
         ahead.idle.notify_all();
     }
 }
 
-std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t start, std::uint64_t firstDraw) {
+std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t start, std::uint64_t firstDraw, std::size_t index) {
     auto& ahead = drawAhead;
-    auto& queue = ahead.state;
+    auto& lane = ahead.lanes[index];
+    auto& queue = lane.state;
+    const auto lanes = drawAheadLanes();
     const auto& commands = submission.commands;
     std::uint64_t seen = firstDraw;
     for (std::size_t cursor = start + Pm4::PacketWords(commands[start]); cursor < commands.size();) {
@@ -148,21 +168,25 @@ std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t sta
         const auto packet = std::span(commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         if (Pm4::Predicated(header) && queue.predication.operation != 0) {
-            ahead.Count(AheadStops);
+            ahead.Stop(0x100);
             return cursor;
         }
         if (Pm4::DrawOpcode(opcode)) {
             ++seen;
+            if (seen % lanes != index) {
+                cursor += count;
+                continue;
+            }
             while (seen > ahead.draws.load(std::memory_order_relaxed) + DrawAhead::Window) {
                 std::unique_lock lock(ahead.mutex);
                 if (ahead.wake.wait_for(lock, std::chrono::microseconds(50), [&] { return ahead.cancel.load(std::memory_order_acquire); })) return cursor;
             }
             if (seen > ahead.draws.load(std::memory_order_relaxed)) {
-                ahead.preparing.store(seen, std::memory_order_release);
+                lane.preparing.store(seen, std::memory_order_release);
                 struct Prepared {
                     std::atomic<std::uint64_t>& preparing;
                     ~Prepared() { preparing.store(0, std::memory_order_release); }
-                } prepared{ahead.preparing};
+                } prepared{lane.preparing};
                 try {
                     prepareDrawAhead(queue, packet, submission);
                 } catch (const std::exception&) {
@@ -185,7 +209,7 @@ std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t sta
                 const auto kind = (header >> 2u) & 0x3fu;
                 if (kind == 0x1a) Pm4::Execute(packet, queue);
                 else if (kind != 0 && kind != 0x0b && kind != 0x0c) {
-                    ahead.Count(AheadStops);
+                    ahead.Stop(0x101);
                     return cursor;
                 }
                 break;
@@ -193,7 +217,7 @@ std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t sta
             case 0x15: case 0x16: case 0x37: case 0x3c: case 0x3f: case 0x40: case 0x42: case 0x45: case 0x46: case 0x49: case 0x50: case 0x58: case 0x81: case 0x83: case 0x93:
                 break;
             default:
-                ahead.Count(AheadStops);
+                ahead.Stop(opcode);
                 return cursor;
         }
         cursor += count;
@@ -206,8 +230,10 @@ std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t sta
 bool Driver::awaitDrawAhead() {
     auto& ahead = drawAhead;
     const auto current = ahead.draws.load(std::memory_order_relaxed);
-    if (current == 0 || ahead.preparing.load(std::memory_order_acquire) != current) return false;
-    for (std::uint32_t spin = 0; ahead.preparing.load(std::memory_order_acquire) == current; ++spin) {
+    if (current == 0) return false;
+    auto& lane = ahead.lanes[current % drawAheadLanes()];
+    if (lane.preparing.load(std::memory_order_acquire) != current) return false;
+    for (std::uint32_t spin = 0; lane.preparing.load(std::memory_order_acquire) == current; ++spin) {
         if (spin < 2000) _mm_pause();
         else std::this_thread::yield();
     }
