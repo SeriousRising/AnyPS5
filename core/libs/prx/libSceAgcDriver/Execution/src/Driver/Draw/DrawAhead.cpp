@@ -92,8 +92,13 @@ void Driver::drawAheadAt(const Submission& submission, const QueueState& queue, 
     const auto draws = ahead.draws.fetch_add(1, std::memory_order_relaxed) + 1;
     const auto lanes = std::span(ahead.lanes).first(drawAheadLanes());
     // Every lane stops at the same packet, so one still running means the scan is not over.
-    if (std::any_of(lanes.begin(), lanes.end(), [&](const DrawAheadLane& lane) { return lane.stopped.load(std::memory_order_acquire) > cursor; })) return;
     std::unique_lock lock(ahead.mutex);
+    if (std::any_of(lanes.begin(), lanes.end(), [&](const DrawAheadLane& lane) { return lane.stopped.load(std::memory_order_acquire) > cursor; })) {
+        const bool busy = std::any_of(lanes.begin(), lanes.end(), [](const DrawAheadLane& lane) { return lane.busy; });
+        lock.unlock();
+        if (busy) ahead.wake.notify_all();
+        return;
+    }
     ahead.idle.wait(lock, [&] { return std::none_of(lanes.begin(), lanes.end(), [](const DrawAheadLane& lane) { return lane.busy; }); });
     if (ahead.stop) return;
     for (std::size_t index = 0; index < lanes.size(); ++index) {
@@ -179,7 +184,8 @@ std::size_t Driver::scanDrawsAhead(const Submission& submission, std::size_t sta
             }
             while (seen > ahead.draws.load(std::memory_order_relaxed) + DrawAhead::Window) {
                 std::unique_lock lock(ahead.mutex);
-                if (ahead.wake.wait_for(lock, std::chrono::microseconds(50), [&] { return ahead.cancel.load(std::memory_order_acquire); })) return cursor;
+                ahead.wake.wait_for(lock, std::chrono::microseconds(50), [&] { return ahead.cancel.load(std::memory_order_acquire) || seen <= ahead.draws.load(std::memory_order_relaxed) + DrawAhead::Window; });
+                if (ahead.cancel.load(std::memory_order_acquire)) return cursor;
             }
             if (seen > ahead.draws.load(std::memory_order_relaxed)) {
                 lane.preparing.store(seen, std::memory_order_release);
