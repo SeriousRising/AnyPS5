@@ -122,7 +122,7 @@ void QueueRecorderTimingTests(AgcDriver::VulkanDevice& device) {
         Require(events.size() >= 3 && events[0] == queueBegin + 1 && events[1] % 2 == 0 && events[2] == Recorder::NoTiming, "cross-queue store flush closed the render pass before transitioning queue timing");
         recorder.Sync();
     }
-    for (const auto which : {Recorder::CommandClass::LabelRun, Recorder::CommandClass::DccKeyStore}) {
+    for (const auto key : {Recorder::ClassKey(Recorder::CommandClass::LabelRun), Recorder::ClassKey(Recorder::CommandClass::DccKeyStore), Recorder::QueueTimingKey}) {
         AgcDriver::GuestMemory::TagGpuLockThread(0);
         Recorder recorder(context, false);
         queueTimestampSpy.events.clear();
@@ -135,8 +135,13 @@ void QueueRecorderTimingTests(AgcDriver::VulkanDevice& device) {
             recorder.EndGpuTiming(timing);
         }
         queueTimestampSpy.events.clear();
-        Require(recorder.BeginGpuTiming(which) == Recorder::NoTiming, "queue timing cap test did not exhaust queries");
-        Require(queueTimestampSpy.events == std::vector<std::uint32_t>{queueBegin + 1}, "a dropped unknown range left the active queue span open");
+        if (key == Recorder::QueueTimingKey) {
+            AgcDriver::GuestMemory::TagGpuLockThread(0x40);
+            recorder.Commands();
+        } else {
+            Require(recorder.BeginGpuTiming(key) == Recorder::NoTiming, "queue timing cap test did not exhaust queries");
+        }
+        Require(queueTimestampSpy.events == std::vector<std::uint32_t>{queueBegin + 1}, key == Recorder::QueueTimingKey ? "a queue transition at the query cap ended the same timestamp twice" : "a dropped unknown range left the active queue span open");
         recorder.RecordStore(buffer.Handle(), 0, std::as_bytes(std::span(&value, 1)), 0);
         recorder.FlushStores();
         recorder.Sync();
