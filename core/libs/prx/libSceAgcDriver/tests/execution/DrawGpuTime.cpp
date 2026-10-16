@@ -255,7 +255,7 @@ Row Find(VkFormat depth) {
     return {};
 }
 
-void TimedDrawTests(AgcDriver::VulkanDevice& device, const Block& first, const Block& second, const Block& depthBlock) {
+void TimedDrawTests(AgcDriver::VulkanDevice& device, const Block& first, const Block& second, const Block& depthBlock, bool queuesOnly) {
     const auto prepared = Prepare(device, Program({0.5f, 0.25f, 0.5f, 0.75f}, false));
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &prepared.vertex, 0},
@@ -273,6 +273,10 @@ void TimedDrawTests(AgcDriver::VulkanDevice& device, const Block& first, const B
     AgcDriver::GuestMemory::TagGpuLockThread(previousTag);
     const auto queues = AgcDriver::Graphics::Recorder::QueueGpuTimes();
     Require(queues.contains(0) && queues.at(0) > 0 && queues.contains(0x40) && queues.at(0x40) > 0, "mixed-batch ranges lost their recording queue tags");
+    if (queuesOnly) {
+        Require(AgcDriver::Graphics::Recorder::DrawGpuTimes().empty(), "queue-only profiling still emitted per-draw timestamp ranges");
+        return;
+    }
     const auto plainBefore = Find(VK_FORMAT_UNDEFINED);
     const auto deepBefore = Find(VK_FORMAT_D32_SFLOAT);
     Require(plainBefore.passes != 0 && deepBefore.passes != 0, "the draws of a profiled run left no draw timing rows");
@@ -396,10 +400,12 @@ void AddressSiteTests() {
 
 int main() {
     try {
+        const auto* mode = std::getenv("APS5_PROFILE_GPU");
+        const bool queuesOnly = mode != nullptr && std::string_view(mode) == "queues";
 #ifdef _WIN32
-        _putenv_s("APS5_PROFILE_GPU", "1");
+        _putenv_s("APS5_PROFILE_GPU", queuesOnly ? "queues" : "1");
 #else
-        setenv("APS5_PROFILE_GPU", "1", 1);
+        setenv("APS5_PROFILE_GPU", queuesOnly ? "queues" : "1", 1);
 #endif
         TraitTests();
         AddressSiteTests();
@@ -409,7 +415,7 @@ int main() {
         Block first(8 * BlockBytes);
         Block second(8 * BlockBytes);
         Block depth(BlockBytes);
-        TimedDrawTests(*device, first, second, depth);
+        TimedDrawTests(*device, first, second, depth, queuesOnly);
         std::puts("draw GPU timing tests passed");
         return 0;
     } catch (const std::exception& error) {
