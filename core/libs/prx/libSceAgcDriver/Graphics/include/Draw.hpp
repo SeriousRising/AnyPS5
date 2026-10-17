@@ -21,6 +21,10 @@ struct HostImport;
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
+// The [begin, end) guest ranges a draw with this state can leave pending once recorded: each color
+// target's resident surface (every mip of a chain, every layer of an array view; a linear target
+// itself), its CMASK and DCC keys, and the depth, stencil and HTILE planes of the depth target.
+void AppendTargetWriteRanges(const State& state, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;

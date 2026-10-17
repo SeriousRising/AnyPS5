@@ -161,6 +161,11 @@ private:
     static bool splitGate(bool wait);
     void splitHandOver(std::unique_ptr<SplitDraw> draw);
     bool splitLabelsOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
+    static std::vector<SplitTransitWrite>& splitTransitWrites();
+    void splitNoteWrites(const SplitDraw& draw);
+    // Whether a front half's reads overlap what draws in flight may write (then it drains and runs again).
+    bool splitWritesOver(std::span<const ShaderRecompiler::MemoryRegion> regions);
+    void splitVerifyReads(std::uint64_t sequence, std::span<const Graphics::GuestMemorySnapshot> snapshots);
     void runSplitRecorder() noexcept;
     void recordSplitDraw(SplitDraw& draw);
     void recordSplitPacket(SplitDraw& op);

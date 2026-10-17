@@ -48,6 +48,14 @@ struct SplitTransitLabel {
     DeferredLabel label;
 };
 
+// Guest memory [begin, end) that draws handed over and not recorded yet may write (sequence: the
+// newest of them), which the worker's front halves must not read before those draws are recorded.
+struct SplitTransitWrite {
+    std::uint64_t sequence;
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
 }
 
 #endif

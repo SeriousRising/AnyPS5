@@ -4,6 +4,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <algorithm>
 #include <string>
@@ -26,7 +30,7 @@ namespace {
 enum SplitCount : std::size_t { SplitHanded, SplitDrains, SplitDrainUs, SplitTriesRefused, SplitVerified, SplitVerifyMismatches, SplitWaitsInOrder };
 
 // Drain sites that are not a packet's own opcode (the [split] line names them).
-enum SplitSite : std::uint32_t { SiteEnd = 0x100, SiteMiss, SiteIndirect, SiteWaits, SiteGate, SiteFlip, SiteRenderingWait, SitePredicated, SiteLabel };
+enum SplitSite : std::uint32_t { SiteEnd = 0x100, SiteMiss, SiteIndirect, SiteWaits, SiteGate, SiteFlip, SiteRenderingWait, SitePredicated, SiteLabel, SiteWrites };
 
 // In-flight draws before the worker waits for room.
 constexpr std::size_t SplitWindow = 64;
@@ -80,6 +84,7 @@ void Driver::splitDrain(std::uint32_t site) {
         splitCounts[SplitDrainUs].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     }
     splitTransitLabels().clear();
+    splitTransitWrites().clear();
     if (splitError != nullptr) {
         splitFailed.store(false, std::memory_order_release);
         std::rethrow_exception(std::exchange(splitError, nullptr));
@@ -174,6 +179,73 @@ bool Driver::splitLabelsOver(std::span<const std::pair<std::uint64_t, std::uint6
     return false;
 }
 
+std::vector<SplitTransitWrite>& Driver::splitTransitWrites() {
+    static thread_local std::vector<SplitTransitWrite> writes;
+    return writes;
+}
+
+static thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> handedWrites;
+
+// What the draw's record can leave pending (hazard 1(c) of the design): its targets, the storage
+// buffers and storage images its stages write, into handedWrites for splitHandOver.
+void Driver::splitNoteWrites(const SplitDraw& draw) {
+    auto& ranges = handedWrites;
+    ranges.clear();
+    if (!draw.packet.empty()) return;
+    Graphics::AppendTargetWriteRanges(draw.decode->state, ranges);
+    for (const auto& stage : draw.stages) {
+        appendWrittenRanges(*stage.program, ranges);
+        for (const auto& binding : stage.program->bindings) {
+            if (binding.kind != ShaderRecompiler::DescriptorKind::StorageImage || binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
+            for (std::uint32_t element = 0; element < binding.count && binding.guestDescriptor.size() >= (element + 1u) * 8u; ++element) {
+                if (element < binding.imageWritten.size() && !binding.imageWritten[element]) continue;
+                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 8u, 8u);
+                if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
+                const auto resource = Graphics::DecodeTextureResource(words);
+                ranges.emplace_back(resource.baseAddress, resource.baseAddress + Graphics::DescribeSurface(resource).guestBytes);
+            }
+        }
+    }
+}
+
+bool Driver::splitWritesOver(std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    // Debug aid: APS5_SPLIT_NO_WRITE_DRAINS=1 lets front halves read under draws in flight (the race).
+    static const bool off = std::getenv("APS5_SPLIT_NO_WRITE_DRAINS") != nullptr;
+    auto& writes = splitTransitWrites();
+    if (off || writes.empty()) return false;
+    const auto recorded = splitRecorded.load(std::memory_order_acquire);
+    std::erase_if(writes, [&](const SplitTransitWrite& write) { return write.sequence <= recorded; });
+    for (const auto& region : regions) {
+        const auto end = region.guestAddress + region.bytes.size();
+        for (const auto& write : writes) {
+            if (region.guestAddress < write.end && write.begin < end) return true;
+        }
+    }
+    return false;
+}
+
+// APS5_SPLIT_VERIFY: every guest byte a draw's front half read (its snapshots: validated entries,
+// captures and decode reads) against guest memory at the draw's place in packet order, after the
+// results recorded before it are stored, for draws recorded by the recorder and misses alike.
+void Driver::splitVerifyReads(std::uint64_t sequence, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
+    std::vector<std::byte> now;
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.bytes.empty() || !GuestMemory::Accessible(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.size())) continue;
+        Graphics::StorageTexture::FlushPending(snapshot.address, snapshot.bytes.size(), nullptr, "split verify");
+        now.resize(snapshot.bytes.size());
+        GuestMemory::Read(snapshot.address, now);
+        splitCounts[SplitVerified].fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(now.data(), snapshot.bytes.data(), now.size()) == 0) continue;
+        std::size_t at = 0;
+        while (now[at] == snapshot.bytes[at]) ++at;
+        at &= ~std::size_t{3};
+        std::uint32_t read = 0, ordered = 0;
+        std::memcpy(&read, snapshot.bytes.data() + at, std::min<std::size_t>(4, now.size() - at));
+        std::memcpy(&ordered, now.data() + at, std::min<std::size_t>(4, now.size() - at));
+        if (splitCounts[SplitVerifyMismatches].fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[split] verify: draw %llu read 0x%llx+0x%zx as 0x%08x at its front half, 0x%08x at its place in packet order (offset 0x%zx)\n", static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(snapshot.address), snapshot.bytes.size(), read, ordered, at);
+    }
+}
+
 void Driver::splitHandOver(std::unique_ptr<SplitDraw> draw) {
     auto& deferred = deferredLabels();
     draw->labels.swap(deferred.labels);
@@ -181,6 +253,7 @@ void Driver::splitHandOver(std::unique_ptr<SplitDraw> draw) {
     auto& transit = splitTransitLabels();
     const auto recorded = splitRecorded.load(std::memory_order_acquire);
     while (!transit.empty() && transit.front().sequence <= recorded) transit.pop_front();
+    splitNoteWrites(*draw);
     std::unique_lock lock(splitMutex);
     if (splitOps.size() >= SplitWindow) {
         splitLeaderWaiting = true;
@@ -190,11 +263,19 @@ void Driver::splitHandOver(std::unique_ptr<SplitDraw> draw) {
     if (splitError != nullptr) {
         splitFailed.store(false, std::memory_order_release);
         transit.clear();
+        splitTransitWrites().clear();
         std::rethrow_exception(std::exchange(splitError, nullptr));
     }
     if (!splitThread.joinable()) splitThread = std::thread([this] { runSplitRecorder(); });
     draw->sequence = ++splitHanded;
     for (const auto& label : draw->labels) transit.push_back({draw->sequence, label});
+    // Successive draws mostly write the same ranges: one already in flight moves to this sequence.
+    auto& writes = splitTransitWrites();
+    for (const auto& [begin, end] : handedWrites) {
+        const auto same = std::find_if(writes.begin(), writes.end(), [&](const SplitTransitWrite& write) { return write.begin == begin && write.end == end; });
+        if (same != writes.end()) same->sequence = draw->sequence;
+        else writes.push_back({draw->sequence, begin, end});
+    }
     splitOps.push_back(std::move(draw));
     splitIdle.store(false, std::memory_order_release);
     const bool wake = splitSleeping;
@@ -253,6 +334,7 @@ void Driver::recordSplitDraw(SplitDraw& draw) {
             if (outcome == EntryOutcome::Equal) continue;
             if (splitCounts[SplitVerifyMismatches].fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[split] verify: draw %llu stage %zu (program 0x%llx) validates as %d at its place in packet order\n", static_cast<unsigned long long>(draw.sequence), i, static_cast<unsigned long long>(programs[i].binary.codeAddress), static_cast<int>(outcome));
         }
+        splitVerifyReads(draw.sequence, draw.snapshots);
     }
     const auto& graphics = draw.decode->state;
     noteDrawWriters(draw.stages, 0);
@@ -366,7 +448,7 @@ void Driver::reportSplit() {
     std::sort(sites.rbegin(), sites.rend());
     std::string bySite;
     for (std::size_t i = 0; i < sites.size() && i < 8; ++i) {
-        static constexpr std::array<const char*, 9> names{"end", "miss", "indirect", "waits", "gate", "flip", "rendering wait", "predicated", "label"};
+        static constexpr std::array<const char*, 10> names{"end", "miss", "indirect", "waits", "gate", "flip", "rendering wait", "predicated", "label", "writes"};
         char item[48];
         static constexpr std::array<const char*, 13> lockSites{"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
         if (sites[i].second >= 0x110) std::snprintf(item, sizeof item, " gate:%s %llu", lockSites[std::min<std::size_t>(sites[i].second - 0x110, 12)], static_cast<unsigned long long>(sites[i].first));

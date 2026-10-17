@@ -265,6 +265,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    // Split recording: a front half that read memory a draw still in flight may write (its targets,
+    // written buffers or images) read it too early; once those draws are recorded it runs again and
+    // syncs on their results as without the split.
+    if (splitLeader() && splitWritesOver(memory)) {
+        splitDrain(0x109);
+        return draw(queue, packet, submission, rejected);
+    }
 
     bool rectListBuilt = false;
 
@@ -316,6 +323,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
+        if (splitLeader() && splitVerify()) splitVerifyReads(0, snapshots);
     };
     if (drawParameters.indirect && indirectCpu) {
 

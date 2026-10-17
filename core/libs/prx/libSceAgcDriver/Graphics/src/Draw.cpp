@@ -143,6 +143,30 @@ GuestTextureResource ArraySurfaceForTarget(const ColorTarget& color) {
 
 }
 
+void AppendTargetWriteRanges(const State& state, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    const auto add = [&](std::uint64_t address, std::uint64_t bytes) {
+        if (address != 0 && bytes != 0) ranges.emplace_back(address, address + bytes);
+    };
+    for (const auto& color : state.colors) {
+        add(color.address, color.bytes);
+        // A chain or an array view lives in one image over the whole surface (SurfaceForTarget).
+        if (color.tileMode != ColorTileMode::Linear && (color.mipCount > 1 || color.arrayLastSlice != 0)) {
+            const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
+            add(surface.baseAddress, DescribeSurface(surface).guestBytes);
+        }
+        add(color.cmaskAddress, color.cmaskBytes);
+        add(color.dccAddress, DccKeyBytes(color.bytes));
+    }
+    if (state.depth) {
+        const auto& depth = *state.depth;
+        const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        // shortcut: the drawn slice only, as State.cpp addresses it; upgrade if layered depth draws appear.
+        add(depth.address, DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
+        add(depth.stencilAddress, DepthSliceBytes(depth.extent, 1u));
+        add(depth.htileAddress, HtileMetadataBytes(depth.extent));
+    }
+}
+
 namespace {
 
 std::size_t colorKeyCount(const ColorTarget& color, std::size_t bytes) {
