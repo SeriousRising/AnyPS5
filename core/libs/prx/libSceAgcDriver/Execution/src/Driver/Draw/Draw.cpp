@@ -418,8 +418,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return DrawVerdict::Rejected;
         }
     }
-    // Never while this thread holds the GPU mutex: its nested acquisitions pass no gate.
-    if (splitLeader() && drawHit && !GuestMemory::GpuMutex().HeldByThisThread()) {
+    // Never while this thread holds the GPU mutex: its nested acquisitions pass no gate. A draw that
+    // stores through an address may write anything later front halves read: it records here.
+    if (splitLeader() && drawHit && !GuestMemory::GpuMutex().HeldByThisThread() && (!splitWriteDrains() || std::none_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program->bdaWrites; }))) {
         auto split = std::make_unique<SplitDraw>();
         split->device = std::move(localDevice);
         split->decode = decode;

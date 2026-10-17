@@ -149,13 +149,14 @@ void AppendTargetWriteRanges(const State& state, std::vector<std::pair<std::uint
     };
     for (const auto& color : state.colors) {
         add(color.address, color.bytes);
-        // A chain or an array view lives in one image over the whole surface (SurfaceForTarget).
-        if (color.tileMode != ColorTileMode::Linear && (color.mipCount > 1 || color.arrayLastSlice != 0)) {
-            const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
-            add(surface.baseAddress, DescribeSurface(surface).guestBytes);
-        }
         add(color.cmaskAddress, color.cmaskBytes);
-        add(color.dccAddress, DccKeyBytes(color.bytes));
+        // A chain, an array view or a volume lives in one image over the whole surface
+        // (SurfaceForTarget), whose first write stores the DCC keys of all of it (MarkDirty).
+        if (color.tileMode == ColorTileMode::Linear || (color.mipCount == 1 && color.arrayLastSlice == 0 && color.depth == 1 && color.dccAddress == 0)) continue;
+        const auto surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
+        const auto bytes = DescribeSurface(surface).guestBytes;
+        add(surface.baseAddress, bytes);
+        if (color.dccAddress != 0) add(color.dccAddress, std::max<std::uint64_t>(DccKeyCount(surface, bytes), DccKeyBytes(color.bytes)));
     }
     if (state.depth) {
         const auto& depth = *state.depth;

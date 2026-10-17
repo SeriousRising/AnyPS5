@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -202,17 +203,23 @@ void Driver::splitNoteWrites(const SplitDraw& draw) {
                 const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 8u, 8u);
                 if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
                 const auto resource = Graphics::DecodeTextureResource(words);
-                ranges.emplace_back(resource.baseAddress, resource.baseAddress + Graphics::DescribeSurface(resource).guestBytes);
+                const auto bytes = Graphics::DescribeSurface(resource).guestBytes;
+                ranges.emplace_back(resource.baseAddress, resource.baseAddress + bytes);
+                if (resource.dccAddress != 0) ranges.emplace_back(resource.dccAddress, resource.dccAddress + Graphics::DccKeyCount(resource, bytes));
             }
         }
     }
 }
 
+// Debug aid: APS5_SPLIT_NO_WRITE_DRAINS=1 lets front halves read under draws in flight (the race).
+bool Driver::splitWriteDrains() {
+    static const bool on = std::getenv("APS5_SPLIT_NO_WRITE_DRAINS") == nullptr;
+    return on;
+}
+
 bool Driver::splitWritesOver(std::span<const ShaderRecompiler::MemoryRegion> regions) {
-    // Debug aid: APS5_SPLIT_NO_WRITE_DRAINS=1 lets front halves read under draws in flight (the race).
-    static const bool off = std::getenv("APS5_SPLIT_NO_WRITE_DRAINS") != nullptr;
     auto& writes = splitTransitWrites();
-    if (off || writes.empty()) return false;
+    if (!splitWriteDrains() || writes.empty()) return false;
     const auto recorded = splitRecorded.load(std::memory_order_acquire);
     std::erase_if(writes, [&](const SplitTransitWrite& write) { return write.sequence <= recorded; });
     for (const auto& region : regions) {
