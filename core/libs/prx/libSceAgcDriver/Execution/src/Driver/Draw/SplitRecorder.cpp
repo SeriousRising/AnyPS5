@@ -300,6 +300,10 @@ void Driver::runSplitRecorder() noexcept {
         splitOps.pop_front();
         if (splitLeaderWaiting) splitIdled.notify_all();
         lock.unlock();
+        // Debug aid: APS5_SPLIT_DELAY_US=N slows the recorder by N us an op, so the worker's front
+        // halves run far ahead of the ops still in flight (makes in-flight hazards reproducible).
+        static const auto delay = std::chrono::microseconds(std::getenv("APS5_SPLIT_DELAY_US") != nullptr ? std::atoi(std::getenv("APS5_SPLIT_DELAY_US")) : 0);
+        if (delay.count() > 0) std::this_thread::sleep_for(delay);
         try {
             if (!gpuLock.owns_lock()) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);

@@ -460,7 +460,10 @@ void Under(Scene& scene) {
             commands.Draw();
         }
         scene.Finish(commands);
-        for (std::uint32_t i = 0; i < draws; ++i) Require(scene.ResultWord(128 + i) == 0x46000000u + round * draws + i, "draw ahead: a draw whose table lies in the memory of its render target did not read its own table");
+        for (std::uint32_t i = 0; i < draws; ++i) {
+            const auto word = scene.ResultWord(128 + i);
+            if (word != 0x46000000u + round * draws + i) throw std::runtime_error("draw ahead: a draw whose table lies in the memory of its render target did not read its own table (round " + std::to_string(round) + ", draw " + std::to_string(i) + ", read value " + std::to_string(static_cast<std::int32_t>(word - 0x46000000u)) + ")");
+        }
     }
 }
 
