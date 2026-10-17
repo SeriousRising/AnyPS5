@@ -12,7 +12,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-// Split recording (APS5_SPLIT_DRAWS=1): one queue-0 draw whose front half the worker finished,
+// Split recording (default, APS5_NO_SPLIT_DRAWS=1 off): one queue-0 draw whose front half the worker finished,
 // handed to the recorder thread to record in packet order. It owns everything the record reads:
 // the stages point into `results` or the matched variants, the snapshots into the decode's
 // programs, the matched variants' regions or `decodeReads`.
